@@ -1,0 +1,113 @@
+# modeling 组工作流默认参数（单点真理）。
+# 键名与 CLI flag 一致；命令行显式传参可覆盖此处。
+# 路径类默认（报告/审批文件等）由 robotarm.paths 统一管理，不在此定义。
+
+train:
+  policy-type: act          # 默认策略类型；训练超参（steps/batch_size 等）
+                            # 由 lerobot 框架默认或命令行透传
+
+train-with-holdout:
+  policy-type: act
+  eval-split: 0.1935483870967742  # = 6/31；留出数 = ceil(n_episodes × eval_split)，
+                                  # 按当前数据集大小换算后在命令行覆盖
+  eval-steps: 1000
+  max-eval-samples: 512
+
+evaluate:
+  samples: 256              # 每 episode 采样帧数
+  device: cuda
+  seed: 1000
+
+online-policy:
+  approval-required: false  # false 跳过执行前审批；不影响 --execute 和其他安全门控
+  # 相机与控制
+  camera-serial: "347522071736"
+  wrist-camera-serial: "260322272554"
+  camera-fps: 20
+  device: cuda
+  rate: 20.0                # 控制频率（Hz）
+  duration: 150.0           # shadow 总时长；execute 模式每次按 X 启动一轮的时长上限
+  # 推理时限（安全门控）
+  max-inference-ms: 150.0
+  max-smolvla-plan-age-ms: 1250.0
+  max-camera-age-ms: 50.0
+  warmup-steps: 3
+  # 步长与超前限幅（安全门控）
+  max-joint-step-deg: 1
+  max-gripper-step-mm: 1.0
+  max-joint-lead-deg: 1.0
+  max-gripper-lead-mm: 2.0
+  # ACT/Pi0 原始预测门控；值由对应 policies 段覆盖。
+  max-act-raw-joint-gap-deg: null
+  max-act-raw-gripper-gap-mm: null
+  max-act-raw-gripper-bound-tolerance-mm: 1.0
+  max-act-clamp-hold-steps: 10
+  gripper-max-mm: 100.0
+  gripper-force: 1.5
+  # 键盘
+  keyboard-hold-seconds: 0.3
+  home-speed-percent: 5
+  home-timeout: 60.0
+  # 按策略类型覆盖（checkpoint 加载后按 policy_type 叠加；键名与 CLI flag
+  # 一致、下划线形式；显式 CLI 参数优先级最高）。chunk_size 等模型结构参数
+  # 以 checkpoint 的 train_config 为准；n_action_steps 和时间集成可调整在线执行节奏。
+  # 时限数值依据真机遥测：ACT 均值 6ms；DP 均值 23ms、尖峰 183ms。
+  policies:
+    act:
+      max-inference-ms: 60.0        # ACT 单次前向很轻（真机均值 6ms）
+      n_action_steps: 30 # 显式覆盖 checkpoint；单次可用 --n-action-steps 修改。
+      max-joint-step-deg: 2.5       # 当前单周期命令变化上限，不是数据统计量。
+      max-joint-lead-deg: 6.0       # 数据 action-state 关节误差 P99≈5.47°
+      max-gripper-step-mm: 8.0      # 数据逐帧夹爪变化 P95≈7.7mm
+      max-gripper-lead-mm: 16.0     # 数据 action-state 夹爪误差 P99.5≈16mm
+      max-act-raw-joint-gap-deg: 12.0    # 超出采集最大值 8.63°即停机
+      max-act-raw-gripper-gap-mm: 30.0  # 当前原始夹爪预测相对反馈差上限。
+      max-act-raw-gripper-bound-tolerance-mm: 1.0  # 原始夹爪目标边界容差；安全目标仍限幅至 [0, gripper-max-mm]
+      max-act-clamp-hold-steps: 10      # 连续 0.5s 仍追不上同一动作则停机
+    diffusion:
+      max-inference-ms: 220.0       # 去噪多步较慢，需容纳 ~183ms 尖峰
+      warmup-steps: 5               # 首次去噪含编译/缓存预热
+    smolvla:
+      max-inference-ms: 60.0
+      task: "Pick up the cup and place it in the target container"
+      n-action-steps: 15
+      smolvla-num-steps: 8
+      rate: 20.0
+      max-chunk-inference-ms: 750.0
+      max-smolvla-plan-age-ms: 1500.0
+      smolvla-replan-lead-steps: 15
+      max-joint-step-deg: 0.25
+      max-joint-lead-deg: 0.5
+      max-gripper-step-mm: 0.5
+      max-gripper-lead-mm: 1.0
+      gripper-max-mm: 100.0
+      gripper-force: 1.0
+      experimental-smolvla-execute: true
+    pi0:
+      task: "Pick up the cup and place it in the target container"
+      n-action-steps: 20
+      max-chunk-inference-ms: 600.0
+      max-smolvla-plan-age-ms: 1250.0
+      smolvla-replan-lead-steps: 12
+      max-act-raw-joint-gap-deg: 15.0
+      max-act-raw-gripper-gap-mm: 20.0
+      max-act-raw-gripper-bound-tolerance-mm: 1.0
+      # Preserve the shared conservative step/lead limits; no automatic execute.
+  # 连接
+  interface: null
+  channel: can_follower1
+  firmware: v189
+  feedback-timeout: 3.0
+
+approve:
+  output: src/robotarm/modeling/configs/shadow_approval.json  # 审批文件输出（相对路径按工作区根解析，与 online-policy.approval 指向同一文件）
+  min-samples: 600         # 报告最少样本数
+  max-smolvla-severe-clamp-fraction: 0.05
+  # 控制周期超时门槛。循环每拍用 sleep(剩余时间) 重新配速，单次超时不会累积，
+  # 因此只拦「持续过载」（miss 聚集）与「单次卡死」两件事；真正会打断试次的
+  # 看门狗违规由 healthy 单独硬拦（推理/相机 age 上限）。历史标定：良性 run
+  # 0.00–0.12%，真过载 run 12.8% / 20% / 100%。
+  max-control-deadline-miss-fraction: 0.005   # 允许超时迭代占比上限（0.5%）
+  max-control-loop-periods: 2.0               # 最长单拍耗时上限，单位=控制周期（20Hz 即 100ms）
+
+normalize-piper-metadata: {}  # 仅路径参数，由 robotarm.paths 管理

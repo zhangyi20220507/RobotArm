@@ -1,0 +1,58 @@
+{
+  "purpose": "2026-10-16 Best Practice illustration snapshot",
+  "sources": {
+    "act": {
+      "path": "artifacts/reports/act_training/act_lf180_90000_20261015.json",
+      "sha256": "c018eefd86f3730c307dd0a5c62399e77575172e0d0b1ebfa1d81651111a8185"
+    },
+    "pi0": {
+      "path": "artifacts/reports/pi0_lora/pi0_lora_lf180_v1_20261014.json",
+      "sha256": "d4b26dcabc0caf22b62cf41df91a14123762eaf0ab9a13d955848667ff6f72b5"
+    },
+    "denoising": {
+      "path": "artifacts/reports/pi0_lora/pi0_denoising_5_vs_10_20261014.json",
+      "sha256": "3a78d4b344a8fe2a9bd929c85295b74b93702c510d1d2d0e0a65af03f49403cf"
+    }
+  },
+  "figures": [
+    {
+      "file": "act_loss.png",
+      "sources": [
+        "act"
+      ],
+      "note": "数据：LF180（182 episodes）；三段续训合并。训练/验证模式不同，左图不构成严格同条件泛化比较。\n右图为局部纵轴，不从 0 开始；87000 步未保存，不能把其成绩归给相邻权重。"
+    },
+    {
+      "file": "act_latent.png",
+      "sources": [
+        "act"
+      ],
+      "note": "每个 checkpoint：Train / Validation 各 128 个相同起点；seed=1000，batch=8，重建重复 2 次。\n关闭增强/dropout/BN 更新；仅 L1，不含 KL，排除 padding。点间连线仅辅助阅读，不是额外测量。"
+    },
+    {
+      "file": "pi0_loss.png",
+      "sources": [
+        "pi0"
+      ],
+      "note": "batch=1，lr=1e-4，LoRA rank=16 / alpha=32；验证日志每次最多 256 起点。无平滑。\nFlow loss 不是动作 L1，也不能与 ACT 的 L1 直接比较；最低 flow loss 不保证最低动作误差。"
+    },
+    {
+      "file": "pi0_horizon_error.png",
+      "sources": [
+        "denoising"
+      ],
+      "note": "均匀组 32 起点、近零位组 7 起点；每起点 2 个种子，5/10 次复用同一噪声。排除 padding；远期有效样本可能减少。\n仅在 k=0/5/10/13/19/49 实测，连线辅助阅读；MAE 是对真实动作的误差，不是相对反馈的 raw gap，也不代表成功率。"
+    },
+    {
+      "file": "pi0_latency.png",
+      "sources": [
+        "denoising"
+      ],
+      "note": "每设置 174 次预测，各丢弃 3 次预热；柱子为中位数/P95，不是均值或误差棒。\n含预处理和 CPU 回传；不含视频解码、实时相机、CAN、预览或异步排队，不能代替真机控制周期。"
+    }
+  ],
+  "font": "Noto Sans CJK SC",
+  "matplotlib_version": "3.11.1",
+  "inference_performed": false,
+  "hardware_connected": false
+}

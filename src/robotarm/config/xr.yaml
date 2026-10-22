@@ -1,0 +1,99 @@
+# Independent PICO defaults; gamepad configuration is unchanged.
+piper-xr:
+  arms: 1 # 1 = right-controller single arm; 2 = independent left/right arms
+  channel: can_follower1
+  firmware: auto
+  model: piper
+  rate: 100.0
+  scale: 1.0
+  speed-percent: 50
+  joint-control-mode: js
+  xr-bridge-endpoint: tcp://127.0.0.1:60062
+  engagement-mode: grip # grip = hold Grip to follow; direct = follow without holding
+  grip-threshold: 0.9
+  grip-release-threshold: 0.7
+  gripper-max-mm: 100.0
+  gripper-speed-mm-s: 20.0
+  gripper-force: 1.0
+  gripper-force-hold-threshold: 0.8
+  button-hold-seconds: 1.0
+  xyz-min:
+  - 0.1
+  - -0.3
+  - 0.05
+  xyz-max:
+  - 0.55
+  - 0.3
+  - 0.55
+  max-relative-translation: 0.2
+  max-step-translation: 0.0024
+  max-step-rotation-deg: 1.2
+  max-step-joint: 0.009
+  max-joint-following-error: 0.05
+  joint-limit-tolerance-deg: 3.0
+  stale-timeout: 0.2
+  xr-wait-timeout: 60.0
+  task: Piper XR teleoperation
+  setup-id: piper_xr
+  setup-note: ''
+  global-camera-serial: '347522071736'
+  wrist-camera-serial: null
+  record-width: 640
+  record-height: 480
+  record-fps: 20
+  translation-speed: 0.12
+  joint-speed: 0.45
+  orientation-weight: 1.0e-05
+  posture-anchor: engage # engage: 零空间正则锚定接合姿势（防漂移）；seed: 跟随上一帧命令
+  xr-yaw-deg: 0.0
+  xr-mirror: none # lr/fb: mirror one horizontal axis if only that one is reversed
+  max-target-lead: 0.02
+
+# Two PICO controllers independently command two Piper arms.  Workspaces are
+# expressed in each arm's own base frame and must be tightened for the actual
+# physical installation before live operation.
+piper-bimanual-xr:
+  left-channel: can_leader1
+  right-channel: can_follower1
+  firmware: auto
+  model: piper
+  rate: 50.0
+  scale: 1.0
+  speed-percent: 10
+  joint-control-mode: js
+  xr-bridge-endpoint: tcp://127.0.0.1:60062
+  engagement-mode: grip # grip = hold Grip to follow; direct = follow without holding
+  grip-threshold: 0.9
+  grip-release-threshold: 0.7
+  gripper-max-mm: 70.0
+  gripper-speed-mm-s: 20.0
+  gripper-force: 1.0
+  gripper-force-hold-threshold: 0.8
+  button-hold-seconds: 1.0
+  left-xyz-min: [0.10, -0.30, 0.05]
+  left-xyz-max: [0.55, 0.30, 0.55]
+  right-xyz-min: [0.10, -0.30, 0.05]
+  right-xyz-max: [0.55, 0.30, 0.55]
+  # Origins in one shared, parallel-axis frame. Measure the real installation
+  # before enabling the optional flange-distance guard.
+  left-base-origin: [0.0, 0.0, 0.0]
+  right-base-origin: [0.0, 0.0, 0.0]
+  min-flange-separation: 0.0
+  max-relative-translation: 0.20
+  max-step-translation: 0.0024
+  max-step-rotation-deg: 1.2
+  max-step-joint: 0.009
+  max-joint-following-error: 0.05
+  joint-limit-tolerance-deg: 3.0
+  stale-timeout: 0.2
+  homing-stale-timeout: 1.0
+  xr-wait-timeout: 60.0
+  translation-speed: 0.12
+  joint-speed: 0.45
+  orientation-weight: 1.0e-05
+  posture-anchor: engage # engage: 零空间正则锚定接合姿势（防漂移）；seed: 跟随上一帧命令
+  left-xr-yaw-deg: 0.0
+  right-xr-yaw-deg: 0.0
+  left-xr-mirror: none # lr/fb: mirror one horizontal axis if only that one is reversed
+  right-xr-mirror: none
+  max-target-lead: 0.02

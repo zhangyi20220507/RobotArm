@@ -1,0 +1,15 @@
+torch==2.11.0
+torchvision==0.26.0
+numpy==2.2.6
+opencv-python==4.13.0.92
+opencv-python-headless==4.13.0.92
+gymnasium==1.3.0
+lerobot==0.6.1
+mani-skill==3.0.1
+sapien==3.0.3
+stable-baselines3==2.9.0
+placo==0.9.23
+pyrealsense2==2.56.5.9235
+python-can==4.6.1
+pyarrow==25.0.1
+pyzmq==27.1.0

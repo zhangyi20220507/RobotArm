@@ -1,0 +1,784 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RobotArm Dataset Browser</title>
+  <style>
+    :root{color-scheme:dark;--bg:#091019;--panel:#111b28;--panel2:#0d1622;--line:#24364b;--text:#e8f0f8;--muted:#899bb0;--blue:#55b8ff;--green:#55d69d;--amber:#ffc65c;--red:#ff7180}
+    *{box-sizing:border-box}body{margin:0;height:100vh;overflow:hidden;background:var(--bg);color:var(--text);font:12px system-ui,sans-serif;display:grid;grid-template-columns:218px minmax(0,1fr)}button,input,select,textarea{font:inherit}button{cursor:pointer}
+    aside{min-height:0;border-right:1px solid var(--line);display:grid;grid-template-rows:auto auto auto minmax(0,1fr);background:#0a121d}.brand{padding:10px 10px 7px;border-bottom:1px solid var(--line)}h1{font-size:16px;margin:0 0 2px}.muted{color:var(--muted)}
+    .counts{display:grid;grid-template-columns:repeat(4,1fr);gap:3px;padding:5px}.count{padding:4px 1px;text-align:center;background:var(--panel);border-radius:5px}.count b{display:block;font-size:14px}.filters{display:grid;grid-template-columns:1fr 78px;gap:4px;padding:0 5px 5px}.filters input,.filters select,select,textarea{min-width:0;width:100%;background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:5px;padding:5px}
+    #episodes{min-height:0;overflow:auto;padding:0 4px 6px}.ep{display:grid;grid-template-columns:1fr auto;width:100%;text-align:left;padding:5px 7px;margin:1px 0;border:1px solid transparent;border-radius:6px;background:transparent;color:var(--text);line-height:1.2}.ep:hover{background:#152235}.ep.active{border-color:var(--blue);background:#14283c}.ep small{color:var(--muted)}.badge{align-self:center;padding:1px 4px;border-radius:7px;font-size:9px}.keep{background:#174936;color:#77e8b6}.reject{background:#51232b;color:#ff9ba5}.review{background:#4c3917;color:#ffd27a}.unreviewed{color:var(--muted)}
+    main{min-width:0;height:100vh;padding:10px 12px;display:grid;grid-template-rows:minmax(42px,auto) minmax(280px,44vh) auto minmax(240px,1fr);gap:8px;overflow:auto}.top{display:flex;align-items:center;justify-content:space-between}.top h1{display:inline;margin-right:10px}.nav button,.control{background:#172538;color:var(--text);border:1px solid var(--line);border-radius:7px;padding:7px 11px}.nav button:hover,.control:hover{border-color:var(--blue)}
+    .upper{display:grid;grid-template-columns:minmax(420px,1.35fr) minmax(285px,.72fr) minmax(285px,.78fr);gap:8px;min-height:0}.card{min-height:0;background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:8px}.card h2{font-size:12px;margin:0 0 5px}.video-card{display:grid;grid-template-rows:auto minmax(0,1fr) 34px}.videos{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:5px;min-height:0}.video-wrap{min-height:0;display:grid;grid-template-rows:16px minmax(0,1fr)}video{width:100%;height:100%;object-fit:contain;background:#020406;border-radius:6px}
+    .transport{display:grid;grid-template-columns:auto auto auto minmax(80px,1fr) 52px 56px;gap:4px;align-items:end}.transport button{height:28px;padding:2px 7px}.transport input{width:100%}.clock{text-align:right;font-variant-numeric:tabular-nums}.side{display:contents}.metrics{display:grid;grid-template-columns:1fr 1fr;gap:4px}.metric{background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:5px}.metric b{display:block;font-size:14px}.score{grid-column:1/-1;display:flex;justify-content:space-between;align-items:center}.score b{font-size:22px}.good b{color:var(--green)}.warn b{color:var(--amber)}.bad b{color:var(--red)}#warnings{font-size:10px;color:var(--amber);margin-top:4px;max-height:32px;overflow:auto}
+    .review-card{display:grid;grid-template-rows:auto auto minmax(42px,1fr) auto;gap:5px}.review-buttons{display:grid;grid-template-columns:repeat(4,1fr);gap:4px}.review-buttons button{border:1px solid var(--line);border-radius:6px;padding:5px;background:var(--panel2);color:var(--text)}.review-buttons .selected{outline:2px solid white}.review-buttons .keep{background:#174936}.review-buttons .review{background:#4c3917}.review-buttons .reject{background:#51232b}textarea{resize:none}.save{background:#17679d!important;color:white!important}.details{display:flex;gap:12px;color:var(--muted);font-size:11px}
+    .charts-card{display:grid;grid-template-rows:auto minmax(0,1fr)}.chart-head{display:flex;justify-content:space-between;align-items:center}.legend{color:var(--muted);font-size:11px}.dot{display:inline-block;width:10px;height:3px;margin:0 4px 2px 10px}.chart-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr));gap:5px;min-height:0}.mini{min-height:0;background:var(--panel2);border:1px solid var(--line);border-radius:6px;display:grid;grid-template-rows:18px minmax(0,1fr);padding:3px 5px}.mini-title{font-size:11px;color:var(--muted)}canvas{width:100%;height:100%;min-height:0}
+    @media(max-width:1450px){.upper{grid-template-columns:minmax(420px,1.35fr) minmax(280px,.8fr)}.side{display:grid;grid-template-rows:auto minmax(0,1fr);gap:8px;min-height:0}}
+    @media(max-width:1100px){body{grid-template-columns:200px minmax(0,1fr)}.upper{grid-template-columns:1.4fr 1fr}.chart-grid{grid-template-columns:repeat(3,1fr);grid-template-rows:repeat(3,1fr)}}
+
+    .trim-tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    .trim-tools input[type=number]{width:85px}
+    .trim-tools input:not([type=checkbox]){background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:5px;padding:5px}
+    .export-row{margin-top:8px;padding-top:8px;border-top:1px solid var(--line)}
+    #trimSummary,#exportStatus{white-space:pre-wrap;overflow-wrap:anywhere}
+    #exportProgress{margin-top:8px}#exportProgress label{display:block;font-variant-numeric:tabular-nums}
+    #exportProgressBar{display:block;width:100%;height:16px;margin:5px 0;accent-color:var(--blue)}
+    #exportProgress.failed #exportProgressBar{accent-color:var(--red)}
+    #exportProgress.complete #exportProgressBar{accent-color:var(--green)}
+    .error{color:var(--red)}button:disabled{opacity:.5;cursor:wait}
+    .top,.nav{gap:6px;flex-wrap:wrap}.nav{display:flex;align-items:center}
+    html[lang="en"] .filters{grid-template-columns:1fr 105px}
+    html[lang="en"] .transport{grid-template-columns:auto auto auto minmax(60px,1fr) 52px 56px}
+    html[lang="en"] .review-buttons button{padding:5px 3px}
+  </style>
+</head>
+<body>
+  <aside>
+    <div class="brand"><h1 data-i18n="Dataset Browser">数据集审核</h1><div id="dataset" class="muted"><span data-i18n="加载中…">加载中…</span></div></div>
+    <div class="counts"><div class="count"><b id="cAll">0</b><span data-i18n="全部">全部</span></div><div class="count"><b id="cKeep">0</b><span data-i18n="保留">保留</span></div><div class="count"><b id="cReview">0</b><span data-i18n="复查">复查</span></div><div class="count"><b id="cReject">0</b><span data-i18n="剔除">剔除</span></div></div>
+    <div class="filters"><input id="search" placeholder="搜索编号/任务" data-i18n-placeholder="搜索编号/任务"><select id="statusFilter"><option value="" data-i18n="全部状态">全部状态</option><option value="unreviewed" data-i18n="未审查">未审查</option><option value="keep" data-i18n="保留">保留</option><option value="review" data-i18n="待复查">待复查</option><option value="reject" data-i18n="剔除">剔除</option></select></div>
+    <div id="episodes"></div>
+  </aside>
+  <main>
+    <header class="top"><div><h1 id="title">Episode</h1><span id="task" class="muted"></span></div><div class="nav"><button id="languageToggle" type="button" class="control" title="切换为英文">English</button> <span class="muted"><span data-i18n="↑↓ 切换条目 · ←→ 逐帧 · 空格 播放/暂停">↑↓ 切换条目 · ←→ 逐帧 · 空格 播放/暂停&nbsp;&nbsp;</span></span><button id="prev" title="快捷键：↑" data-i18n-title="快捷键：↑"><span data-i18n="← 上一个">← 上一个</span></button> <button id="next" title="快捷键：↓" data-i18n-title="快捷键：↓"><span data-i18n="下一个 →">下一个 →</span></button></div></header>
+    <section class="upper">
+      <div class="card video-card"><h2><span data-i18n="同步视频">同步视频</span></h2><div id="videos" class="videos"></div><div class="transport"><button id="back" class="control" title="后退一帧" data-i18n-title="后退一帧"><span data-i18n="−1 帧">−1 帧</span></button><button id="play" class="control" title="空格播放/暂停" data-i18n-title="空格播放/暂停"><span data-i18n="▶ 播放">▶ 播放</span></button><button id="forward" class="control" title="前进一帧" data-i18n-title="前进一帧"><span data-i18n="+1 帧">+1 帧</span></button><input id="seek" type="range" min="0" max="1" value="0" step="0.001"><span id="clock" class="clock">0.00s</span><select id="speed"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></div></div>
+      <div class="side"><div class="card"><h2><span data-i18n="自动质量指标">自动质量指标 </span><span class="muted"><span data-i18n="（整条轨迹，仅辅助）">（整条轨迹，仅辅助）</span></span></h2><div id="metrics" class="metrics"></div><div id="warnings"></div></div><div class="card review-card"><div><h2><span data-i18n="人工审查">人工审查</span></h2><div id="details" class="details"></div></div><div class="review-buttons"><button data-status="keep" class="keep"><span data-i18n="保留">保留</span></button><button data-status="review" class="review"><span data-i18n="复查">复查</span></button><button data-status="reject" class="reject"><span data-i18n="剔除">剔除</span></button><button data-status=""><span data-i18n="清除">清除</span></button></div><textarea id="note" placeholder="记录问题发生的时间和现象" data-i18n-placeholder="记录问题发生的时间和现象"></textarea><div><button id="save" class="control save"><span data-i18n="保存标记与裁剪">保存标记与裁剪</span></button> <span id="saved" class="muted"></span></div></div></div>
+    </section>
+    <section class="card">
+      <h2><span data-i18n="当前 Episode 保留片段（不修改原数据）">当前 Episode 保留片段（不修改原数据）</span></h2>
+      <div class="trim-tools">
+        <label><span data-i18n="起点（秒）">起点（秒） </span><input id="trimStart" type="number" min="0" step="any" value="0"></label>
+        <label><span data-i18n="终点（秒）">终点（秒） </span><input id="trimEnd" type="number" min="0" step="any" value="0"></label>
+        <button id="markStart" class="control"><span data-i18n="当前帧设起点">当前帧设起点</span></button>
+        <button id="markEnd" class="control"><span data-i18n="当前帧后设终点">当前帧后设终点</span></button>
+        <button id="trimReset" class="control"><span data-i18n="恢复整条">恢复整条</span></button>
+        <label><input id="previewTrim" type="checkbox"><span data-i18n="只播放所选片段">只播放所选片段</span></label>
+      </div>
+      <div id="trimSummary" class="muted"></div>
+      <div class="trim-tools export-row">
+        <label><span data-i18n="新数据集名称">新数据集名称 </span><input id="exportName" size="42" placeholder="dataset_trimmed_v1"></label>
+        <button id="export" class="control save"><span data-i18n="导出已保存的裁剪数据集">导出已保存的裁剪数据集</span></button>
+        <span class="muted"><span data-i18n="保留/未审查参与导出；复查/剔除不导出。未裁剪的条目保留整条。">保留/未审查参与导出；复查/剔除不导出。未裁剪的条目保留整条。</span></span>
+      </div>
+      <div id="exportProgress" hidden>
+        <label id="exportEpisodeCount" for="exportProgressBar"></label>
+        <progress id="exportProgressBar" value="0" max="1" aria-labelledby="exportEpisodeCount"></progress>
+        <div id="exportCurrent" class="muted"></div>
+      </div>
+      <div id="exportStatus" class="muted" role="status"></div>
+    </section>
+    <section class="card charts-card"><div class="chart-head"><h2><span data-i18n="全部关节与夹爪：状态 / 动作">全部关节与夹爪：状态 / 动作</span></h2><div class="legend"><i class="dot" style="background:var(--blue)"></i>state <i class="dot" style="background:var(--amber)"></i>action <i class="dot" style="background:var(--red)"></i><span data-i18n="当前帧">当前帧</span></div></div><div id="charts" class="chart-grid"></div></section>
+  </main>
+
+  <script>
+    let meta, current, time=0, playing=false, selectedStatus='', loadGeneration=0;
+    let dirty=false, saving=false, exporting=false, playbackGeneration=0;
+    let exportJob=null;
+    const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+
+    // UI-only localization. Dataset content, review status IDs and saved ranges never change.
+    const translations = {
+  "Dataset Browser": [
+    "数据集审核",
+    "Dataset Browser"
+  ],
+  "加载中…": [
+    "加载中…",
+    "Loading…"
+  ],
+  "全部": [
+    "全部",
+    "All"
+  ],
+  "保留": [
+    "保留",
+    "Keep"
+  ],
+  "复查": [
+    "复查",
+    "Review"
+  ],
+  "剔除": [
+    "剔除",
+    "Reject"
+  ],
+  "未审查": [
+    "未审查",
+    "Unreviewed"
+  ],
+  "待复查": [
+    "待复查",
+    "Review"
+  ],
+  "清除": [
+    "清除",
+    "Clear"
+  ],
+  "搜索编号/任务": [
+    "搜索编号/任务",
+    "Search ID / task"
+  ],
+  "全部状态": [
+    "全部状态",
+    "All statuses"
+  ],
+  "↑↓ 切换条目 · ←→ 逐帧 · 空格 播放/暂停": [
+    "↑↓ 切换条目 · ←→ 逐帧 · 空格 播放/暂停",
+    "↑↓ Episodes · ←→ Frames · Space Play/pause"
+  ],
+  "快捷键：↑": [
+    "快捷键：↑",
+    "Shortcut: ↑"
+  ],
+  "快捷键：↓": [
+    "快捷键：↓",
+    "Shortcut: ↓"
+  ],
+  "← 上一个": [
+    "← 上一个",
+    "← Previous"
+  ],
+  "下一个 →": [
+    "下一个 →",
+    "Next →"
+  ],
+  "同步视频": [
+    "同步视频",
+    "Synchronized video"
+  ],
+  "后退一帧": [
+    "后退一帧",
+    "Previous frame"
+  ],
+  "前进一帧": [
+    "前进一帧",
+    "Next frame"
+  ],
+  "−1 帧": [
+    "−1 帧",
+    "−1 frame"
+  ],
+  "+1 帧": [
+    "+1 帧",
+    "+1 frame"
+  ],
+  "空格播放/暂停": [
+    "空格播放/暂停",
+    "Space: play/pause"
+  ],
+  "▶ 播放": [
+    "▶ 播放",
+    "▶ Play"
+  ],
+  "❚❚ 暂停": [
+    "❚❚ 暂停",
+    "❚❚ Pause"
+  ],
+  "自动质量指标": [
+    "自动质量指标",
+    "Quality metrics"
+  ],
+  "（整条轨迹，仅辅助）": [
+    "（整条轨迹，仅辅助）",
+    "(Full episode; advisory only)"
+  ],
+  "人工审查": [
+    "人工审查",
+    "Manual review"
+  ],
+  "记录问题发生的时间和现象": [
+    "记录问题发生的时间和现象",
+    "Note the time and describe the issue"
+  ],
+  "保存标记与裁剪": [
+    "保存标记与裁剪",
+    "Save review & trim"
+  ],
+  "当前 Episode 保留片段（不修改原数据）": [
+    "当前 Episode 保留片段（不修改原数据）",
+    "Keep a segment of this episode (source unchanged)"
+  ],
+  "起点（秒）": [
+    "起点（秒）",
+    "Start (s)"
+  ],
+  "终点（秒）": [
+    "终点（秒）",
+    "End (s)"
+  ],
+  "当前帧设起点": [
+    "当前帧设起点",
+    "Start at current frame"
+  ],
+  "当前帧后设终点": [
+    "当前帧后设终点",
+    "End after current frame"
+  ],
+  "恢复整条": [
+    "恢复整条",
+    "Reset to full episode"
+  ],
+  "只播放所选片段": [
+    "只播放所选片段",
+    "Play selected segment only"
+  ],
+  "新数据集名称": [
+    "新数据集名称",
+    "New dataset name"
+  ],
+  "导出已保存的裁剪数据集": [
+    "导出已保存的裁剪数据集",
+    "Export saved trims"
+  ],
+  "保留/未审查参与导出；复查/剔除不导出。未裁剪的条目保留整条。": [
+    "保留/未审查参与导出；复查/剔除不导出。未裁剪的条目保留整条。",
+    "Keep/unreviewed episodes are exported; review/reject are excluded. Untrimmed episodes stay complete."
+  ],
+  "全部关节与夹爪：状态 / 动作": [
+    "全部关节与夹爪：状态 / 动作",
+    "All joints & gripper: state / action"
+  ],
+  "当前帧": [
+    "当前帧",
+    "Current frame"
+  ],
+  "未保存": [
+    "未保存",
+    "Unsaved changes"
+  ],
+  "请先选择 episode": [
+    "请先选择 episode",
+    "Select an episode first"
+  ],
+  "所选区间没有采样帧，请扩大范围": [
+    "所选区间没有采样帧，请扩大范围",
+    "No sampled frames in this range; select a wider interval."
+  ],
+  "正在保存，请稍候": [
+    "正在保存，请稍候",
+    "Saving, please wait"
+  ],
+  "当前 episode 的标记/裁剪尚未保存，放弃修改并切换？": [
+    "当前 episode 的标记/裁剪尚未保存，放弃修改并切换？",
+    "This episode has unsaved review/trim changes. Discard them and switch?"
+  ],
+  "已保存标记与裁剪": [
+    "已保存标记与裁剪",
+    "Review and trim saved"
+  ],
+  "最大关节动作步长": [
+    "最大关节动作步长",
+    "Max joint action step"
+  ],
+  "P95 关节跟随误差": [
+    "P95 关节跟随误差",
+    "P95 joint tracking error"
+  ],
+  "最大夹爪动作步长": [
+    "最大夹爪动作步长",
+    "Max gripper action step"
+  ],
+  "P95 夹爪跟随误差": [
+    "P95 夹爪跟随误差",
+    "P95 gripper tracking error"
+  ],
+  "时间戳最大抖动": [
+    "时间戳最大抖动",
+    "Max timestamp jitter"
+  ],
+  "静止帧比例": [
+    "静止帧比例",
+    "Idle frame ratio"
+  ],
+  "整条质量评分": [
+    "整条质量评分",
+    "Full-episode quality score"
+  ],
+  "✓ 未发现规则型异常，仍需人工确认": [
+    "✓ 未发现规则型异常，仍需人工确认",
+    "✓ No rule-based issues found; manual review is still required."
+  ],
+  "动作存在大于 5°/帧的关节跳变": [
+    "动作存在大于 5°/帧的关节跳变",
+    "Joint action jumps exceed 5° per frame"
+  ],
+  "夹爪动作存在大于 10 mm/帧的跳变": [
+    "夹爪动作存在大于 10 mm/帧的跳变",
+    "Gripper action jumps exceed 10 mm per frame"
+  ],
+  "关节 state/action 跟随误差偏大": [
+    "关节 state/action 跟随误差偏大",
+    "Large joint state/action tracking error"
+  ],
+  "夹爪 state/action 跟随误差偏大": [
+    "夹爪 state/action 跟随误差偏大",
+    "Large gripper state/action tracking error"
+  ],
+  "时间戳间隔抖动超过 5 ms": [
+    "时间戳间隔抖动超过 5 ms",
+    "Timestamp interval jitter exceeds 5 ms"
+  ],
+  "静止帧比例较高，请检查无效等待": [
+    "静止帧比例较高，请检查无效等待",
+    "High idle-frame ratio; check for unnecessary waiting"
+  ],
+  "请先保存当前条目的修改，再导出。": [
+    "请先保存当前条目的修改，再导出。",
+    "Save the current episode's changes before exporting."
+  ],
+  "复制帧": [
+    "复制帧",
+    "Copying frames"
+  ],
+  "编码视频": [
+    "编码视频",
+    "Encoding videos"
+  ],
+  "生成统计与来源清单": [
+    "生成统计与来源清单",
+    "Generating statistics and provenance"
+  ],
+  "加载导出依赖": [
+    "加载导出依赖",
+    "Loading export dependencies"
+  ],
+  "导出完成": [
+    "导出完成",
+    "Export complete"
+  ],
+  "新目录名只允许字母、数字、下划线、点和短横线，不能包含路径": [
+    "新目录名只允许字母、数字、下划线、点和短横线，不能包含路径",
+    "Use a new directory name with letters, digits, underscores, dots or hyphens only; no paths."
+  ],
+  "输出目录已经存在，请换一个新名称": [
+    "输出目录已经存在，请换一个新名称",
+    "Output directory already exists; choose a new name."
+  ],
+  "已有导出任务正在运行": [
+    "已有导出任务正在运行",
+    "An export is already running."
+  ],
+  "起止时间必须是有限数字": [
+    "起止时间必须是有限数字",
+    "Start and end must be finite numbers."
+  ],
+  "所选时间段没有完整采样帧，请扩大范围": [
+    "所选时间段没有完整采样帧，请扩大范围",
+    "No sampled frames in this interval; select a wider range."
+  ],
+  "裁剪标记与当前 episode 长度/FPS 不符，请重新审核": [
+    "裁剪标记与当前 episode 长度/FPS 不符，请重新审核",
+    "Trim metadata does not match this episode's length/FPS; review it again."
+  ],
+  "没有可导出的轨迹：复查和剔除条目不参与导出": [
+    "没有可导出的轨迹：复查和剔除条目不参与导出",
+    "Nothing to export: review/reject episodes are excluded."
+  ],
+  "导出必须是源数据集旁边尚不存在的新目录": [
+    "导出必须是源数据集旁边尚不存在的新目录",
+    "Export must use a new, nonexistent directory next to the source dataset."
+  ],
+  "invalid episode index": [
+    "无效的 episode 编号",
+    "Invalid episode index"
+  ],
+  "invalid review status": [
+    "无效的审查状态",
+    "Invalid review status"
+  ],
+  "invalid trim frame range": [
+    "无效的裁剪帧范围",
+    "Invalid trim frame range"
+  ],
+  "invalid trim: expected frame range object": [
+    "裁剪数据必须是帧范围对象",
+    "Invalid trim: expected a frame range object"
+  ],
+  "trim requires start_s and end_s": [
+    "裁剪须包含 start_s 和 end_s",
+    "Trim requires start_s and end_s"
+  ],
+  "quality-review file belongs to another dataset": [
+    "审查文件属于另一份数据集",
+    "The review file belongs to another dataset"
+  ],
+  "cross-origin writes are not allowed": [
+    "不允许跨站写入",
+    "Cross-origin writes are not allowed"
+  ],
+  "request too large": [
+    "请求大小不合法",
+    "Invalid request size"
+  ],
+  "request must be an object": [
+    "请求必须是JSON对象",
+    "Request must be a JSON object"
+  ],
+  "Content-Type must be application/json": [
+    "Content-Type 必须为 application/json",
+    "Content-Type must be application/json"
+  ],
+  "export requires a positive integer FPS": [
+    "导出要求FPS为正整数",
+    "Export requires a positive integer FPS"
+  ],
+  "empty export plan": [
+    "导出计划为空",
+    "Empty export plan"
+  ],
+  "exported frame/episode count mismatch": [
+    "导出的帧数/轨迹数不匹配",
+    "Exported frame/episode count mismatch"
+  ],
+  "frames": [
+    "帧",
+    "frames"
+  ],
+  "trimmed": [
+    "已裁剪",
+    "trimmed"
+  ],
+  "episode": [
+    "轨迹",
+    "Episode"
+  ],
+  "datasetSummary": [
+    "{name} · {count} 条轨迹 · {fps} FPS",
+    "{name} · {count} episodes · {fps} FPS"
+  ],
+  "details": [
+    "{count} 帧 · {duration} 秒 · {fps} FPS",
+    "{count} frames · {duration} s · {fps} FPS"
+  ],
+  "rangeError": [
+    "起止时间须满足 0 ≤ 起点 < 终点 ≤ {duration} 秒",
+    "Range must satisfy 0 ≤ start < end ≤ {duration} s"
+  ],
+  "trimSummary": [
+    "实际保留 [{start}, {end}) 秒 · {count} 帧；包含起点帧、不包含终点帧。绿色区域为保留范围。保存后需导出新目录，训练才会使用裁剪结果。",
+    "Keep [{start}, {end}) s · {count} frames. Start included, end excluded. Green marks the retained range. Save and export a new dataset to apply trims to training."
+  ],
+  "exportProgress": [
+    "{phase} · {done}/{total} 帧\n输出：{output}；导出期间请保持服务运行。",
+    "{phase} · {done}/{total} frames\nOutput: {output}. Keep the server running during export."
+  ],
+  "exportEpisodeCount": [
+    "总计 {total} 条 · 已完成 {done} 条 · {percent}%（按 Episode 计）",
+    "Total: {total} episodes · Completed: {done} · {percent}% (by episode)"
+  ],
+  "exportCurrent": [
+    "正在处理第 {position}/{total} 条（原 Episode {episode}）· {phase}",
+    "Processing {position}/{total} (source Episode {episode}) · {phase}"
+  ],
+  "exportComplete": [
+    "完成：{episodes} 条 / {frames} 帧\n{output}\n训练时请改用此新目录；不要将原数据与裁剪副本混入同一次训练。",
+    "Complete: {episodes} episodes / {frames} frames\n{output}\nTrain on this new directory; do not mix source data and trimmed copies in one training run."
+  ],
+  "exportFailed": [
+    "导出失败：{error}\n部分输出不可用于训练；请排查后换新目录名重试。",
+    "Export failed: {error}\nDo not train on partial output. Resolve the error and retry with a new directory name."
+  ],
+  "exportConfirm": [
+    "导出已保存的 {episodes} 条轨迹、{frames} 帧到新目录？\n复查/剔除不导出，原数据保留；视频将重新编码，可能需要较长时间。",
+    "Export the saved selection of {episodes} episodes and {frames} frames to a new directory?\nReview/reject episodes are excluded; originals are preserved. Re-encoding video may take some time."
+  ],
+  "exportParent": [
+    "输出父目录：{path}",
+    "Output parent directory: {path}"
+  ],
+  "switchLanguage": [
+    "切换为英文",
+    "Switch to Chinese"
+  ],
+  "unsupportedCamera": [
+    "目前裁剪导出支持 RGB HWC 相机，无法导出 {key}",
+    "Trim export currently supports RGB HWC cameras; cannot export {key}"
+  ],
+  "sourceChanged": [
+    "源轨迹 {episode} 的长度发生变化",
+    "Source episode {episode} length changed"
+  ],
+  "invalidStatusEpisode": [
+    "轨迹 {episode} 的审查状态无效",
+    "Invalid review status: episode {episode}"
+  ],
+  "rawError": [
+    "错误详情：{error}",
+    "Error details: {error}"
+  ]
+};
+    const languageStorageKey='robotarm.datasetBrowser.language';
+    let language='zh-CN';
+    try{if(window.localStorage.getItem(languageStorageKey)==='en')language='en'}catch(e){}
+    const messages=new Map();
+    function t(key,params={}){
+      const template=translations[key]?.[language==='en'?1:0]??key;
+      return template.replace(/\{(\w+)\}/g,(_,name)=>String(params[name]??'{'+name+'}'));
+    }
+    class LocalizedError extends Error{
+      constructor(key,params={}){super(t(key,params));this.key=key;this.params=params}
+    }
+    function errorText(error){
+      if(error instanceof LocalizedError)return t(error.key,error.params);
+      const raw=error instanceof Error?error.message:String(error);
+      if(translations[raw])return t(raw);
+      // Backend diagnostics retain the raw technical details if no UI translation is known.
+      let match=raw.match(/^保留范围须满足 0 ≤ 起点 < 终点 ≤ (.+) 秒$/);
+      if(match)return t('rangeError',{duration:match[1]});
+      match=raw.match(/^目前裁剪导出支持 RGB HWC 相机，无法导出 (.+)$/);
+      if(match)return t('unsupportedCamera',{key:match[1]});
+      match=raw.match(/^source episode (\d+) length changed$/);
+      if(match)return t('sourceChanged',{episode:match[1]});
+      match=raw.match(/^invalid review status: episode (\d+)$/);
+      if(match)return t('invalidStatusEpisode',{episode:match[1]});
+      match=raw.match(/^([A-Za-z]+Error): (.+)$/s);
+      if(match)return match[1]+': '+errorText(match[2]);
+      return raw;
+    }
+    function renderMessage(id,entry){
+      const text=typeof entry.text==='function'?entry.text():errorText(entry.text);
+      $(id).textContent=text;$(id).classList.toggle('error',entry.error);
+    }
+    function renderLocalizedState(){
+      $('#play').textContent=t(playing?'❚❚ 暂停':'▶ 播放');
+      if(meta){
+        $('#dataset').textContent=t('datasetSummary',{name:meta.name,count:meta.total_episodes,fps:meta.fps});
+        renderList();
+      }
+      if(current){
+        $('#title').textContent=t('episode')+' '+current.index;
+        $('#details').textContent=t('details',{count:current.length,duration:current.duration.toFixed(2),fps:meta.fps});
+        renderMetrics();trimSummary();
+      }
+      messages.forEach((entry,id)=>renderMessage(id,entry));
+      renderExportProgress();
+    }
+    function setLanguage(next,persist=true){
+      language=next==='en'?'en':'zh-CN';
+      if(persist){try{window.localStorage.setItem(languageStorageKey,language)}catch(e){}}
+      document.documentElement.lang=language;
+      document.title='RobotArm · '+t('Dataset Browser');
+      $$('[data-i18n]').forEach(el=>el.textContent=t(el.dataset.i18n));
+      for(const attr of ['title','placeholder']){
+        $$('[data-i18n-'+attr+']').forEach(el=>el.setAttribute(attr,t(el.getAttribute('data-i18n-'+attr))));
+      }
+      $('#languageToggle').textContent=language==='en'?'中文':'English';
+      $('#languageToggle').setAttribute('title',t('switchLanguage'));
+      $('#languageToggle').setAttribute('aria-label',t('switchLanguage'));
+      renderLocalizedState();
+    }
+    $('#languageToggle').onclick=()=>setLanguage(language==='en'?'zh-CN':'en');
+
+    const labels={unreviewed:'未审查',keep:'保留',review:'待复查',reject:'剔除'};
+    async function api(url,opt){
+      const response=await fetch(url,opt);
+      const result=await response.json();
+      if(!response.ok)throw Error(result.error||JSON.stringify(result));
+      return result;
+    }
+    function message(id,text,error=false){const entry={text,error};messages.set(id,entry);renderMessage(id,entry)}
+    function changed(){dirty=true;message('#saved','未保存')}
+    function statusOf(i){return meta.reviews[String(i)]?.status||'unreviewed'}
+    function updateCounts(){
+      const values=Object.values(meta.reviews);
+      $('#cAll').textContent=meta.total_episodes;
+      ['Keep','Review','Reject'].forEach(key=>$('#c'+key).textContent=values.filter(x=>x.status===key.toLowerCase()).length);
+    }
+    function renderList(){
+      const query=$('#search').value.trim().toLowerCase(), filter=$('#statusFilter').value, list=$('#episodes');
+      list.replaceChildren();
+      meta.episodes.filter(x=>(!query||String(x.index).includes(query)||x.tasks.join(' ').toLowerCase().includes(query))&&(!filter||statusOf(x.index)===filter)).forEach(x=>{
+        const button=document.createElement('button'),status=statusOf(x.index);
+        button.className='ep '+(current?.index===x.index?'active':'');
+        const left=document.createElement('span'),badge=document.createElement('span'),trim=meta.reviews[String(x.index)]?.trim;
+        left.innerHTML=t('episode')+' '+x.index+'<br><small>'+x.length+' '+t('frames')+' · '+x.duration.toFixed(1)+'s'+
+          (trim?' · '+t('trimmed')+' '+(trim.start_frame/meta.fps).toFixed(2)+'–'+(trim.end_frame/meta.fps).toFixed(2)+'s':'')+'</small>';
+        badge.className='badge '+status;badge.textContent=t(labels[status]);
+        button.append(left,badge);button.onclick=()=>loadEpisode(x.index);list.appendChild(button);
+      });
+      requestAnimationFrame(()=>list.querySelector('.active')?.scrollIntoView({block:'nearest'}));updateCounts();
+    }
+    function releaseVideos(){
+      $('#videos').querySelectorAll('video').forEach(v=>{v.pause();v.removeAttribute('src');v.load()});
+      $('#videos').replaceChildren();
+    }
+    function bounds(){
+      if(!current)throw new LocalizedError('请先选择 episode');
+      const start=Number($('#trimStart').value),end=Number($('#trimEnd').value);
+      if($('#trimStart').value===''||$('#trimEnd').value===''||!Number.isFinite(start)||!Number.isFinite(end)||
+         start<0||start>=end||end>current.duration+1e-9)throw new LocalizedError('rangeError',{duration:current.duration});
+      const first=Math.ceil(start*meta.fps-1e-8),stop=Math.min(current.length,Math.ceil(end*meta.fps-1e-8));
+      if(first>=stop)throw new LocalizedError('所选区间没有采样帧，请扩大范围');
+      return {start:first/meta.fps,end:stop/meta.fps,first,stop};
+    }
+    function trimSummary(){
+      try{
+        const r=bounds();
+        message('#trimSummary',()=>t('trimSummary',{start:r.start.toFixed(3),end:r.end.toFixed(3),count:r.stop-r.first}));
+      }catch(e){message('#trimSummary',e,true)}
+      drawAll();
+    }
+    async function loadEpisode(index){
+      if(saving)return message('#saved','正在保存，请稍候');
+      if(dirty&&!confirm(t('当前 episode 的标记/裁剪尚未保存，放弃修改并切换？')))return;
+      dirty=false;const generation=++loadGeneration;pause();releaseVideos();current=null;
+      try{
+        const episode=await api('/api/episode/'+index);
+        if(generation!==loadGeneration)return;
+        current=episode;time=0;$('#title').textContent=t('episode')+' '+index;$('#task').textContent=current.tasks.join(' · ');
+        $('#seek').max=Math.max(0,(current.length-1)/meta.fps);$('#seek').value=0;
+        current.videos.forEach(video=>{
+          const wrap=document.createElement('div');wrap.className='video-wrap';
+          const label=document.createElement('span');label.className='muted';label.textContent=video.key;
+          const element=document.createElement('video');
+          element.preload='auto';element.muted=true;element.playsInline=true;element.dataset.offset=video.from;element.src=video.url;
+          element.onloadedmetadata=()=>{if(generation===loadGeneration)element.currentTime=+element.dataset.offset+time};
+          element.onended=()=>{if(generation===loadGeneration)pause()};
+          wrap.append(label,element);$('#videos').appendChild(wrap);
+        });
+        $('#charts').replaceChildren();
+        current.names.forEach((name,j)=>{
+          const wrap=document.createElement('div');wrap.className='mini';
+          const title=document.createElement('div');title.className='mini-title';title.textContent=name+(j===6?' (m)':' (rad)');
+          const canvas=document.createElement('canvas');canvas.dataset.dimension=j;wrap.append(title,canvas);$('#charts').appendChild(wrap);
+        });
+        const review=meta.reviews[String(index)]||{};
+        selectedStatus=review.status||'';$('#note').value=review.note||'';
+        $('#trimStart').value=review.trim?review.trim.start_frame/meta.fps:0;
+        $('#trimEnd').value=review.trim?review.trim.end_frame/meta.fps:current.duration;
+        $('#trimStart').max=current.duration;$('#trimEnd').max=current.duration;
+        if($('#previewTrim').checked)time=bounds().start;
+        message('#saved','');markButtons();renderMetrics();trimSummary();renderList();sync(true);
+        $('#details').textContent=t('details',{count:current.length,duration:current.duration.toFixed(2),fps:meta.fps});
+      }catch(e){message('#saved',e,true)}
+    }
+    function renderMetrics(){
+      const m=current.metrics,level=m.score>=90?'good':m.score>=70?'warn':'bad';
+      const items=[['最大关节动作步长',m.max_joint_step_deg.toFixed(2)+'°'],['P95 关节跟随误差',m.p95_tracking_deg.toFixed(2)+'°'],
+        ['最大夹爪动作步长',m.max_gripper_step_mm.toFixed(2)+' mm'],['P95 夹爪跟随误差',m.p95_gripper_tracking_mm.toFixed(2)+' mm'],
+        ['时间戳最大抖动',m.timestamp_jitter_ms.toFixed(2)+' ms'],['静止帧比例',(m.idle_ratio*100).toFixed(1)+'%']];
+      $('#metrics').innerHTML='<div class="metric score '+level+'"><span>'+t('整条质量评分')+'</span><b>'+m.score+'</b></div>'+
+        items.map(([key,value])=>'<div class="metric"><span>'+t(key)+'</span><b>'+value+'</b></div>').join('');
+      $('#warnings').textContent=m.warnings.length?'⚠ '+m.warnings.map(w=>t(w)).join(language==='en'?'; ':'；'):t('✓ 未发现规则型异常，仍需人工确认');
+    }
+    function markButtons(){$$('.review-buttons button').forEach(b=>b.classList.toggle('selected',b.dataset.status===selectedStatus))}
+    $$('.review-buttons button').forEach(b=>b.onclick=()=>{if(!current||saving)return;selectedStatus=b.dataset.status;markButtons();changed()});
+    $('#note').oninput=changed;
+    ['#trimStart','#trimEnd'].forEach(id=>$(id).oninput=()=>{pause();changed();trimSummary()});
+    $('#markStart').onclick=()=>{if(!current)return;pause();$('#trimStart').value=Math.round(time*meta.fps)/meta.fps;changed();trimSummary()};
+    $('#markEnd').onclick=()=>{if(!current)return;pause();$('#trimEnd').value=Math.min(current.length,Math.round(time*meta.fps)+1)/meta.fps;changed();trimSummary()};
+    $('#trimReset').onclick=()=>{if(!current)return;pause();$('#trimStart').value=0;$('#trimEnd').value=current.duration;changed();trimSummary()};
+    $('#previewTrim').onchange=()=>{pause();try{if($('#previewTrim').checked){time=bounds().start;sync(true)}}catch(e){message('#trimSummary',e,true)}};
+    $('#save').onclick=async()=>{
+      if(!current||saving)return;
+      try{
+        const r=bounds(),index=current.index;
+        saving=true;$('#save').disabled=true;
+        // Freeze editing while the request is pending, so late edits cannot be mistaken as saved.
+        $$('#note,#trimStart,#trimEnd,#markStart,#markEnd,#trimReset').forEach(el=>el.disabled=true);
+        meta.reviews=await api('/api/review',{method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({episode:index,status:selectedStatus,note:$('#note').value,trim:{start_s:r.start,end_s:r.end}})});
+        dirty=false;$('#trimStart').value=r.start;$('#trimEnd').value=r.end;
+        message('#saved','已保存标记与裁剪');trimSummary();renderList();
+      }catch(e){message('#saved',e,true)}
+      finally{saving=false;$('#save').disabled=false;$$('#note,#trimStart,#trimEnd,#markStart,#markEnd,#trimReset').forEach(el=>el.disabled=false)}
+    };
+    function pause(){playing=false;playbackGeneration++;$('#play').textContent=t('▶ 播放');$$('video').forEach(v=>v.pause())}
+    function play(){
+      if(!current)return;
+      try{
+        const r=$('#previewTrim').checked?bounds():{start:0,end:current.duration};
+        if(time<r.start||time>=r.end-1e-8){time=r.start;sync(true)}
+        playing=true;const generation=++playbackGeneration;$('#play').textContent=t('❚❚ 暂停');
+        $$('video').forEach(v=>{v.playbackRate=+$('#speed').value;v.play().catch(()=>{})});
+        requestAnimationFrame(()=>tick(generation));
+      }catch(e){message('#trimSummary',e,true)}
+    }
+    function toggle(){playing?pause():play()}
+    function tick(generation){
+      if(!playing||!current||generation!==playbackGeneration)return;
+      const video=$$('video')[0],end=$('#previewTrim').checked?bounds().end:current.duration;
+      time=video?Math.max(0,video.currentTime-(+video.dataset.offset)):time+1/meta.fps;
+      if(time>=end-1e-8){time=Math.max(0,end-1/meta.fps);pause();sync(true);return}
+      sync(false);requestAnimationFrame(()=>tick(generation));
+    }
+    function sync(force){
+      if(!current)return;
+      $$('video').forEach(v=>{if(v.readyState<1)return;const target=+v.dataset.offset+time;if(force||Math.abs(v.currentTime-target)>.12)v.currentTime=target});
+      $('#seek').value=time;$('#clock').textContent=time.toFixed(2)+'s';drawAll();
+    }
+    function step(delta){if(!current)return;pause();time=Math.max(0,Math.min(current.length-1,Math.round(time*meta.fps)+delta))/meta.fps;sync(true)}
+    $('#play').onclick=toggle;$('#back').onclick=()=>step(-1);$('#forward').onclick=()=>step(1);
+    $('#seek').oninput=e=>{pause();time=+e.target.value;sync(true)};
+    $('#speed').onchange=e=>$$('video').forEach(v=>v.playbackRate=+e.target.value);
+    $('#prev').onclick=()=>{if(current)loadEpisode(Math.max(0,current.index-1))};
+    $('#next').onclick=()=>{if(current)loadEpisode(Math.min(meta.total_episodes-1,current.index+1))};
+    $('#search').oninput=renderList;$('#statusFilter').onchange=renderList;
+    document.addEventListener('keydown',e=>{
+      if(e.target.matches('input,textarea,select,button'))return;
+      const action={Space:toggle,ArrowLeft:()=>step(-1),ArrowRight:()=>step(1),ArrowUp:()=>$('#prev').click(),ArrowDown:()=>$('#next').click()}[e.code];
+      if(action){e.preventDefault();action()}
+    });
+    window.addEventListener('beforeunload',e=>{if(dirty){e.preventDefault();e.returnValue=''}});
+    let pollTimer;
+    function renderExportProgress(){
+      const job=exportJob, visible=job&&job.status!=='idle';
+      $('#exportProgress').hidden=!visible;
+      if(!visible)return;
+      const total=job.total_episodes??job.episodes??0;
+      const done=Math.max(0,Math.min(total,job.episodes_done??0));
+      const percent=total?Math.floor(100*done/total):0;
+      const label=t('exportEpisodeCount',{total,done,percent});
+      $('#exportEpisodeCount').textContent=label;
+      $('#exportProgressBar').max=Math.max(1,total);
+      $('#exportProgressBar').value=done;
+      $('#exportProgressBar').setAttribute('aria-valuetext',label);
+      $('#exportProgress').classList.toggle('failed',job.status==='failed');
+      $('#exportProgress').classList.toggle('complete',job.status==='complete');
+      $('#exportCurrent').textContent=job.status==='running'
+        ?(job.current_episode!=null?t('exportCurrent',{position:job.episode_position,total,episode:job.current_episode,phase:t(job.phase)}):t(job.phase))
+        :'';
+    }
+    function updateExportJob(job){
+      exportJob=job;exporting=job.status==='running';$('#export').disabled=exporting;
+      renderExportProgress();
+      if(job.status==='running')message('#exportStatus',()=>t('exportProgress',{phase:t(job.phase),done:job.frames_done,total:job.total_frames,output:job.output}));
+      if(job.status==='complete')message('#exportStatus',()=>t('exportComplete',{episodes:job.episodes,frames:job.frames,output:job.output}));
+      if(job.status==='failed')message('#exportStatus',()=>t('exportFailed',{error:errorText(job.error)}),true);
+    }
+    async function pollExport(){
+      clearTimeout(pollTimer);
+      try{
+        updateExportJob(await api('/api/export'));
+      }catch(e){message('#exportStatus',e,true)}
+      if(exporting)pollTimer=setTimeout(pollExport,1000);
+    }
+    $('#export').onclick=async()=>{
+      if(exporting||saving)return;
+      if(dirty)return message('#exportStatus','请先保存当前条目的修改，再导出。',true);
+      const selected=meta.episodes.filter(x=>['keep','unreviewed'].includes(statusOf(x.index)));
+      const count=selected.reduce((n,x)=>{const trim=meta.reviews[String(x.index)]?.trim;return n+(trim?trim.end_frame-trim.start_frame:x.length)},0);
+      if(!confirm(t('exportConfirm',{episodes:selected.length,frames:count})))return;
+      exporting=true;$('#export').disabled=true;
+      try{
+        updateExportJob(await api('/api/export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:$('#exportName').value.trim()})}));
+        pollExport();
+      }catch(e){exporting=false;$('#export').disabled=false;message('#exportStatus',e,true)}
+    };
+    function niceStep(value){let power=Math.pow(10,Math.floor(Math.log10(Math.max(value,1e-9)))),fraction=value/power,nice=fraction<=1?1:fraction<=2?2:fraction<=2.5?2.5:fraction<=5?5:10;return nice*power}
+    function draw(canvas,j){let dpr=devicePixelRatio||1,w=canvas.clientWidth,h=canvas.clientHeight;if(!w||!h)return;canvas.width=w*dpr;canvas.height=h*dpr;let x=canvas.getContext('2d');x.scale(dpr,dpr);let a=current.state.map(v=>v[j]),b=current.action.map(v=>v[j]),all=a.concat(b),dataLo=Math.min(...all),dataHi=Math.max(...all),span=Math.max(dataHi-dataLo,1e-6),step=niceStep(span*1.12/4),lo=Math.floor((dataLo-span*.06)/step)*step,hi=lo+4*step;if(hi<dataHi+span*.06){hi=Math.ceil((dataHi+span*.06)/step)*step;lo=hi-4*step}let left=39,right=4,top=3,bottom=3,plotW=Math.max(1,w-left-right),plotH=Math.max(1,h-top-bottom),decimals=step>=.1?2:step>=.01?3:4;x.font='9px system-ui';x.textAlign='right';x.textBaseline='middle';for(let k=0;k<5;k++){let y=top+plotH*k/4,value=hi-k*step;x.strokeStyle='#24364b';x.lineWidth=1;x.beginPath();x.moveTo(left,y);x.lineTo(w-right,y);x.stroke();x.fillStyle='#899bb0';x.fillText(value.toFixed(decimals),left-4,y)}function line(v,c){x.strokeStyle=c;x.lineWidth=1.35;x.beginPath();v.forEach((n,k)=>{let px=left+k*plotW/Math.max(1,v.length-1),py=top+(hi-n)*plotH/(hi-lo);k?x.lineTo(px,py):x.moveTo(px,py)});x.stroke()}try{const r=bounds();x.fillStyle='rgba(85,214,157,.12)';x.fillRect(left+r.start/current.duration*plotW,top,(r.end-r.start)/current.duration*plotW,plotH)}catch(e){}line(a,'#55b8ff');line(b,'#ffc65c');let px=left+time/current.duration*plotW;x.strokeStyle='#ff7180';x.beginPath();x.moveTo(px,top);x.lineTo(px,h-bottom);x.stroke()}function drawAll(){if(!current)return;$$('canvas[data-dimension]').forEach(c=>draw(c,+c.dataset.dimension))}window.onresize=drawAll;
+
+    setLanguage(language,false);
+    api('/api/meta').then(m=>{
+      meta=m;$('#dataset').textContent=t('datasetSummary',{name:m.name,count:m.total_episodes,fps:m.fps});
+      $('#exportName').value=m.suggested_export_name;
+      message('#exportStatus',()=>t('exportParent',{path:m.export_parent}));
+      renderList();if(m.total_episodes)loadEpisode(0);pollExport();
+    }).catch(e=>message('#dataset',e,true));
+  </script>
+
+</body>
+</html>

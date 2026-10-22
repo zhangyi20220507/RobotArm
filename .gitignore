@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+.venv/
+venv/
+
+# Local caches and credentials
+.cache/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Data, checkpoints and generated outputs
+data/
+artifacts/
+archive/
+outputs/
+runs/
+wandb/
+mlruns/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+
+# Logs
+*.log

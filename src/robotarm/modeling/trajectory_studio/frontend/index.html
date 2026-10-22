@@ -1,0 +1,35 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RobotArm Open-loop Studio</title><link rel="stylesheet" href="/styles.css"></head><body>
+<header><div><h1>RobotArm Open-loop Studio</h1><p>记录动作与模型预测的离线对照</p></div><div class="live-control"><span id="liveBadge" class="safe">OFFLINE · NO CAN</span><button id="liveToggle" aria-pressed="false"><i></i><span>实时机械臂</span></button></div></header>
+<main id="layout">
+  <aside class="panel config" id="sidebar">
+    <div class="sidebar-head"><div><div class="section-title">验证配置</div><span>数据 · 模型 · 推理参数</span></div><button id="sidebarToggle" title="展开或折叠筛选栏" aria-expanded="true">‹</button></div>
+    <div class="form-grid">
+      <label>URDF 文件<input id="urdf" type="text"></label>
+      <label>模型适配器<select id="adapter"></select></label>
+      <label>LeRobot 数据集<select id="dataset"></select></label>
+      <label>Checkpoint<select id="checkpoint"></select></label>
+      <label>Episode<input id="episode" type="number" min="0" value="25"></label>
+      <label>推理模式<select id="inferenceMode"><option value="replan_each_frame">逐帧重规划</option><option value="chunked">连续消费动作块</option></select></label>
+      <label>动作块输出步 <span id="stepHelp" class="hint"></span><input id="outputStep" type="number" min="0" value="0"></label>
+      <label>推理设备<select id="device"><option>cuda</option><option>cpu</option></select></label>
+      <div class="actions"><button id="evaluate" class="primary">运行验证</button></div>
+    </div>
+    <details><summary>直接选择视频与关节 CSV（不运行模型）</summary><div class="form-grid custom">
+      <label>视频路径<input id="videoPath" type="text" placeholder="/home/dm/data/.../video.mp4"></label>
+      <label>轨迹 CSV<input id="trajectoryPath" type="text" placeholder="包含 state_J1...predicted_gripper"></label>
+      <div class="actions"><button id="loadSource">加载自定义数据</button></div>
+    </div></details>
+    <div id="status">正在读取本地目录…</div>
+  </aside>
+
+  <div class="workspace">
+
+  <section class="viewer-grid">
+    <article class="panel"><div class="viewer-head"><b>同步相机</b><span>数据集原始画面</span></div><video id="video" controls muted playsinline></video></article>
+    <article class="panel"><div class="viewer-head scene-head"><b>轨迹叠加对比</b><div class="scene-tools"><span class="scene-legend"><i class="actual-dot"></i>记录状态 <i class="prediction-dot"></i>模型预测</span><span class="camera-tools" aria-label="三维视图控制"><button data-camera="zoom-in" title="放大">＋</button><button data-camera="zoom-out" title="缩小">−</button><button data-camera="left" title="画面左移">←</button><button data-camera="up" title="画面上移">↑</button><button data-camera="down" title="画面下移">↓</button><button data-camera="right" title="画面右移">→</button><button data-camera="reset" title="还原默认视角">还原</button></span></div></div><canvas class="robot-canvas" id="compareRobot" title="左键拖动旋转；滚轮缩放；Shift+左键、中键或右键拖动画面"></canvas><div id="poseSummary" class="pose-summary"></div></article>
+  </section>
+
+  <section class="panel error-panel"><div class="chart-head"><div><div class="section-title">记录值与模型预测</div><span><i class="actual-line"></i>记录值 <i class="prediction-line"></i>模型预测</span></div><div id="overallMetrics" class="overall-metrics"></div></div><div id="charts" class="joint-charts"></div></section>
+  </div>
+</main><script type="module" src="/app.js"></script></body></html>

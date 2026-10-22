@@ -1,0 +1,60 @@
+<?xml version="1.0"?>
+<!-- Kinematic-only Piper model derived from AgileX agx_arm_description. -->
+<robot name="piper_kinematics">
+  <link name="world"/>
+  <link name="base_link"/>
+  <link name="link1"/>
+  <link name="link2"/>
+  <link name="link3"/>
+  <link name="link4"/>
+  <link name="link5"/>
+  <link name="link6"/>
+
+  <joint name="world_to_base_link" type="fixed">
+    <parent link="world"/>
+    <child link="base_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+  <joint name="joint1" type="revolute">
+    <parent link="base_link"/>
+    <child link="link1"/>
+    <origin xyz="0 0 0.123" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.6005406" upper="2.6005406" effort="100" velocity="5"/>
+  </joint>
+  <joint name="joint2" type="revolute">
+    <parent link="link1"/>
+    <child link="link2"/>
+    <origin xyz="0 0 0" rpy="1.5707963 -0.1357866 -3.1415926"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-0.0349066" upper="3.1764992" effort="100" velocity="5"/>
+  </joint>
+  <joint name="joint3" type="revolute">
+    <parent link="link2"/>
+    <child link="link3"/>
+    <origin xyz="0.28503 0 0" rpy="0 0 -1.7938494"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.0019663" upper="0.0349066" effort="100" velocity="5"/>
+  </joint>
+  <joint name="joint4" type="revolute">
+    <parent link="link3"/>
+    <child link="link4"/>
+    <origin xyz="-0.02198 -0.25075 0" rpy="1.5707963 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.7278760" upper="1.7278760" effort="100" velocity="5"/>
+  </joint>
+  <joint name="joint5" type="revolute">
+    <parent link="link4"/>
+    <child link="link5"/>
+    <origin xyz="0 0 0" rpy="-1.5707963 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.2042772" upper="1.2042772" effort="100" velocity="5"/>
+  </joint>
+  <joint name="joint6" type="revolute">
+    <parent link="link5"/>
+    <child link="link6"/>
+    <origin xyz="0.000088259 -0.091 0" rpy="1.5707963 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.0769419" upper="2.0769419" effort="100" velocity="5"/>
+  </joint>
+</robot>

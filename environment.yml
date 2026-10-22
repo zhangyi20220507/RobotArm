@@ -1,0 +1,12 @@
+name: robotarm
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - cmake>=3.14
+  - pip
+  - setuptools>=68
+  - wheel
+  - pip:
+      - pybind11>=2.13,<4
+
