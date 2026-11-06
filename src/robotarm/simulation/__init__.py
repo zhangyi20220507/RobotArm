@@ -38,6 +38,7 @@ def _run_module(module: str):
 
 
 WORKFLOWS = {
+    "lift-cup": WorkflowSpec("Grasp and lift a handleless cup in upright or sideways poses.", _run_module("robotarm.simulation.lift_cup")),
     "viewer": WorkflowSpec("Open the Piper ManiSkill camera viewer.", _run_module("robotarm.simulation.viewer")),
     "scripted-pick-place": WorkflowSpec("Run the scripted Piper pick-and-place baseline.", _run_module("robotarm.simulation.scripted_pick_place")),
     "force-scripted-pick-place": WorkflowSpec("Run the physical-contact scripted baseline.", _run_module("robotarm.simulation.force_scripted_pick_place")),

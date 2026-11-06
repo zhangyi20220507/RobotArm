@@ -60,6 +60,7 @@ def main(argv: list[str] | None = None) -> int:
             timestamp = int(xrt.get_time_stamp_ns())
             state = {
                 "timestamp_ns": timestamp,
+                "headset_pose": list(xrt.get_headset_pose()),
                 "left_controller_pose": list(xrt.get_left_controller_pose()),
                 "left_grip": float(xrt.get_left_grip()),
                 "left_trigger": float(xrt.get_left_trigger()),

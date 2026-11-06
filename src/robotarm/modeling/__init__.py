@@ -98,6 +98,14 @@ WORKFLOWS = {
     "validate-runtime": WorkflowSpec("Validate runtime telemetry and create approval.", _run_validate_runtime),
     "trajectory-studio": WorkflowSpec("Launch the open-loop validation studio.", _run_trajectory_studio),
     "dataset-browser": WorkflowSpec("Browse, review and trim episodes into a new local LeRobot dataset.", _run_dataset_browser),
+    "extend-dataset": WorkflowSpec(
+        "Safely append raw Piper episodes or publish a new combined dataset.",
+        _run_module("robotarm.modeling.dataset_extend"),
+    ),
+    "relabel-dataset-task": WorkflowSpec(
+        "Publish a dataset with one unified language task.",
+        _run_module("robotarm.modeling.dataset_relabel"),
+    ),
     "normalize-piper-metadata": WorkflowSpec("Normalize Piper pick-up metadata.", _run_module("robotarm.modeling.normalize_metadata")),
     "approve": WorkflowSpec("Approve a shadow report and bind it to a checkpoint.", _run_module("robotarm.modeling.approve")),
 }

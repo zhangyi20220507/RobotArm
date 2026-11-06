@@ -18,6 +18,7 @@ class XrBridgeClient:
         self.socket.connect(endpoint)
         self.state = {
             "timestamp_ns": 0,
+            "headset_pose": [0.0] * 7,
             "left_controller_pose": [0.0] * 7,
             "left_grip": 0.0,
             "left_trigger": 0.0,
@@ -54,6 +55,10 @@ class XrBridgeClient:
     def get_time_stamp_ns(self):
         self._refresh()
         return self.state["timestamp_ns"]
+
+    def get_headset_pose(self):
+        self._refresh()
+        return self.state["headset_pose"]
 
     def get_left_controller_pose(self):
         self._refresh()

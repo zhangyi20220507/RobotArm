@@ -233,6 +233,14 @@ class LeaderFollowerTests(unittest.TestCase):
         self.assertEqual(result, 0)
         commands = [call.args[0] for call in follower.move_j.call_args_list]
         self.assertTrue(commands)
+        self.assertGreaterEqual(
+            follower.set_motion_mode.call_count,
+            follower.move_j.call_count,
+        )
+        self.assertTrue(all(
+            call.args == (follower.OPTIONS.MOTION_MODE.J,)
+            for call in follower.set_motion_mode.call_args_list
+        ))
         self.assertTrue(all(max(command) <= 0.01 + 1e-9 for command in commands))
         self.assertAlmostEqual(commands[-1][0], 0.01)
         for previous, current in zip(commands, commands[1:]):
@@ -272,7 +280,10 @@ class LeaderFollowerTests(unittest.TestCase):
         ):
             enter_follower_j(robot, gripper, [0.0] * 6, 0.02, 1.0, True)
         robot.move_js.assert_not_called()
-        robot.set_motion_mode.assert_called_once_with("j")
+        self.assertEqual(robot.set_motion_mode.call_count, 2)
+        self.assertTrue(all(
+            call.args == ("j",) for call in robot.set_motion_mode.call_args_list
+        ))
         robot.enable.assert_not_called()
 
     def test_f_starts_following_after_alignment(self):
@@ -656,6 +667,22 @@ class LeaderFollowerTests(unittest.TestCase):
         value, age = read_leader_gripper_command(gripper, 0.03)
         self.assertEqual(value, 0.04)
         self.assertTrue(math.isfinite(age))
+
+    def test_drag_gripper_ignores_command_cached_before_role_transition(self):
+        message = SimpleNamespace(
+            timestamp=99.9,
+            msg=SimpleNamespace(value=0.04, status_code=1),
+        )
+        gripper = SimpleNamespace(get_gripper_ctrl_states=lambda: message)
+        with patch(
+            "robotarm.teleop.leader_follower.runtime.time.time",
+            return_value=100.1,
+        ):
+            value, age = read_leader_gripper_command(
+                gripper, 0.0, not_before=100.0
+            )
+        self.assertEqual(value, 0.0)
+        self.assertTrue(math.isinf(age))
 
     def test_unsafe_limits_are_rejected(self):
         args = make_parser().parse_args(["--max-step-joint-deg", "4"])

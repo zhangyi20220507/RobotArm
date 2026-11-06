@@ -209,15 +209,27 @@ def build_approval(
         ),
         "smolvla_replan_lead_steps": optional_value("smolvla_replan_lead_steps"),
         "max_joint_step_deg": one_value("max_joint_step_deg"),
+        "max_joint_acceleration_deg_s2": one_value(
+            "max_joint_acceleration_deg_s2"
+        ),
         "max_gripper_step_mm": one_value("max_gripper_step_mm"),
         "max_joint_lead_deg": one_value("max_joint_lead_deg"),
         "max_gripper_lead_mm": one_value("max_gripper_lead_mm"),
         **({
+            "warn_act_raw_joint_gap_deg": optional_value(
+                "warn_act_raw_joint_gap_deg"
+            ),
             "max_act_raw_joint_gap_deg": one_value(
                 "max_act_raw_joint_gap_deg"
             ),
+            "max_act_raw_gap_consecutive_steps": one_value(
+                "max_act_raw_gap_consecutive_steps"
+            ),
             "max_act_raw_gripper_gap_mm": one_value(
                 "max_act_raw_gripper_gap_mm"
+            ),
+            "max_act_raw_joint_bound_tolerance_deg": one_value(
+                "max_act_raw_joint_bound_tolerance_deg"
             ),
             "max_act_raw_gripper_bound_tolerance_mm": one_value(
                 "max_act_raw_gripper_bound_tolerance_mm"
@@ -226,6 +238,14 @@ def build_approval(
                 "max_act_clamp_hold_steps"
             ),
         } if policy_type in {"act", "pi0"} else {}),
+        **({
+            "act_subgoal_min_progress_deg": one_value(
+                "act_subgoal_min_progress_deg"
+            ),
+            "act_subgoal_min_gripper_progress_mm": one_value(
+                "act_subgoal_min_gripper_progress_mm"
+            ),
+        } if policy_type == "act" else {}),
         "gripper_max_mm": one_value("gripper_max_mm"),
         "gripper_force": one_value("gripper_force"),
         "max_camera_age_ms": one_value("max_camera_age_ms"),

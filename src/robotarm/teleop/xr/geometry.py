@@ -34,13 +34,47 @@ MIRROR_FLIPS = {
 }
 
 
-def mapping_matrix(yaw_degrees: float = 0.0, mirror: str = "none") -> np.ndarray:
-    """XR tracking axes -> Piper base axes, with the yaw calibration and mirror."""
+def headset_yaw_basis(headset_pose: np.ndarray) -> np.ndarray:
+    """Return head right/up/back axes in the XR tracking frame.
+
+    Pitch and roll are discarded so looking up or tilting the head cannot
+    rotate horizontal hand motion into robot vertical motion.
+    """
+    pose = np.asarray(headset_pose, dtype=float)
+    if not valid_xr_pose(pose):
+        raise ValueError("invalid headset pose for head-relative XR mapping")
+    forward = xr_rotation(pose).apply([0.0, 0.0, -1.0])
+    forward[1] = 0.0
+    norm = float(np.linalg.norm(forward))
+    if norm < 1.0e-6:
+        raise ValueError("headset forward axis is vertical; cannot determine yaw")
+    forward /= norm
+    up = np.array([0.0, 1.0, 0.0])
+    right = np.cross(forward, up)
+    right /= np.linalg.norm(right)
+    back = -forward
+    return np.column_stack((right, up, back))
+
+
+def mapping_matrix(
+    yaw_degrees: float = 0.0,
+    mirror: str = "none",
+    headset_pose: np.ndarray | None = None,
+) -> np.ndarray:
+    """XR tracking axes -> Piper base axes, with yaw/mirror calibration."""
     try:
         flip = MIRROR_FLIPS[mirror]
     except KeyError as exc:
         raise ValueError(f"unknown xr mirror mode: {mirror}") from exc
-    return flip @ Rotation.from_euler("z", yaw_degrees, degrees=True).as_matrix() @ R_XR_TO_PIPER
+    tracking_to_operator = (
+        np.eye(3) if headset_pose is None else headset_yaw_basis(headset_pose).T
+    )
+    return (
+        flip
+        @ Rotation.from_euler("z", yaw_degrees, degrees=True).as_matrix()
+        @ R_XR_TO_PIPER
+        @ tracking_to_operator
+    )
 
 
 @dataclass
@@ -85,9 +119,10 @@ def build_target(
     limits: Limits,
     yaw_degrees: float = 0.0,
     mirror: str = "none",
+    mapping: np.ndarray | None = None,
 ) -> np.ndarray:
     delta_xr = xr_current[:3] - xr_reference[:3]
-    mapping = mapping_matrix(yaw_degrees, mirror)
+    mapping = mapping_matrix(yaw_degrees, mirror) if mapping is None else np.asarray(mapping)
     delta_base = mapping @ delta_xr * scale
     delta_norm = float(np.linalg.norm(delta_base))
     if delta_norm > limits.max_relative_translation:
@@ -136,11 +171,17 @@ class TranslationTracker:
     The original clutch position continues to define the relative travel limit.
     """
 
-    def __init__(self, hand, flange, scale, limits, max_lead, yaw_degrees=0.0, mirror="none"):
+    def __init__(
+        self, hand, flange, scale, limits, max_lead,
+        yaw_degrees=0.0, mirror="none", mapping=None,
+    ):
         self.previous_hand = np.asarray(hand, dtype=float).copy()
         self.reference = np.asarray(flange, dtype=float).copy()
         self.target = self.reference.copy()
-        self.mapping = mapping_matrix(yaw_degrees, mirror)
+        self.mapping = (
+            mapping_matrix(yaw_degrees, mirror)
+            if mapping is None else np.asarray(mapping, dtype=float).copy()
+        )
         self.scale = scale
         self.limits = limits
         self.max_lead = max_lead

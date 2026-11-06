@@ -280,6 +280,7 @@ def align_fingers_over_cube(env, target_z, args, render_cb=None, label="align"):
             tol=args.centering_tolerance,
             render_cb=render_cb,
             label=label,
+            stagnation_steps=getattr(args, "motion_stagnation_steps", None),
         )
 
 
@@ -301,6 +302,7 @@ def try_centered_force_grasp(env, args, render_cb=None):
         render_cb=render_cb,
         label="pre_grasp_centered",
         max_xyz_step=0.01,
+        stagnation_steps=getattr(args, "motion_stagnation_steps", None),
     )
     align_fingers_over_cube(
         env, args.pre_grasp_z, args, render_cb=render_cb, label="center_over_cube"
@@ -321,6 +323,7 @@ def try_centered_force_grasp(env, args, render_cb=None):
         tol=0.004,
         render_cb=render_cb,
         label="grasp_centered",
+        stagnation_steps=getattr(args, "motion_stagnation_steps", None),
     )
     tcp = current_tcp(env)
     if tcp[2] > args.grasp_z + args.max_grasp_z_error:

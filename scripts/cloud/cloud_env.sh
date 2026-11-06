@@ -5,6 +5,8 @@ export HF_HOME="${TASK_BUNDLE_ROOT}/.cache/huggingface"
 export HF_DATASETS_CACHE="${HF_HOME}/datasets"
 export HF_HUB_OFFLINE=1
 export WANDB_MODE=offline
+# Some cloud images inject values such as "auto" here, which libgomp rejects.
+export OMP_NUM_THREADS="${ROBOTARM_OMP_NUM_THREADS:-4}"
 if [[ -f "${TASK_BUNDLE_ROOT}/.venv-pi0/bin/activate" ]]; then
   source "${TASK_BUNDLE_ROOT}/.venv-pi0/bin/activate"
 fi

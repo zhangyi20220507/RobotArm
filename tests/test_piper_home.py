@@ -54,6 +54,13 @@ class HomeTests(unittest.TestCase):
         moves = robot.move_j.call_args_list
         self.assertEqual(moves[0].args[0],[.2]*6)
         self.assertEqual(moves[1].args[0],[0.0]*6)
+        mode_calls = [i for i, call in enumerate(calls) if call[0] == 'set_motion_mode']
+        enable_call = names.index('enable')
+        zero_call = next(
+            i for i, call in enumerate(calls)
+            if call[0] == 'move_j' and call.args[0] == [0.0]*6
+        )
+        self.assertTrue(any(enable_call < i < zero_call for i in mode_calls))
         robot.disable.assert_not_called()
         robot.init_effector.assert_not_called()
         robot.electronic_emergency_stop.assert_not_called()

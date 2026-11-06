@@ -24,12 +24,18 @@ def _row(**overrides) -> dict:
         "n_action_steps": 50, "num_flow_steps": None, "rate_hz": 20.0,
         "planner_mode": None, "max_chunk_inference_ms": 60.0,
         "max_smolvla_plan_age_ms": 1250.0, "smolvla_replan_lead_steps": None,
-        "max_joint_step_deg": 1, "max_gripper_step_mm": 1.0,
+        "max_joint_step_deg": 1, "max_joint_acceleration_deg_s2": 200.0,
+        "max_gripper_step_mm": 1.0,
         "max_joint_lead_deg": 1.0, "max_gripper_lead_mm": 2.0,
+        "warn_act_raw_joint_gap_deg": 8.0,
         "max_act_raw_joint_gap_deg": 9.0,
+        "max_act_raw_gap_consecutive_steps": 3,
         "max_act_raw_gripper_gap_mm": 18.0,
+        "max_act_raw_joint_bound_tolerance_deg": 1.0,
         "max_act_raw_gripper_bound_tolerance_mm": 1.0,
         "max_act_clamp_hold_steps": 10,
+        "act_subgoal_min_progress_deg": 0.05,
+        "act_subgoal_min_gripper_progress_mm": 0.1,
         "gripper_max_mm": 100.0, "gripper_force": 1.5, "max_camera_age_ms": 50.0,
         "raw_action": [0.0] * 7, "safe_action": [0.0] * 7,
         "act_raw_action_ok": True,
@@ -111,6 +117,9 @@ class DeadlineGateTests(unittest.TestCase):
         self.assertEqual(approval["severe_clamp_fraction"], 0.5)
         self.assertIs(approval["act_raw_action_watchdog_passed"], True)
         self.assertEqual(approval["runtime"]["max_act_raw_joint_gap_deg"], 9.0)
+        self.assertEqual(
+            approval["runtime"]["max_act_raw_joint_bound_tolerance_deg"], 1.0
+        )
         self.assertEqual(
             approval["runtime"]["max_act_raw_gripper_bound_tolerance_mm"], 1.0
         )

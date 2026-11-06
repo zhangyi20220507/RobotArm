@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from robotarm.modeling.dataset_browser import DatasetStore, make_handler
+from robotarm.modeling.dataset_browser import DatasetStore, _episode_metrics, make_handler
 from robotarm.modeling.dataset_trim import export_dataset, export_plan, frame_bounds, trim_from_seconds
 
 
@@ -40,6 +40,31 @@ class TrimRangeTests(unittest.TestCase):
         self.assertEqual([x["output_episode"] for x in plan], [0, 1, 2])
 
 
+class EpisodeMetricsTests(unittest.TestCase):
+    def test_only_advisory_motion_checks_are_returned(self):
+        import numpy as np
+
+        state = np.zeros((3, 7))
+        action = state.copy()
+        action[1:, 0] = 0.1
+        action[1:, 6] = 0.02
+        metrics = _episode_metrics(state, action)
+
+        self.assertEqual(set(metrics), {
+            "max_joint_step_deg", "max_gripper_step_mm", "p95_tracking_deg",
+            "p95_gripper_tracking_mm", "warnings",
+        })
+        self.assertEqual(len(metrics["warnings"]), 4)
+        self.assertEqual(_episode_metrics(state, state)["warnings"], [])
+
+        action = state.copy()
+        action[1:, 6] = 0.0100000016
+        self.assertEqual(_episode_metrics(action, action)["warnings"], [])
+        action[1:, 6] = 0.01001
+        self.assertIn("夹爪动作存在大于 10 mm/帧的跳变",
+                      _episode_metrics(action, action)["warnings"])
+
+
 class BrowserTrimTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -63,6 +88,66 @@ class BrowserTrimTests(unittest.TestCase):
         self.assertNotIn("trim", self.store.reviews()["0"])
         self.store.save_review(1, "", "", {"start_s": 0, "end_s": 20})
         self.assertNotIn("1", self.store.reviews())
+
+    def test_episode_labels_save_filter_clear_and_survive_old_clients(self):
+        self.store.save_review(
+            0, "keep", "side cup", labels={"cup_orientation": "sideways"}
+        )
+        self.assertEqual(
+            self.store.reviews()["0"]["labels"],
+            {"cup_orientation": "sideways"},
+        )
+        # A client that predates labels must not erase them while changing status.
+        self.store.save_review(0, "review", "check again")
+        self.assertEqual(
+            self.store.reviews()["0"]["labels"]["cup_orientation"], "sideways"
+        )
+        self.store.save_review(0, "", "", labels={})
+        self.assertNotIn("0", self.store.reviews())
+
+    def test_invalid_episode_label_does_not_change_saved_file(self):
+        self.store.save_review(0, "keep", "", labels={"cup_orientation": "upright"})
+        original = self.reviews.read_bytes()
+        for labels in (
+            ["sideways"],
+            {"cup_orientation": "diagonal"},
+            {"unknown_field": "sideways"},
+        ):
+            with self.subTest(labels=labels), self.assertRaises(ValueError):
+                self.store.save_review(0, "keep", "", labels=labels)
+            self.assertEqual(self.reviews.read_bytes(), original)
+
+    def test_label_filtered_export_only_plans_matching_episodes(self):
+        self.store.save_review(0, "keep", "", labels={"cup_orientation": "sideways"})
+        self.store.save_review(1, "keep", "", labels={"cup_orientation": "upright"})
+        with patch("robotarm.modeling.dataset_browser.threading.Thread") as thread:
+            job = self.store.start_export(
+                "sideways_only",
+                {"field": "cup_orientation", "value": "sideways"},
+            )
+            run = thread.call_args.kwargs["target"]
+        self.assertEqual(job["total_episodes"], 1)
+        self.assertEqual(job["label_filter"], {
+            "field": "cup_orientation", "value": "sideways",
+        })
+
+        captured = {}
+        def export(source, output, info, plan, reviews, progress):
+            captured["plan"] = plan
+            return {"episodes": 1, "frames": 400}
+
+        with patch("robotarm.modeling.dataset_browser.export_dataset", side_effect=export):
+            run()
+        self.assertEqual([item["source_episode"] for item in captured["plan"]], [0])
+        self.assertEqual(captured["plan"][0]["output_episode"], 0)
+
+    def test_meta_exposes_versionable_label_schema(self):
+        schema = self.store.meta_payload()["label_schema"]
+        self.assertEqual(schema[0]["id"], "cup_orientation")
+        self.assertEqual(
+            {option["value"] for option in schema[0]["options"]},
+            {"upright", "sideways", "uncertain"},
+        )
 
     def test_bad_range_does_not_change_saved_file(self):
         self.store.save_review(0, "keep", "", {"start_s": 5, "end_s": 14})
@@ -187,10 +272,13 @@ assert.throws(()=>vm.runInContext('bounds()',sandbox));
             head, payload = bytes(output).split(b"\r\n\r\n", 1)
             return int(head.split()[1]), json.loads(payload)
 
-        data = {"episode": 0, "status": "keep", "trim": {"start_s": 5, "end_s": 14}}
+        data = {"episode": 0, "status": "keep",
+                "labels": {"cup_orientation": "sideways"},
+                "trim": {"start_s": 5, "end_s": 14}}
         status, result = request("POST", "/api/review", data)
         self.assertEqual(status, 200)
         self.assertEqual(result["0"]["trim"]["end_frame"], 280)
+        self.assertEqual(result["0"]["labels"]["cup_orientation"], "sideways")
         self.assertEqual(request("GET", "/api/meta")[1]["reviews"]["0"]["trim"]["start_frame"], 100)
         self.assertEqual(request("GET", "/api/export")[1]["status"], "idle")
         before = self.reviews.read_bytes()

@@ -125,6 +125,7 @@ class RawEpisodeRecorder:
         preview: bool = True,
         encoder_queue_size: int = 60,
         extra_sample_fields: tuple[str, ...] = (),
+        cameras: RoleCameras | None = None,
     ) -> None:
         if shutil.which("ffmpeg") is None:
             raise RuntimeError("ffmpeg is required; install it with: sudo apt install ffmpeg")
@@ -147,21 +148,19 @@ class RawEpisodeRecorder:
         if len(set(extra_sample_fields)) != len(extra_sample_fields):
             raise ValueError("extra sample fields must be unique")
         self.extra_sample_fields = tuple(extra_sample_fields)
-        stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
-        self.root = root_base / stamp
-        self.root.mkdir(parents=True, exist_ok=False)
-        self.episodes_dir = self.root / "episodes"
-        self.episodes_dir.mkdir()
+        self.root_base = root_base
+        self.root: Path | None = None
+        self.episodes_dir: Path | None = None
+        self._owns_cameras = cameras is None
         try:
-            self.cameras = RoleCameras(
+            self.cameras = cameras or RoleCameras(
                 camera_serials, width, height, fps, preview, always_on_top=True
             )
             self.cameras.wait_ready()
         except Exception:
-            cameras = getattr(self, "cameras", None)
-            if cameras is not None:
-                cameras.close()
-            shutil.rmtree(self.root, ignore_errors=True)
+            active_cameras = getattr(self, "cameras", None)
+            if active_cameras is not None and self._owns_cameras:
+                active_cameras.close()
             raise
         self.session = session_metadata(
             task, setup_id, setup_note, fps, robot_metadata, self.cameras.metadata
@@ -169,7 +168,6 @@ class RawEpisodeRecorder:
         self.session["raw_sample_fields"] = [
             *SAMPLE_FIELDS, *self.extra_sample_fields
         ]
-        _json_write(self.root / "session.json", self.session)
         self.active = False
         self.episode_index = 0
         self.frames = 0
@@ -179,7 +177,25 @@ class RawEpisodeRecorder:
         self.writers: dict[str, FFmpegWriter] = {}
         self.samples: dict[str, list[Any]] = {}
         self.dropped_samples = 0
-        print(f"[record] Raw dataset session: {self.root.resolve()}")
+        print("[record] Cameras ready; dataset folder will be created when recording starts.")
+
+    def _create_session(self) -> None:
+        """Create session storage on the first explicit recording request."""
+        if self.root is not None:
+            return
+        stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
+        root = self.root_base / stamp
+        episodes_dir = root / "episodes"
+        try:
+            root.mkdir(parents=True, exist_ok=False)
+            episodes_dir.mkdir()
+            _json_write(root / "session.json", self.session)
+        except Exception:
+            shutil.rmtree(root, ignore_errors=True)
+            raise
+        self.root = root
+        self.episodes_dir = episodes_dir
+        print(f"[record] Raw dataset session: {root.resolve()}")
 
     def preview(self) -> None:
         frames = self.cameras.latest()
@@ -188,9 +204,13 @@ class RawEpisodeRecorder:
     def start_episode(self) -> None:
         if self.active:
             return
-        free = shutil.disk_usage(self.root).free
+        usage_path = self.root_base.resolve() if self.root_base.exists() else Path.cwd()
+        free = shutil.disk_usage(usage_path).free
         if free < 2 * 1024**3:
             raise RuntimeError("Less than 2 GiB free; cannot start another episode")
+        created_session = self.root is None
+        self._create_session()
+        assert self.root is not None and self.episodes_dir is not None
         self.working_dir = self.episodes_dir / f".episode_{self.episode_index:06d}.in_progress"
         self.working_dir.mkdir()
         self.writers = {}
@@ -208,6 +228,10 @@ class RawEpisodeRecorder:
                     pass
             shutil.rmtree(self.working_dir)
             self.working_dir = None
+            if created_session:
+                shutil.rmtree(self.root, ignore_errors=True)
+                self.root = None
+                self.episodes_dir = None
             raise
         self.samples = {
             field: [] for field in (*SAMPLE_FIELDS, *self.extra_sample_fields)
@@ -343,4 +367,5 @@ class RawEpisodeRecorder:
     def close(self) -> None:
         if self.active:
             self.mark_incomplete()
-        self.cameras.close()
+        if self._owns_cameras:
+            self.cameras.close()

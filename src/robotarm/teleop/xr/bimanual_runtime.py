@@ -3,8 +3,9 @@
 左手柄控制 ``left-channel``，右手柄控制 ``right-channel``。默认只预览；
 只有显式传入 ``--live`` 后才会使能机械臂和发送运动命令。
 
-按键：默认使能后直接跟随，Trigger 分别控制夹爪；长按 Y/B 分别使能或恢复
-左/右臂；长按 X/A 分别回零；按下任一摇杆对两臂发送电子急停。
+按键：默认使能后直接跟随，Trigger 分别控制夹爪；长按同侧 Grip（或 Trigger）+Y/B
+分别使能或恢复左/右臂；长按同侧 Grip（或 Trigger）+X/A 分别回零；按下任一摇杆
+对两臂发送电子急停。
 """
 
 from __future__ import annotations
@@ -29,16 +30,29 @@ from .arm_ops import (
     wait_for_flange_pose,
     wait_for_joint_angles,
 )
-from .control import PoseJumpGuard, Clutch, joint_limit_diagnostics, limit_joint_step
+from .control import (
+    PoseJumpGuard,
+    Clutch,
+    joint_limit_diagnostics,
+    limit_joint_step,
+    command_button_chord,
+)
 from .geometry import (
     Limits,
     TranslationTracker,
     build_target,
     clamp_rotation_step,
     clamp_vector_step,
+    mapping_matrix,
     valid_xr_pose,
 )
-from .piper_ik import PIPER_JOINT_MAX, PIPER_JOINT_MIN, PiperIK, joint_limit_violations
+from .piper_ik import (
+    PIPER_JOINT_MAX,
+    PIPER_JOINT_MIN,
+    PiperIK,
+    command_joint_limit_violations,
+    joint_limit_violations,
+)
 from .runtime import parse_xyz
 
 
@@ -60,8 +74,18 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", choices=("piper",), default=cfg["model"])
     parser.add_argument("--rate", type=float, default=cfg["rate"])
     parser.add_argument("--scale", type=float, default=cfg["scale"])
+    parser.add_argument(
+        "--verbose-status",
+        action="store_true",
+        help="print per-second controller, gripper, arm-status and IK diagnostics",
+    )
     parser.add_argument("--speed-percent", type=int, default=cfg["speed-percent"])
     parser.add_argument("--joint-control-mode", choices=("js", "j"), default=cfg["joint-control-mode"])
+    parser.add_argument(
+        "--tracking-frame", choices=("head", "world"),
+        default=cfg.get("tracking-frame", "head"),
+        help="head: freeze headset yaw at engagement; world: use raw XR tracking axes",
+    )
     parser.add_argument("--translation-speed", type=float, default=cfg["translation-speed"])
     parser.add_argument("--joint-speed", type=float, default=cfg["joint-speed"])
     parser.add_argument("--max-target-lead", type=float, default=cfg["max-target-lead"])
@@ -83,6 +107,22 @@ def make_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--grip-threshold", type=float, default=cfg["grip-threshold"])
     parser.add_argument("--grip-release-threshold", type=float, default=cfg["grip-release-threshold"])
+    parser.add_argument(
+        "--engage-settle-seconds", type=float,
+        default=cfg.get("engage-settle-seconds", 0.25),
+        help="continuously rebase for this long after engagement",
+    )
+    parser.add_argument(
+        "--engage-deadband-m", type=float,
+        default=cfg.get("engage-deadband-m", 0.002),
+        help="deliberate hand travel required before the first motion command",
+    )
+    parser.add_argument(
+        "--command-modifier-threshold", "--command-trigger-threshold",
+        dest="command_modifier_threshold", type=float,
+        default=cfg.get("command-modifier-threshold", 0.8),
+        help="minimum same-hand Grip or Trigger value required with Y/B or X/A",
+    )
     parser.add_argument("--gripper-max-mm", type=float, default=cfg["gripper-max-mm"])
     parser.add_argument("--gripper-speed-mm-s", type=float, default=cfg["gripper-speed-mm-s"])
     parser.add_argument("--gripper-force", type=float, default=cfg["gripper-force"])
@@ -143,8 +183,16 @@ def validate_args(args) -> None:
             raise ValueError(f"--{side}-xr-mirror must be one of none, lr, fb")
     if args.posture_anchor not in ("engage", "seed"):
         raise ValueError("--posture-anchor must be engage or seed")
+    if args.tracking_frame not in ("head", "world"):
+        raise ValueError("--tracking-frame must be head or world")
     if not 0 <= args.grip_release_threshold < args.grip_threshold <= 1:
         raise ValueError("grip thresholds must satisfy 0 <= release < engage <= 1")
+    if not 0 <= args.engage_settle_seconds <= 1:
+        raise ValueError("--engage-settle-seconds must be in [0, 1]")
+    if not 0 <= args.engage_deadband_m <= 0.02:
+        raise ValueError("--engage-deadband-m must be in [0, 0.02]")
+    if not math.isfinite(args.command_modifier_threshold) or not 0 < args.command_modifier_threshold <= 1:
+        raise ValueError("command-modifier-threshold must be in (0, 1]")
     if not 0 <= args.speed_percent <= 100:
         raise ValueError("speed-percent must be in [0, 100]")
     if not 0.3 <= args.button_hold_seconds <= 5:
@@ -199,9 +247,13 @@ def home_grip_released(state: dict, hand: str, release_threshold: float) -> bool
     return float(state[f"{hand}_grip"]) <= release_threshold
 
 
-def simultaneous_home_pressed(state: dict) -> bool:
+def simultaneous_home_pressed(state: dict, modifier_threshold: float = 0.8) -> bool:
     """Two-arm homing is intentionally rejected without full collision checking."""
-    return bool(state["X_button"] and state["A_button"])
+    return command_button_chord(
+        state["left_grip"], state["left_trigger"], state["X_button"], modifier_threshold
+    ) and command_button_chord(
+        state["right_grip"], state["right_trigger"], state["A_button"], modifier_threshold
+    )
 
 
 def gripper_text(side: "ArmSide") -> str:
@@ -251,6 +303,9 @@ class ArmSide:
     xr_reference: np.ndarray | None = None
     flange_reference: np.ndarray | None = None
     tracker: TranslationTracker | None = None
+    engagement_mapping: np.ndarray | None = None
+    settle_until: float = 0.0
+    motion_armed: bool = False
     last_cartesian_target: np.ndarray | None = None
     last_joint_command: np.ndarray | None = None
     next_gripper_command: float = 0.0
@@ -264,6 +319,9 @@ class ArmSide:
         self.xr_reference = None
         self.flange_reference = None
         self.tracker = None
+        self.engagement_mapping = None
+        self.settle_until = 0.0
+        self.motion_armed = False
         self.clutch.blocked = True
         self.ik.set_posture_anchor(None)
 
@@ -273,6 +331,7 @@ def snapshot_xr(xrt, bridged: bool) -> dict:
         return xrt.snapshot()
     return {
         "timestamp_ns": xrt.get_time_stamp_ns(),
+        "headset_pose": xrt.get_headset_pose(),
         "left_controller_pose": xrt.get_left_controller_pose(),
         "left_grip": xrt.get_left_grip(),
         "left_trigger": xrt.get_left_trigger(),
@@ -288,8 +347,10 @@ def snapshot_xr(xrt, bridged: bool) -> dict:
     }
 
 
-def wait_for_bimanual_xr(xrt, bridged: bool, timeout: float, stop_requested) -> None:
-    print("Waiting for fresh left and right controller poses; Y/B enable is not active yet...")
+def wait_for_bimanual_xr(
+    xrt, bridged: bool, timeout: float, stop_requested, tracking_frame: str = "world"
+) -> None:
+    print("Waiting for fresh left and right controller poses; Grip/Trigger+Y/B is not active yet...")
     deadline = time.monotonic() + timeout
     previous = None
     next_notice = 0.0
@@ -300,6 +361,13 @@ def wait_for_bimanual_xr(xrt, bridged: bool, timeout: float, stop_requested) -> 
         state = snapshot_xr(xrt, bridged)
         stamp = state.get("timestamp_ns", 0)
         poses = {}
+        if tracking_frame == "head":
+            value = state.get("headset_pose")
+            try:
+                valid = value is not None and valid_xr_pose(np.asarray(value, dtype=float))
+            except (TypeError, ValueError):
+                valid = False
+            poses["headset"] = "missing" if value is None else "valid" if valid else "invalid"
         for hand in ("left", "right"):
             value = state.get(f"{hand}_controller_pose")
             try:
@@ -308,11 +376,17 @@ def wait_for_bimanual_xr(xrt, bridged: bool, timeout: float, stop_requested) -> 
                 valid = False
             poses[hand] = "missing" if value is None else "valid" if valid else "invalid"
         changing = previous not in (None, 0) and stamp not in (None, 0, previous)
+        head_detail = (
+            f"headset_pose={poses['headset']}, " if tracking_frame == "head" else ""
+        )
         detail = (
             f"timestamp={stamp} ({'changing' if changing else 'not changing'}), "
-            f"left_pose={poses['left']}, right_pose={poses['right']}"
+            f"{head_detail}left_pose={poses['left']}, right_pose={poses['right']}"
         )
-        if changing and poses["left"] == poses["right"] == "valid":
+        required = [poses["left"], poses["right"]]
+        if tracking_frame == "head":
+            required.append(poses["headset"])
+        if changing and all(value == "valid" for value in required):
             print("Both XR controllers are ready.")
             return
         if time.monotonic() >= next_notice:
@@ -323,7 +397,7 @@ def wait_for_bimanual_xr(xrt, bridged: bool, timeout: float, stop_requested) -> 
     raise RuntimeError(
         f"No valid two-controller XR data within {timeout:.0f} seconds. "
         f"Last XR state: {detail}. Start/restart xr-bridge, enable Send on the headset, "
-        "and wake both controllers. Hold Y/B only after both controllers are ready."
+        "and wake both controllers. Hold Grip/Trigger+Y/B only after both controllers are ready."
     )
 
 
@@ -342,11 +416,18 @@ def pause_on_input_jump(sides, state, guards, args):
              if (reason := guards[side.hand].update(state[f"{side.hand}_controller_pose"]))]
     if not jumps:
         return False
-    print("INPUT PAUSED: " + "; ".join(jumps) + "; hold Y/B to resume.")
+    strict_pause = getattr(args, "hand_jump_action", "rebase") == "pause"
+    if strict_pause:
+        print("INPUT PAUSED: " + "; ".join(jumps) + "; hold Grip/Trigger+Y/B to resume.")
+    else:
+        print("INPUT REBASED: " + "; ".join(jumps) + "; discontinuity discarded.")
     for side in sides:
         _hold(side, args)
         side.reset_clutch()
-        side.clutch.pause()
+        if strict_pause:
+            side.clutch.pause()
+        else:
+            side.clutch.resume()
     return True
 
 
@@ -362,8 +443,19 @@ def _estop_all(sides: list[ArmSide]) -> None:
 def _enable(side: ArmSide, args) -> None:
     if side.ready:
         side.reset_clutch()
+        current = wait_for_joint_angles(side.robot)
+        violations = command_joint_limit_violations(current)
+        if violations:
+            side.clutch.pause()
+            print(
+                f"{side.name} control blocked: " + "; ".join(violations)
+                + f"; hold {('LEFT Grip+X' if side.hand == 'left' else 'RIGHT Grip+A')} to home"
+            )
+            return
+        # The command chord itself suppresses motion.  Re-arm now so releasing
+        # Y/B captures a fresh reference immediately, even while Grip stays held.
         side.clutch.resume()
-        print(f"{side.name} control resumed; capturing a new hand reference")
+        print(f"{side.name} control resumed; release Y/B to follow from a new reference")
         return
     current = wait_for_joint_angles(side.robot)
     violations = joint_limit_violations(current, args.joint_limit_tolerance)
@@ -386,8 +478,16 @@ def _enable(side: ArmSide, args) -> None:
     side.last_cartesian_target = side.ik.flange_pose(current)
     side.ready = True
     side.reset_clutch()
-    if args.engagement_mode == "direct":
-        side.clutch.resume()
+    violations = command_joint_limit_violations(current)
+    if violations:
+        side.clutch.pause()
+        print(f"{side.name} arm enabled on {side.channel}: {states}")
+        print(
+            f"{side.name} control blocked: " + "; ".join(violations)
+            + f"; hold {('LEFT Grip+X' if side.hand == 'left' else 'RIGHT Grip+A')} to home"
+        )
+        return
+    side.clutch.resume()
     print(f"{side.name} arm enabled on {side.channel}: {states}")
 
 
@@ -444,6 +544,35 @@ def _home(side: ArmSide, other: ArmSide, args, xrt, stop_requested) -> None:
     side.last_cartesian_target = side.ik.flange_pose(joints)
 
 
+def _home_both_sequentially(
+    left: ArmSide,
+    right: ArmSide,
+    args,
+    xrt,
+    stop_requested,
+) -> None:
+    """Home both arms one at a time; the non-moving arm holds position."""
+    print("Both-arm home requested: homing LEFT first, then RIGHT; only one arm moves at a time.")
+    _home(left, right, args, xrt, stop_requested)
+    if stop_requested():
+        raise InterruptedError("stopped between left and right homing")
+    _home(right, left, args, xrt, stop_requested)
+    print("Both-arm sequential homing complete.")
+
+
+def _rebase_arm_reference(side: ArmSide, pose, feedback_pose, current, args) -> None:
+    """Capture a no-motion hand/arm reference for engagement filtering."""
+    side.xr_reference = np.asarray(pose, dtype=float).copy()
+    side.flange_reference = np.asarray(feedback_pose, dtype=float).copy()
+    side.ik.set_posture_anchor(current if args.posture_anchor == "engage" else None)
+    side.tracker = TranslationTracker(
+        side.xr_reference[:3], side.flange_reference[:3], args.scale, side.limits,
+        args.max_target_lead, mapping=side.engagement_mapping,
+    )
+    side.last_joint_command = np.asarray(current, dtype=float).copy()
+    side.last_cartesian_target = side.flange_reference.copy()
+
+
 def _compute_arm(side: ArmSide, state: dict, fresh: bool, dt: float, now: float, args):
     pose = np.asarray(state[f"{side.hand}_controller_pose"], dtype=float)
     both_valid = valid_xr_pose(np.asarray(state["left_controller_pose"], dtype=float)) and valid_xr_pose(
@@ -452,8 +581,32 @@ def _compute_arm(side: ArmSide, state: dict, fresh: bool, dt: float, now: float,
     grip = float(state[f"{side.hand}_grip"])
     trigger = float(np.clip(state[f"{side.hand}_trigger"], 0.0, 1.0))
     active = side.clutch.update(grip, fresh and both_valid)
+    command_buttons = ("X", "Y") if side.hand == "left" else ("A", "B")
+    command_chord_held = any(
+        command_button_chord(
+            grip,
+            trigger,
+            state.get(f"{button}_button", False),
+            getattr(args, "command_modifier_threshold", 0.8),
+        )
+        for button in command_buttons
+    )
 
-    if active and args.live and side.ready and side.gripper is not None and now >= side.next_gripper_command:
+    if command_chord_held:
+        if side.xr_reference is not None:
+            _hold(side, args)
+        side.xr_reference = None
+        side.flange_reference = None
+        side.tracker = None
+        return None
+
+    if (
+        active
+        and args.live
+        and side.ready
+        and side.gripper is not None
+        and now >= side.next_gripper_command
+    ):
         maximum = args.gripper_speed_mm_s / 1000.0 * 0.05
         (
             side.gripper_command,
@@ -490,15 +643,24 @@ def _compute_arm(side: ArmSide, state: dict, fresh: bool, dt: float, now: float,
     current = wait_for_joint_angles(side.robot)
     feedback_pose = side.ik.flange_pose(current)
     if side.xr_reference is None:
-        side.xr_reference = pose.copy()
-        side.flange_reference = feedback_pose.copy()
-        side.ik.set_posture_anchor(current if args.posture_anchor == "engage" else None)
-        side.tracker = TranslationTracker(
-            pose[:3], feedback_pose[:3], args.scale, side.limits,
-            args.max_target_lead, side.yaw_degrees, side.mirror,
+        violations = command_joint_limit_violations(current)
+        if violations:
+            side.reset_clutch()
+            side.clutch.pause()
+            print(
+                f"{side.name} control blocked at engagement: " + "; ".join(violations)
+                + f"; hold {('LEFT Grip+X' if side.hand == 'left' else 'RIGHT Grip+A')} to home"
+            )
+            return None
+        headset_pose = None
+        if args.tracking_frame == "head":
+            headset_pose = np.asarray(state.get("headset_pose"), dtype=float)
+        side.engagement_mapping = mapping_matrix(
+            side.yaw_degrees, side.mirror, headset_pose=headset_pose
         )
-        side.last_joint_command = current.copy()
-        side.last_cartesian_target = feedback_pose.copy()
+        _rebase_arm_reference(side, pose, feedback_pose, current, args)
+        side.settle_until = now + args.engage_settle_seconds
+        side.motion_armed = False
         outside = not np.all(
             (feedback_pose[:3] >= side.limits.xyz_min)
             & (feedback_pose[:3] <= side.limits.xyz_max)
@@ -510,11 +672,32 @@ def _compute_arm(side: ArmSide, state: dict, fresh: bool, dt: float, now: float,
             "..", np.array2string(side.limits.xyz_max, precision=3),
             "(outside; inward recovery only)" if outside else "",
         )
+        # Capturing the clutch reference is not a movement request.  In
+        # particular, do not let an IK solve redistribute wrist joints while
+        # the operator's hand has not moved yet.
+        return None
+
+    if now < side.settle_until:
+        # Grip squeezing commonly shifts the controller a few millimetres.
+        # Continuously rebase during this short window and send no arm target.
+        _rebase_arm_reference(side, pose, feedback_pose, current, args)
+        return None
+
+    if not side.motion_armed:
+        hand_travel = float(np.linalg.norm(pose[:3] - side.xr_reference[:3]))
+        if hand_travel < args.engage_deadband_m:
+            return None
+        # Crossing the threshold merely arms motion; it is not itself a target.
+        # This prevents the accumulated Grip-squeeze displacement from causing
+        # a first-frame wrist movement.
+        _rebase_arm_reference(side, pose, feedback_pose, current, args)
+        side.motion_armed = True
+        return None
 
     requested = build_target(
         side.xr_reference, pose, side.flange_reference, args.scale,
         args.orientation, side.limits, yaw_degrees=side.yaw_degrees,
-        mirror=side.mirror,
+        mirror=side.mirror, mapping=side.engagement_mapping,
     )
     requested[:3], reasons = side.tracker.update(pose[:3], feedback_pose[:3])
     if reasons and now - side.last_limit_notice >= 1.0:
@@ -632,7 +815,9 @@ def main(argv: list[str] | None = None) -> int:
     xrt.init()
     try:
         # Validate the XR source before probing or connecting either arm.
-        wait_for_bimanual_xr(xrt, args.xr_bridge, args.xr_wait_timeout, lambda: stop)
+        wait_for_bimanual_xr(
+            xrt, args.xr_bridge, args.xr_wait_timeout, lambda: stop, args.tracking_frame
+        )
         for name, hand, channel, minimum, maximum, yaw, mirror in (
             ("left", "left", args.left_channel, args.left_xyz_min, args.left_xyz_max,
              args.left_xr_yaw_deg, args.left_xr_mirror),
@@ -670,8 +855,15 @@ def main(argv: list[str] | None = None) -> int:
 
         mode = "LIVE" if args.live else "DRY-RUN"
         print(f"Mode: {mode}. Left controller -> {args.left_channel}; right controller -> {args.right_channel}")
-        print(f"Engagement mode: {args.engagement_mode}; jumps pause BOTH arms; hold Y/B to resume.")
-        print("Hold Y/B to enable left/right; X/A to home; either stick click E-stops both.")
+        print(
+            f"Engagement mode: {args.engagement_mode}; jumps pause BOTH arms; "
+            "hold same-hand Grip/Trigger+Y/B to resume."
+        )
+        print(
+            "Hold LEFT Grip+Y / RIGHT Grip+B to enable; "
+            "LEFT Grip+X / RIGHT Grip+A to home; Trigger is also accepted; "
+            "either stick click E-stops both."
+        )
         if args.live:
             print("Clear both workspaces and keep the physical E-stop within reach.")
             if args.min_flange_separation <= 0:
@@ -714,48 +906,48 @@ def main(argv: list[str] | None = None) -> int:
                 time.sleep(period)
                 continue
 
+            command_hands = {"X": "left", "Y": "left", "A": "right", "B": "right"}
             fired = {
-                name: presses[name].update(bool(state[f"{name}_button"]), started, args.button_hold_seconds)
+                name: presses[name].update(
+                    command_button_chord(
+                        state[f"{command_hands[name]}_grip"],
+                        state[f"{command_hands[name]}_trigger"],
+                        state[f"{name}_button"],
+                        args.command_modifier_threshold,
+                    ),
+                    started,
+                    args.button_hold_seconds,
+                )
                 for name in presses
             }
-            hands_released = args.engagement_mode == "direct" or (
-                float(state["left_grip"]) <= args.grip_release_threshold
-                and float(state["right_grip"]) <= args.grip_release_threshold
-            )
             if fired["Y"]:
-                if not hands_released:
-                    print("Release both Grip buttons before enabling the left arm.")
-                elif args.live:
+                if args.live:
                     _enable(left, args)
                 else:
                     print("DRY-RUN: left enable skipped")
             if fired["B"]:
-                if not hands_released:
-                    print("Release both Grip buttons before enabling the right arm.")
-                elif args.live:
+                if args.live:
                     _enable(right, args)
                 else:
                     print("DRY-RUN: right enable skipped")
-            if simultaneous_home_pressed(state) and (fired["X"] or fired["A"]):
+            if simultaneous_home_pressed(state, args.command_modifier_threshold) and (
+                fired["X"] or fired["A"]
+            ):
                 # Suppress the still-held partner button too.  Both buttons must
                 # be released before either LongPress can arm again.
                 presses["X"].fired = True
                 presses["A"].fired = True
-                print(
-                    "X+A simultaneous home blocked: home one arm at a time "
-                    "because full inter-arm collision checking is not enabled."
-                )
+                if args.live:
+                    _home_both_sequentially(left, right, args, xrt, lambda: stop)
+                else:
+                    print("DRY-RUN: both-arm sequential home skipped")
             else:
-                if fired["X"] and not home_grip_released(state, "left", args.grip_release_threshold):
-                    print("Release LEFT GRIP before homing the left arm.")
-                elif fired["X"] and args.live:
+                if fired["X"] and args.live:
                     _home(left, right, args, xrt, lambda: stop)
                     # A may have been pressed while the blocking home ran.  Do
                     # not let it immediately start the other arm on return.
                     presses["A"].fired = True
-                if fired["A"] and not home_grip_released(state, "right", args.grip_release_threshold):
-                    print("Release RIGHT GRIP before homing the right arm.")
-                elif fired["A"] and args.live:
+                if fired["A"] and args.live:
                     _home(right, left, args, xrt, lambda: stop)
                     presses["X"].fired = True
 
@@ -794,7 +986,7 @@ def main(argv: list[str] | None = None) -> int:
                     else:
                         side.robot.move_j(command.tolist())
 
-            if started - last_print >= 1.0:
+            if args.verbose_status and started - last_print >= 1.0:
                 print(
                     f"fresh={fresh}",
                     f"buttons=X{int(bool(state['X_button']))}/Y{int(bool(state['Y_button']))}/"

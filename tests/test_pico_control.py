@@ -5,6 +5,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 from robotarm.teleop.xr.geometry import Limits, build_target, clamp_rotation_step
 from robotarm.teleop.xr.piper_ik import PiperIK
+from robotarm.teleop.xr.control import command_button_chord
 from robotarm.teleop.xr.runtime import wait_for_xr, make_parser, validate_args
 
 
@@ -40,6 +41,28 @@ class PicoControlTests(unittest.TestCase):
             feedback=target
         np.testing.assert_allclose(target,[.31,0.,.3])
 
+    def test_default_translation_scale_is_two_to_one(self):
+        args = make_parser().parse_args([])
+        self.assertEqual(args.scale, 2.0)
+        self.assertFalse(args.verbose_status)
+        limits = Limits(np.full(3, -1.0), np.full(3, 1.0), 0.2, 0.0024, 0.014)
+        from robotarm.teleop.xr.geometry import TranslationTracker
+        tracker = TranslationTracker(
+            np.zeros(3), np.array([0.3, 0.0, 0.3]), args.scale, limits, 0.05
+        )
+        target, reasons = tracker.update(
+            np.array([0.0, 0.0, -0.01]), np.array([0.3, 0.0, 0.3])
+        )
+        self.assertFalse(reasons)
+        np.testing.assert_allclose(target, [0.32, 0.0, 0.3])
+
+    def test_face_button_accepts_grip_or_trigger_modifier(self):
+        self.assertFalse(command_button_chord(0.0, 0.0, True, 0.8))
+        self.assertFalse(command_button_chord(1.0, 1.0, False, 0.8))
+        self.assertFalse(command_button_chord(0.79, 0.79, True, 0.8))
+        self.assertTrue(command_button_chord(0.8, 0.0, True, 0.8))
+        self.assertTrue(command_button_chord(0.0, 0.8, True, 0.8))
+
     def test_workspace_notice_and_fixed_clutch_boundary(self):
         t=self.tracker(1.)
         target,reasons=t.update(np.array([0.,-.5,0.]),np.array([.3,0.,.3]))
@@ -68,6 +91,25 @@ class PicoControlTests(unittest.TestCase):
         moved = ref.copy(); moved[2] = -.1; moved[1] = .02
         target = build_target(ref,moved,np.zeros(6),1.,False,limits,yaw_degrees=90)
         np.testing.assert_allclose(target[:3],[0,.1,.02],atol=1e-10)
+
+    def test_head_relative_mapping_uses_operator_forward_right_and_up(self):
+        from robotarm.teleop.xr.geometry import mapping_matrix
+
+        # Head is yawed 90 degrees left in the XR world. Local forward is
+        # world -X and local right is world -Z.
+        headset = np.r_[
+            np.zeros(3), Rotation.from_euler("y", 90, degrees=True).as_quat()
+        ]
+        mapping = mapping_matrix(headset_pose=headset)
+        np.testing.assert_allclose(
+            mapping @ [-0.1, 0.0, 0.0], [0.1, 0.0, 0.0], atol=1e-9
+        )
+        np.testing.assert_allclose(
+            mapping @ [0.0, 0.1, 0.0], [0.0, 0.0, 0.1], atol=1e-9
+        )
+        np.testing.assert_allclose(
+            mapping @ [0.0, 0.0, -0.1], [0.0, -0.1, 0.0], atol=1e-9
+        )
 
     def test_bent_posture_tracks_three_cm_lateral_in_one_second(self):
         from robotarm.teleop.xr.control import limit_joint_step
@@ -113,7 +155,7 @@ class PicoControlTests(unittest.TestCase):
 
     def test_recording_cannot_reclaim_b_button(self):
         args = make_parser().parse_args(['--live','--record'])
-        with self.assertRaisesRegex(ValueError,'hold B'):
+        with self.assertRaisesRegex(ValueError,r'Grip/Trigger\+B'):
             validate_args(args,np)
 
     def test_joint_limits_preserve_ratios(self):

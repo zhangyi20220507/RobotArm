@@ -7,17 +7,19 @@
 程序默认 dry-run。真机运行必须显式指定 --execute；录制还需 --setup-id 和 --task。
 --control-only 仅控制主从臂，不连接相机或创建采集目录。
 运行时按键：l 进入主臂零力拖动，a 慢速对齐从臂，f 开始/暂停跟随，r 开始/保存 episode，
-h 空闲时让双臂和两侧夹爪依次回零，d 丢弃 episode，x 从臂电子急停并退出，q 保持两臂并退出。正常退出时主臂进入受控使能保持；回零期间急停后，
+h 空闲时让双臂和两侧夹爪回零（默认依次，--parallel-home 并行），d 丢弃 episode，x 从臂电子急停并退出，q 保持两臂并退出。正常退出时主臂进入受控使能保持；回零期间急停后，
 主臂角色可能仍为零力拖动，需单独恢复角色。
 """
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import math
 import select
 import sys
 import termios
+import threading
 import time
 import traceback
 import tty
@@ -96,6 +98,13 @@ def make_parser() -> argparse.ArgumentParser:
         "--home-gripper-speed-mm-s", type=base.positive_float,
         default=cfg["home-gripper-speed-mm-s"],
         help="maximum gripper closing speed during h in mm/s",
+    )
+    parser.add_argument(
+        "--parallel-home", action="store_true",
+        help=(
+            "home leader and follower concurrently when h is pressed; requires "
+            "two clear, non-intersecting return paths"
+        ),
     )
     parser.add_argument(
         "--control-rate", type=base.positive_float, default=cfg["control-rate"],
@@ -537,11 +546,15 @@ def read_gripper_message(gripper: Any, role: str) -> tuple[float, float]:
 
 
 def read_leader_gripper_command(
-    gripper: Any, previous: float
+    gripper: Any, previous: float, *, not_before: float = 0.0,
 ) -> tuple[float, float]:
     """Read event-driven 0x159 leader gripper input, retaining the last value."""
     message = gripper.get_gripper_ctrl_states()
     if message is None:
+        return previous, math.inf
+    if float(getattr(message, "timestamp", 0.0)) < not_before:
+        # A cached pre-transition drag command must not reopen the follower
+        # gripper immediately after both grippers were homed closed.
         return previous, math.inf
     value = float(message.msg.value)
     status_code = int(message.msg.status_code)
@@ -617,6 +630,21 @@ def enter_follower_j(
         base.retry_boolean(robot.enable, 5.0, "Enable follower")
     base.set_gripper_enabled(gripper, True, gripper_width, force, 5.0)
     time.sleep(0.1)
+    # Enabling can consume/reset the planned-motion trigger.  Re-assert J mode
+    # before the current-position hold so the next planned target is accepted.
+    robot.set_motion_mode(robot.OPTIONS.MOTION_MODE.J)
+    robot.move_j(joints)
+
+
+def move_follower_j(robot: Any, joints: list[float]) -> None:
+    """Send one planned joint target with a fresh MOVE_J trigger.
+
+    The SDK normally emits the mode frame for every ``move_j`` call.  This
+    runtime disables that automatic behavior so high-rate JS following does
+    not resend mode frames, therefore planned-J operations must trigger their
+    own 0x151 frame explicitly.
+    """
+    robot.set_motion_mode(robot.OPTIONS.MOTION_MODE.J)
     robot.move_j(joints)
 
 
@@ -809,7 +837,7 @@ def print_controls() -> None:
     print("  f: start/pause following; cancel alignment while aligning")
     print("  s: show detailed arm modes, joints and following errors on demand")
     print("  r: start/save episode    d: discard episode")
-    print("  h: when idle, native-home leader, then MOVE_J-home follower; close both grippers")
+    print("  h: home both arms; restore following afterward if f was active")
     print("  q: hold both arms and quit")
     print("  x: follower electronic emergency stop, hold leader and quit")
     print("  normal exit: leader holds enabled; after homing E-stop, restore its role separately\n")
@@ -863,6 +891,14 @@ def read_fresh_motor_joint_snapshot(robot: Any, now_wall: float) -> tuple[list[f
         positions.append(position)
         timestamps.append(stamp)
     return positions, min(timestamps)
+
+
+class NativeHomeFeedbackSilent(RuntimeError):
+    """Firmware home moved without publishing verifiable joint feedback."""
+
+
+class LeaderGripperHomeIncomplete(RuntimeError):
+    """Leader gripper did not move, while arm-joint homing remains valid."""
 
 
 def home_leader_native(
@@ -924,6 +960,15 @@ def _home_leader_native(
         on_command_start()
     move_home()
     started = time.monotonic()
+    initial_error_deg = math.degrees(max(abs(value) for value in joints))
+    # Native-home speed is controller-defined.  Silent firmware used to force
+    # an eight-second blind wait.  Probe ordinary feedback sooner; callers can
+    # safely finish a partial pose with verified 10% MOVE_J after role restore.
+    verification_reserve = min(5.0, max(0.5, timeout * 0.25))
+    silent_restore_after = min(
+        max(3.0, initial_error_deg / 10.0 + 1.0),
+        max(0.1, timeout - verification_reserve),
+    )
     last_print = -math.inf
     last_source = None
     best_total_error_deg = sum(math.degrees(abs(value)) for value in joints)
@@ -973,13 +1018,17 @@ def _home_leader_native(
         if position_fresh and total_error_deg <= best_total_error_deg - 1.0:
             best_total_error_deg = total_error_deg
             last_progress_at = now
-        if (not position_fresh or error > 3.0) and now - last_progress_at >= 8.0:
-            reason = (
-                "no fresh position feedback"
-                if not position_fresh else "made no meaningful progress"
+        if not position_fresh and now - started >= silent_restore_after:
+            raise NativeHomeFeedbackSilent(
+                f"{channel} firmware leader home no fresh position feedback "
+                f"for {now - started:.1f} s; last_known_max_error={error:.2f} deg; "
+                f"updated_joint_pairs={sorted(seen_pairs)}; "
+                f"ctrl_mode={getattr(status.msg, 'ctrl_mode', 'unavailable')}, "
+                f"motion_status={getattr(status.msg, 'motion_status', 'unavailable')}"
             )
+        if position_fresh and error > 3.0 and now - last_progress_at >= 8.0:
             raise RuntimeError(
-                f"{channel} firmware leader home {reason} "
+                f"{channel} firmware leader home made no meaningful progress "
                 f"for 8 s; last_known_max_error={error:.2f} deg; "
                 f"updated_joint_pairs={sorted(seen_pairs)}; "
                 f"ctrl_mode={getattr(status.msg, 'ctrl_mode', 'unavailable')}, "
@@ -1003,6 +1052,66 @@ def _home_leader_native(
             settled_since = None
         time.sleep(0.02)
     raise TimeoutError(f'{channel} firmware leader home did not finish within {timeout:g} s')
+
+
+def restore_and_verify_native_home(
+    robot: Any, config: dict[str, Any], channel: str,
+    timeout: float, stop_requested: Any, *, allow_nonzero: bool = False,
+) -> list[float]:
+    """Leave 0x191 home, restore normal feedback, and verify the zero pose."""
+    restore_drag = getattr(robot, "restore_leader_drag_mode", None)
+    if not callable(restore_drag):
+        raise RuntimeError("installed Piper SDK lacks restore_leader_drag_mode")
+    set_follower = getattr(robot, "set_follower_mode", None)
+    if not callable(set_follower):
+        raise RuntimeError("installed Piper SDK lacks set_follower_mode")
+    if stop_requested():
+        raise InterruptedError("leader home verification interrupted before mode restore")
+
+    restore_drag()
+    time.sleep(0.2)
+    if stop_requested():
+        raise InterruptedError("leader home verification interrupted during mode restore")
+    transition_wall_time = time.time()
+    set_follower()
+
+    deadline = time.monotonic() + min(5.0, max(0.5, timeout))
+    last_error: BaseException | None = None
+    while time.monotonic() < deadline:
+        if stop_requested():
+            raise InterruptedError("leader home verification interrupted")
+        try:
+            message = robot.get_joint_angles()
+            if message is None or float(message.timestamp) <= transition_wall_time:
+                raise arm_home.IncompleteJointFeedback(
+                    "normal joint feedback is not newer than the role transition"
+                )
+            joints = arm_home.read_joints(
+                robot, config, 0.5,
+                arm_home.DEFAULT_JOINT_LIMIT_TOLERANCE_DEG,
+            )
+        except arm_home.IncompleteJointFeedback as error:
+            last_error = error
+            time.sleep(0.02)
+            continue
+        base.ensure_arm_status_normal(robot)
+        error_deg = math.degrees(max(abs(value) for value in joints))
+        if error_deg > 3.0 and not allow_nonzero:
+            angles = ', '.join(f'{math.degrees(value):+.2f}' for value in joints)
+            raise RuntimeError(
+                f"{channel} firmware home verification failed after feedback "
+                f"resumed: max_error={error_deg:.2f} deg; joints_deg=[{angles}]"
+            )
+        state = "verified home" if error_deg <= 3.0 else "partial pose"
+        print(
+            f"{channel}: normal feedback resumed after firmware home; "
+            f"{state}, max_error={error_deg:.2f} deg."
+        )
+        return joints
+    raise RuntimeError(
+        f"{channel} did not resume complete normal joint feedback within "
+        f"{min(5.0, max(0.5, timeout)):g} s after firmware home: {last_error}"
+    )
 
 
 def close_gripper_slowly(
@@ -1031,8 +1140,10 @@ def close_gripper_slowly(
         if width <= best_width - 0.001:
             best_width = width
             last_progress_at = now
-        if width > 0.002 and now - last_progress_at >= 8.0:
-            raise RuntimeError('leader gripper made no closing progress for 8 s')
+        if width > 0.002 and now - last_progress_at >= 1.5:
+            raise LeaderGripperHomeIncomplete(
+                'leader gripper made no closing progress for 1.5 s'
+            )
         if command <= 0.002 and width <= 0.002:
             if settled_since is None:
                 settled_since = now
@@ -1048,7 +1159,7 @@ def close_gripper_slowly(
 
 def home_one_arm(robot: Any, config: dict[str, Any], channel: str,
                  gripper: Any, force: float, gripper_speed_mm_s: float,
-                 timeout: float, stop_requested: Any) -> None:
+                 timeout: float, stop_requested: Any) -> list[float]:
     """MOVE_J to joint zero while rate-limiting the gripper to closed width."""
     options = SimpleNamespace(
         channel=channel, speed_percent=10, timeout=timeout,
@@ -1056,10 +1167,75 @@ def home_one_arm(robot: Any, config: dict[str, Any], channel: str,
         joint_limit_tolerance_deg=arm_home.DEFAULT_JOINT_LIMIT_TOLERANCE_DEG,
         tolerance_deg=3.0,
     )
-    arm_home.run_home(
+    return arm_home.run_home(
         robot, config, options, stop_requested, gripper=gripper,
         gripper_force=force, gripper_speed_mm_s=gripper_speed_mm_s,
     )
+
+
+def home_leader_and_restore(
+    leader: Any, leader_config: dict[str, Any], leader_channel: str,
+    leader_initial_joints: list[float], timeout: float,
+    stop_requested: Any, on_command_start: Any = None,
+) -> list[float]:
+    """Run native home, then use verified MOVE_J only if silent home was partial."""
+    silent = False
+    try:
+        home_leader_native(
+            leader, leader_config, leader_channel,
+            leader_initial_joints, timeout, stop_requested,
+            on_command_start=on_command_start,
+        )
+    except NativeHomeFeedbackSilent as error:
+        silent = True
+        print(
+            f"[leader-follower] {error}; probing normal feedback now instead "
+            "of continuing to wait blindly."
+        )
+    joints = restore_and_verify_native_home(
+        leader, leader_config, leader_channel, timeout, stop_requested,
+        allow_nonzero=silent,
+    )
+    error_deg = math.degrees(max(abs(value) for value in joints))
+    if error_deg > 3.0:
+        print(
+            f"[leader-follower] {leader_channel} native home stopped at "
+            f"{error_deg:.2f} deg; finishing with feedback-verified MOVE_J at 10%."
+        )
+        joints = home_one_arm(
+            leader, leader_config, leader_channel, None,
+            1.0, 1.0, timeout, stop_requested,
+        )
+    return joints
+
+
+def close_leader_gripper_best_effort(
+    gripper: Any, force: float, speed_mm_s: float,
+    timeout: float, stop_requested: Any, *, robot: Any,
+) -> bool:
+    """Close the leader gripper without invalidating successful joint homing."""
+    try:
+        close_gripper_slowly(
+            gripper, force, speed_mm_s, timeout, stop_requested, robot=robot,
+        )
+    except LeaderGripperHomeIncomplete as error:
+        try:
+            hold_width = arm_home.read_gripper_width(gripper, 0.5)
+            gripper.move_gripper_m(hold_width, force)
+        except Exception as hold_error:
+            print(
+                f"[leader-follower] WARNING: could not hold the stalled leader "
+                f"gripper at its measured width: {hold_error}",
+                file=sys.stderr,
+            )
+        print(
+            f"[leader-follower] WARNING: {error}; arm joints are homed, so "
+            "continuing without E-stop. Operate the leader gripper once after "
+            "following resumes.",
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 def home_both_sequentially(
@@ -1079,19 +1255,18 @@ def home_both_sequentially(
         nonlocal motion_started
         motion_started = True
     try:
-        leader_joints = home_leader_native(
-            leader, leader_config, leader_channel,
-            leader_initial_joints, timeout, stop_requested,
-            on_command_start=mark_motion_started,
+        leader_joints = home_leader_and_restore(
+            leader, leader_config, leader_channel, leader_initial_joints,
+            timeout, stop_requested, on_command_start=mark_motion_started,
         )
-        # 0x191 mode 0 restores drag; we instead leave the leader in an
-        # enabled hold using the measured zero pose before moving the follower.
+        # Leave zero-force mode immediately and hold the measured zero pose
+        # before the follower starts moving.
         motion_started = True
         exit_leader_drag_mode(
             leader, leader_joints, leader_gripper,
             leader_initial_gripper_width, force, config=leader_config,
         )
-        close_gripper_slowly(
+        close_leader_gripper_best_effort(
             leader_gripper, force, gripper_speed_mm_s,
             timeout, stop_requested, robot=leader,
         )
@@ -1139,6 +1314,128 @@ def home_both_sequentially(
                 f"({type(error).__name__}: {error}); no E-stop sent."
             )
         raise
+
+
+def home_both_in_parallel(
+    follower: Any, follower_config: dict[str, Any], follower_channel: str,
+    leader: Any, leader_config: dict[str, Any], leader_channel: str,
+    follower_gripper: Any, leader_gripper: Any,
+    force: float, gripper_speed_mm_s: float,
+    timeout: float, stop_requested: Any,
+    leader_initial_joints: list[float], leader_initial_gripper_width: float,
+    on_estop: Any = None,
+) -> list[float]:
+    """Home both CAN endpoints concurrently and fail-stop both as one operation."""
+    if stop_requested():
+        raise InterruptedError("parallel dual-arm homing cancelled before movement")
+
+    cancel = threading.Event()
+    start = threading.Event()
+
+    def worker_stop_requested() -> bool:
+        return cancel.is_set()
+
+    def home_leader() -> list[float]:
+        start.wait()
+        if cancel.is_set():
+            raise InterruptedError("parallel leader home cancelled before start")
+        joints = home_leader_and_restore(
+            leader, leader_config, leader_channel, leader_initial_joints,
+            timeout, worker_stop_requested,
+        )
+        exit_leader_drag_mode(
+            leader, joints, leader_gripper,
+            leader_initial_gripper_width, force, config=leader_config,
+        )
+        close_leader_gripper_best_effort(
+            leader_gripper, force, gripper_speed_mm_s,
+            timeout, worker_stop_requested, robot=leader,
+        )
+        return joints
+
+    def home_follower() -> None:
+        start.wait()
+        if cancel.is_set():
+            raise InterruptedError("parallel follower home cancelled before start")
+        home_one_arm(
+            follower, follower_config, follower_channel,
+            follower_gripper, force, gripper_speed_mm_s, timeout,
+            worker_stop_requested,
+        )
+
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=2, thread_name_prefix="dual-home"
+    )
+    try:
+        # Both workers wait at the gate, so a thread-submission failure cannot
+        # leave only one physical arm moving.
+        leader_future = executor.submit(home_leader)
+        follower_future = executor.submit(home_follower)
+    except BaseException:
+        cancel.set()
+        start.set()
+        executor.shutdown(wait=True)
+        raise
+    start.set()
+    futures = {leader_future, follower_future}
+    failure: BaseException | None = None
+    try:
+        pending = set(futures)
+        while pending:
+            if stop_requested():
+                failure = InterruptedError("parallel dual-arm homing interrupted")
+                break
+            done, pending = concurrent.futures.wait(
+                pending, timeout=0.02,
+                return_when=concurrent.futures.FIRST_EXCEPTION,
+            )
+            for future in done:
+                error = future.exception()
+                if error is not None:
+                    failure = error
+                    break
+            if failure is not None:
+                break
+    except BaseException as error:
+        failure = error
+
+    if failure is not None:
+        cancel.set()
+        if on_estop is not None:
+            on_estop()
+        reason = (
+            "interrupted by operator"
+            if isinstance(failure, (KeyboardInterrupt, InterruptedError))
+            else "failed"
+        )
+        for robot, channel in (
+            (leader, leader_channel), (follower, follower_channel)
+        ):
+            try:
+                robot.electronic_emergency_stop()
+                print(
+                    f"[leader-follower] parallel homing {reason}; electronic "
+                    f"emergency stop sent to {channel}."
+                )
+            except Exception as stop_error:
+                print(
+                    f"[leader-follower] WARNING: failed to send homing E-stop "
+                    f"to {channel}: {stop_error}",
+                    file=sys.stderr,
+                )
+        # Workers only receive the cancellation event; consume their outcomes so
+        # no command can outlive this helper or leak an unobserved exception.
+        concurrent.futures.wait(futures)
+        executor.shutdown(wait=True)
+        print(
+            "[leader-follower] WARNING: parallel home stopped both arms. The "
+            "leader role may need restore-piper-role before controller restart.",
+            file=sys.stderr,
+        )
+        raise failure
+
+    executor.shutdown(wait=True)
+    return leader_future.result()
 
 
 def run_check(args: argparse.Namespace) -> int:
@@ -1226,6 +1523,7 @@ def main(argv: list[str] | None = None) -> int:
     leader_drag = False
     leader_joints: list[float] | None = None
     leader_gripper_width = 0.0
+    leader_gripper_input_not_before = 0.0
     motion_diagnostics = MotionDiagnostics()
     last_status_print = -math.inf
     last_sent_joints: list[float] | None = None
@@ -1429,7 +1727,7 @@ def main(argv: list[str] | None = None) -> int:
                         if age > args.stale_timeout:
                             raise RuntimeError("cannot hold with stale follower feedback")
                         command = clip_command_to_bounds(follower_joints, bounds)
-                        follower.move_j(command)
+                        move_follower_j(follower, command)
                         last_sent_joints = list(command)
                         print("\n[leader-follower] alignment cancelled; follower holds position.")
                     elif following:
@@ -1520,6 +1818,7 @@ def main(argv: list[str] | None = None) -> int:
                     elif alignment_target is not None:
                         print("\n[leader-follower] press f to cancel alignment before homing.")
                     else:
+                        resume_following_after_home = following
                         # Stop streaming before changing the leader's role. Never
                         # let a moving leader drag arm remain free while the
                         # follower is homing.
@@ -1534,7 +1833,7 @@ def main(argv: list[str] | None = None) -> int:
                             if follower_js_mode:
                                 follower.move_js(follower_hold)
                             else:
-                                follower.move_j(follower_hold)
+                                move_follower_j(follower, follower_hold)
                         following = False
                         command = follower_hold
                         last_sent_joints = None
@@ -1569,18 +1868,30 @@ def main(argv: list[str] | None = None) -> int:
                             leader.set_leader_mode()
                             leader_drag = True
                             time.sleep(0.1)
-                        print(
-                            "\n[leader-follower] following paused; homing leader "
-                            "with firmware 0x191 at controller-defined speed, "
-                            "then follower with MOVE_J at 10%; both grippers close slowly."
-                        )
+                        if args.parallel_home:
+                            print(
+                                "\n[leader-follower] following paused; PARALLEL HOME: "
+                                "leader uses firmware 0x191 and follower uses MOVE_J "
+                                "at 10%; both grippers close slowly. Keep both return "
+                                "paths clear. Any failure E-stops both arms."
+                            )
+                        else:
+                            print(
+                                "\n[leader-follower] following paused; homing leader "
+                                "with firmware 0x191 at controller-defined speed, "
+                                "then follower with MOVE_J at 10%; both grippers close slowly."
+                            )
                         def home_stop_requested() -> bool:
                             return keys.poll() in ("x", "q")
                         def mark_homing_estop() -> None:
                             nonlocal emergency_stop
                             emergency_stop = True
                         try:
-                            leader_joints = home_both_sequentially(
+                            home_both = (
+                                home_both_in_parallel
+                                if args.parallel_home else home_both_sequentially
+                            )
+                            leader_joints = home_both(
                                 follower, follower_config, args.follower_channel,
                                 leader, leader_config, args.leader_channel,
                                 follower_gripper, leader_gripper,
@@ -1591,23 +1902,81 @@ def main(argv: list[str] | None = None) -> int:
                             )
                         except BaseException:
                             if emergency_stop:
-                                # Helper held the leader, or E-stopped the
-                                # active arm; do not command it in cleanup.
+                                # Helper E-stopped the active homing arm(s); do
+                                # not command the leader again during cleanup.
                                 leader_drag = False
                             raise
                         leader_drag = False
                         leader_gripper_width = 0.0
+                        leader_gripper_input_not_before = time.time()
                         follower_enabled = True
                         follower_js_mode = False
-                        follower_joints, _ = read_joint_message(
+                        follower_joints, follower_joint_age = read_joint_message(
                             follower, follower_config, "follower"
                         )
-                        command = follower_joints[:]
-                        episode_ready_for_home = False
-                        print(
-                            "[leader-follower] both arms homed and holding enabled; "
-                            "press l, a, f to resume following."
+                        follower_gripper_width, follower_gripper_age = read_gripper_message(
+                            follower_gripper, "follower"
                         )
+                        if max(follower_joint_age, follower_gripper_age) > args.stale_timeout:
+                            raise RuntimeError(
+                                "cannot restore post-home state with stale follower feedback"
+                            )
+                        command = follower_joints[:]
+                        command_gripper = follower_gripper_width
+                        last_sent_joints = list(command)
+                        episode_ready_for_home = False
+                        if resume_following_after_home:
+                            leader.set_leader_mode()
+                            leader_drag = True
+                            time.sleep(0.1)
+                            leader_joints, _ = update_leader_joint_message(
+                                leader, leader_joints, leader_config
+                            )
+                            requested_after_home = map_leader_joints(
+                                leader_joints, args.joint_signs,
+                                args.joint_offsets_deg,
+                            )
+                            requested_after_home = clip_feedback_zero_offsets(
+                                requested_after_home, follower_config
+                            )
+                            requested_after_home = prepare_leader_target(
+                                requested_after_home, bounds, args.control_only
+                            )
+                            resume_errors = [
+                                target - actual for target, actual in zip(
+                                    requested_after_home, follower_joints
+                                )
+                            ]
+                            if max(abs(value) for value in resume_errors) > alignment_limit:
+                                text = ", ".join(
+                                    f"J{i}={math.degrees(value):+.1f}deg"
+                                    for i, value in enumerate(resume_errors, 1)
+                                )
+                                print(
+                                    "[leader-follower] both arms homed, but automatic "
+                                    f"following restore was rejected: {text}; "
+                                    "press a to align, then f to follow."
+                                )
+                            else:
+                                follower.set_speed_percent(args.speed)
+                                enter_follower_js(
+                                    follower, follower_gripper, command,
+                                    follower_gripper_width, args.gripper_force,
+                                    follower_enabled,
+                                )
+                                follower_js_mode = True
+                                ensure_receive_running(leader, "leader")
+                                ensure_receive_running(follower, "follower")
+                                following = True
+                                print(
+                                    "[leader-follower] both arms homed; previous f "
+                                    "following mode restored automatically."
+                                )
+                        else:
+                            print(
+                                "[leader-follower] both arms homed and holding enabled; "
+                                "following remains paused because f was not active before h."
+                            )
                 elif key == "q":
                     print("\n[leader-follower] clean exit; follower holds position.")
                     break
@@ -1624,7 +1993,8 @@ def main(argv: list[str] | None = None) -> int:
                         leader, leader_joints, leader_config
                     )
                     leader_width, leader_gripper_age = read_leader_gripper_command(
-                        leader_gripper, leader_gripper_width
+                        leader_gripper, leader_gripper_width,
+                        not_before=leader_gripper_input_not_before,
                     )
                 else:
                     leader_joints, leader_joint_age = read_joint_message(
@@ -1694,7 +2064,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     validate_target_bounds(command, bounds)
                     if alignment_target is not None:
-                        follower.move_j(command)
+                        move_follower_j(follower, command)
                     else:
                         follower.move_js(command)
                     last_sent_joints = list(command)
@@ -1809,8 +2179,8 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         if emergency_stop:
             print(
-                "\n[leader-follower] interrupted during homing; the active arm "
-                "received an electronic emergency stop."
+                "\n[leader-follower] interrupted during homing; the active homing "
+                "arm(s) received an electronic emergency stop."
             )
         else:
             print("\n[leader-follower] interrupted; follower will hold position.")
@@ -1818,7 +2188,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         cleanup = (
             "Homing aborted; electronic emergency-stop handling ran for the "
-            "active arm. No following is active after exit."
+            "active homing arm(s). No following is active after exit."
             if emergency_stop else
             "Starting exit cleanup: follower will hold; leader will leave drag "
             "mode and hold enabled. No following is active after exit."
@@ -1845,7 +2215,11 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 if follower_js_mode:
                     follower.move_js(hold)
+                elif last_sent_joints is not None:
+                    move_follower_j(follower, hold)
                 else:
+                    # A read-only/idle session never armed planned motion, so
+                    # do not introduce a mode transition merely while exiting.
                     follower.move_j(hold)
             except Exception:
                 pass

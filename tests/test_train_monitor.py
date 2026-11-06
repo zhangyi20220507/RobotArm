@@ -19,6 +19,18 @@ _spec.loader.exec_module(monitor)
 
 
 class MonitorSideEffectTests(unittest.TestCase):
+    def test_page_has_persistent_chinese_english_switch(self) -> None:
+        page = monitor.PAGE
+        self.assertIn('id="language-switch"', page)
+        self.assertIn('data-lang="zh" aria-pressed="true"', page)
+        self.assertIn('data-lang="en" aria-pressed="false"', page)
+        self.assertIn('button.classList.toggle("selected", selected)', page)
+        self.assertIn('data-i18n="title"', page)
+        self.assertIn('Training Monitor', page)
+        self.assertIn('训练监视', page)
+        self.assertIn('localStorage.setItem("train-monitor-language", LANG)', page)
+        self.assertIn('document.documentElement.lang =', page)
+
     def test_main_does_not_create_the_run_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "not_yet"

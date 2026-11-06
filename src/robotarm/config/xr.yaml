@@ -5,13 +5,16 @@ piper-xr:
   firmware: auto
   model: piper
   rate: 100.0
-  scale: 1.0
+  scale: 2.0
   speed-percent: 50
   joint-control-mode: js
   xr-bridge-endpoint: tcp://127.0.0.1:60062
   engagement-mode: grip # grip = hold Grip to follow; direct = follow without holding
   grip-threshold: 0.9
   grip-release-threshold: 0.7
+  engage-settle-seconds: 0.25 # Ignore controller motion caused by squeezing Grip.
+  engage-deadband-m: 0.002 # Require deliberate hand motion before the first robot command.
+  command-modifier-threshold: 0.8
   gripper-max-mm: 100.0
   gripper-speed-mm-s: 20.0
   gripper-force: 1.0
@@ -58,13 +61,17 @@ piper-bimanual-xr:
   firmware: auto
   model: piper
   rate: 50.0
-  scale: 1.0
+  scale: 2.0
   speed-percent: 10
   joint-control-mode: js
+  tracking-frame: head # Freeze headset yaw at engagement; operator forward/right/up -> robot +X/-Y/+Z.
   xr-bridge-endpoint: tcp://127.0.0.1:60062
   engagement-mode: grip # grip = hold Grip to follow; direct = follow without holding
   grip-threshold: 0.9
   grip-release-threshold: 0.7
+  engage-settle-seconds: 0.25 # Ignore controller motion caused by squeezing Grip.
+  engage-deadband-m: 0.002 # Require deliberate hand motion before the first robot command.
+  command-modifier-threshold: 0.8
   gripper-max-mm: 70.0
   gripper-speed-mm-s: 20.0
   gripper-force: 1.0
@@ -94,6 +101,6 @@ piper-bimanual-xr:
   posture-anchor: engage # engage: 零空间正则锚定接合姿势（防漂移）；seed: 跟随上一帧命令
   left-xr-yaw-deg: 0.0
   right-xr-yaw-deg: 0.0
-  left-xr-mirror: none # lr/fb: mirror one horizontal axis if only that one is reversed
+  left-xr-mirror: none # Optional per-arm correction after head-relative mapping.
   right-xr-mirror: none
   max-target-lead: 0.02

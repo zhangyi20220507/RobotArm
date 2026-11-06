@@ -15,6 +15,55 @@ from typing import Callable
 BOOKKEEPING = {"timestamp", "frame_index", "episode_index", "index", "task_index"}
 
 
+def exported_reviews(dataset_root: Path) -> dict | None:
+    """Recover remapped reviews from a completed export, without writing files.
+
+    Old source-frame trims are already materialized and must never be reapplied.
+    This also supports exports created before review inheritance was available.
+    """
+    root = dataset_root.expanduser().resolve()
+    if (root / "TRIM_INCOMPLETE.txt").exists():
+        raise ValueError("裁剪导出尚未完成或已失败，不能使用此数据集训练")
+    path = root / "meta/trim_provenance.json"
+    if not path.is_file():
+        return None
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    info = json.loads((root / "meta/info.json").read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("reviews_snapshot"), dict):
+        raise ValueError("invalid trim provenance: missing review snapshot")
+    plan = manifest.get("episodes")
+    if (manifest.get("format") != "robotarm_dataset_trim_v1"
+            or manifest.get("range_semantics") != "[start_frame, end_frame)"
+            or manifest.get("fps") != info.get("fps")
+            or not isinstance(plan, list) or len(plan) != info["total_episodes"]
+            or not plan):
+        raise ValueError("invalid trim provenance: format/FPS/episode count mismatch")
+    reviews = {}
+    source_ids = set()
+    frames = 0
+    for index, item in enumerate(plan):
+        if not isinstance(item, dict):
+            raise ValueError("invalid trim provenance episode")
+        source_id = item.get("source_episode")
+        first, stop, length = (item.get(k) for k in ("start_frame", "end_frame", "source_length"))
+        review = item.get("review")
+        if (item.get("output_episode") != index or type(source_id) is not int
+                or source_id < 0 or source_id in source_ids
+                or any(type(v) is not int for v in (first, stop, length))
+                or not 0 <= first < stop <= length or item.get("frames") != stop - first
+                or not isinstance(review, dict) or review.get("status", "") not in ("", "keep")
+                or manifest.get("reviews_snapshot", {}).get(str(source_id), {}) != review):
+            raise ValueError("invalid trim provenance: episode mapping/range/review mismatch")
+        source_ids.add(source_id)
+        frames += stop - first
+        reviews[str(index)] = {k: copy.deepcopy(v) for k, v in review.items() if k != "trim"}
+    if frames != info.get("total_frames") or frames != manifest.get("total_frames"):
+        raise ValueError("invalid trim provenance: frame count mismatch")
+    return {"dataset_root": str(root), "episodes": reviews,
+            "derived_from": {"path": str(path), "source_dataset": manifest.get("source_dataset"),
+                             "trim_already_applied": True}}
+
+
 def trim_from_seconds(start: float, end: float, length: int, fps: float) -> dict | None:
     """Keep frame timestamps in [start, end); full episode is represented by None."""
     if isinstance(start, bool) or isinstance(end, bool):

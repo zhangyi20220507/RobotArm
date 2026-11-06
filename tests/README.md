@@ -26,10 +26,11 @@ python -m unittest discover -s tests -p 'test_training_report.py' -v
 | `test_online_policy*`、`test_pi0_async`、`test_approve*`、`test_validate_runtime` | 预测边界、端点修正、异步过期/断供、审批 |
 | `test_act_latent_report`、`test_pi0_*report`、`test_training_report`、`test_report_entrypoints` | padding、单位、配对、续训合并、报告兼容入口 |
 | `test_pi0_lora`、`test_pi0_cloud_bundle`、`test_pi05*` | LoRA计划/重载约束、无凭据打包、基础模型适配 |
-| `test_quality_filter`、`test_train_monitor`、`test_trajectory_studio` | 划分与审查、监控不修改run、Open-loop适配 |
+| `test_quality_filter`、`test_train_monitor`、`test_trajectory_studio` | 划分与审查、裁剪导出审核继承/新编号映射/未完成导出拒绝、新审核优先；监控不修改run、Open-loop适配 |
 | `test_dataset_trim` | 独立时间范围、标记保存/撤销、路径保护、失败状态；真实导出进度计数、视频保存失败不计完成、新任务归零；微型双相机LeRobot真实导出、视频/动作对齐及末端padding |
 | `test_dataset_browser_i18n` | 中英文标签与提示、语言记忆、存储不可用回退；导出进度条与语言切换；切换不丢失未保存备注/裁剪和播放状态 |
 | `test_readme_workflows` | README全量CLI覆盖、导航链接、shell语法与常用参数静态校验；不会执行示例命令 |
+| `test_lift_cup_simulation` | ManiSkill CPU抓杯环境：复位种子、离桌但无接触不能成功、物理数值、稳定保持计时；缺少仿真依赖时跳过 |
 
 测试使用临时目录保存夹具。不要把真实checkpoint或视频复制到tests。
 断言需要升级时说明行为变化，不通过删除失败断言来“让测试通过”。

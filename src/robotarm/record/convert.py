@@ -578,6 +578,23 @@ def main() -> int:
             default_output(session_path).resolve().name + suffix
         )
     )
+    discovered = [
+        discover_episodes(path, args.include_incomplete) for path in session_paths
+    ]
+    session = discovered[0][0]
+    episodes = [episode for _, items, _ in discovered for episode in items]
+    skipped = [
+        f"{path.name}/{reason}"
+        for path, (_, _, reasons) in zip(session_paths, discovered)
+        for reason in reasons
+    ]
+    # Resolve the selected roles before append compatibility checks.  Older
+    # code referenced camera_roles here before it was initialized, making the
+    # otherwise supported --append path fail immediately.
+    recorded_roles = list(episodes[0].metadata.get("camera_roles", []))
+    if not recorded_roles:
+        raise RuntimeError("selected episodes contain no camera roles")
+    camera_roles = select_camera_roles(recorded_roles, args.camera_role)
     existing_provenance: dict[str, Any] = {}
     existing_info: dict[str, Any] = {}
     existing_session_metadata: dict[str, Any] = {}
@@ -639,35 +656,16 @@ def main() -> int:
         repo_id = args.repo_id or default_repo_id(session_path) + suffix
     if args.image_writer_threads < 1 or args.encoder_threads < 1:
         raise RuntimeError("writer/encoder thread counts must be positive")
-    if (
-        output == session_path
-        or session_path in output.parents
-        or output in session_path.parents
-    ):
-        raise RuntimeError(
-            "output must be separate from the source session and its parents"
-        )
-
-    discovered = [
-        discover_episodes(path, args.include_incomplete) for path in session_paths
-    ]
-    session = discovered[0][0]
-    episodes = [episode for _, items, _ in discovered for episode in items]
-    skipped = [
-        f"{path.name}/{reason}"
-        for path, (_, _, reasons) in zip(session_paths, discovered)
-        for reason in reasons
-    ]
+    for path in session_paths:
+        if output == path or path in output.parents or output in path.parents:
+            raise RuntimeError(
+                "output must be separate from every source session and its parents"
+            )
     # Roles the session actually recorded (validated in full below) versus the
     # roles this conversion writes.  Keeping them apart lets ``--camera-role``
     # drop a camera without relaxing source validation: validate_episode still
     # checks every recorded camera's video, matching the raw arrays' per-camera
     # columns, which are sized by the recorded count.
-    recorded_roles = list(episodes[0].metadata.get("camera_roles", []))
-    if not recorded_roles:
-        raise RuntimeError("selected episodes contain no camera roles")
-    camera_roles = select_camera_roles(recorded_roles, args.camera_role)
-
     compatibility_keys = (
         "record_fps", "state_names", "state_units", "action_semantics"
     )

@@ -1,0 +1,9 @@
+# Confirmed 2026-10-22: this adapter connects to the follower arm (then can0).
+# The name follows the USB adapter, not the arm or the USB socket.
+[Match]
+Driver=gs_usb
+Property=ID_SERIAL_SHORT=004300414148570D20343133
+
+[Link]
+NamePolicy=
+Name=can_follower1

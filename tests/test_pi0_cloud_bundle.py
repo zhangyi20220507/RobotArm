@@ -24,6 +24,10 @@ class CloudBundleTests(unittest.TestCase):
                          "tests/test_pi0_lora.py", "docs/best_practice_assets/example.svg",
                          "src/robotarm/modeling/pi0_lora.py"):
                 write(name)
+            for name in ("run_smoke.sh", "run_train.sh", "check_smoke.sh"):
+                write("scripts/cloud/" + name,
+                      "data/lerobot/piper_pick_cup_dual_camera_lf_180eps\npi0_lora_lf180\n"
+                      + ("--batch-size 1\n" if name != "check_smoke.sh" else ""))
             write("src/robotarm/__pycache__/cached.pyc")
             write(".aws/credentials", "secret")
             write("vendor/native_binary", "not cloud training")
@@ -72,3 +76,37 @@ class CloudBundleTests(unittest.TestCase):
                 self.assertFalse(any(name.endswith("/token") or "__pycache__" in name for name in compressed.getnames()))
             with self.assertRaisesRegex(ValueError, "already exists"):
                 build(workspace, bundle, tokenizer)
+
+            trimmed_rel = "data/lerobot/piper_pick_cup_20261019_direct_122eps_trimmed_20261022"
+            write(trimmed_rel + "/meta/info.json",
+                  json.dumps({"total_episodes": 2, "total_frames": 8, "fps": 20}))
+            write(trimmed_rel + "/meta/trim_provenance.json", json.dumps({
+                "source_dataset": "/old/computer/piper_pick_cup_20261019_direct_122eps",
+                "reviews_snapshot": {"0": {}, "1": {}, "2": {"status": "reject"}},
+            }))
+            write(trimmed_rel + "/data/chunk.parquet")
+            selected_bundle = root / "export/cup122"
+            with patch("builtins.print"):
+                build(workspace, selected_bundle, tokenizer, trimmed_rel, "pi0_lora_cup122", 4)
+            selected_manifest = json.loads((selected_bundle / "CLOUD_MANIFEST.json").read_text())
+            self.assertEqual(selected_manifest["dataset"]["path"], trimmed_rel)
+            self.assertEqual(selected_manifest["dataset"]["origin"]["source_episodes"], 3)
+            self.assertEqual(selected_manifest["run_prefix"], "pi0_lora_cup122")
+            self.assertEqual(selected_manifest["batch_size"], 4)
+            selected_readme = (selected_bundle / "CLOUD_README.md").read_text()
+            self.assertIn("2 条", selected_readme)
+            self.assertIn("原始 3 条", selected_readme)
+            self.assertIn("cup122.tar.gz.sha256", selected_readme)
+            self.assertIn("batch size 均为 4", selected_readme)
+            for name in ("run_smoke.sh", "run_train.sh", "check_smoke.sh"):
+                content = (selected_bundle / "scripts/cloud" / name).read_text()
+                self.assertIn(trimmed_rel, content)
+                self.assertIn("pi0_lora_cup122", content)
+                self.assertNotIn("lf_180eps", content)
+                if name != "check_smoke.sh":
+                    self.assertIn("--batch-size 4", content)
+                    self.assertNotIn("--batch-size 1", content)
+            with self.assertRaisesRegex(ValueError, "inside workspace"):
+                build(workspace, root / "export/unsafe", tokenizer, "../outside")
+            with self.assertRaisesRegex(ValueError, "positive integer"):
+                build(workspace, root / "export/invalid", tokenizer, batch_size=0)

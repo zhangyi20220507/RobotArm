@@ -102,11 +102,16 @@ def joint_limit_diagnostics(
 def add_input_options(parser, default_engagement="direct"):
     parser.add_argument("--engagement-mode", choices=("direct", "grip"), default=default_engagement,
                         help="grip: hold Grip to follow, release to hold position; "
-                             "direct: follow after Y/B enable without holding Grip")
+                             "direct: follow after Grip/Trigger+Y/B enable without holding Grip")
     parser.add_argument("--max-hand-jump-m", type=float, default=0.05,
-                        help="pause on a controller position jump between received poses (meters)")
+                        help="detect a controller position jump between received poses (meters)")
     parser.add_argument("--max-hand-jump-deg", type=float, default=30.0,
-                        help="pause on a controller rotation jump between received poses (degrees)")
+                        help="detect a controller rotation jump between received poses (degrees)")
+    parser.add_argument(
+        "--hand-jump-action", choices=("rebase", "pause"), default="rebase",
+        help="rebase: hold and automatically capture a new reference; "
+             "pause: require the enable chord to resume",
+    )
 
 
 def validate_input_options(args):
@@ -115,6 +120,23 @@ def validate_input_options(args):
         raise ValueError("max-hand-jump-m must be in (0, 0.2]")
     if not math.isfinite(args.max_hand_jump_deg) or not 0 < args.max_hand_jump_deg <= 90:
         raise ValueError("max-hand-jump-deg must be in (0, 90]")
+    if args.hand_jump_action not in ("rebase", "pause"):
+        raise ValueError("hand-jump-action must be rebase or pause")
+
+
+def command_button_chord(
+    grip: float,
+    trigger: float,
+    button: bool,
+    threshold: float,
+) -> bool:
+    """Accept the PICO side Grip or index Trigger as a command modifier.
+
+    XRoboToolkit/controller profiles do not consistently name the physical
+    button operators call the trigger.  Accepting either analog channel keeps
+    the safety chord explicit while working with both mappings.
+    """
+    return bool(button) and max(float(grip), float(trigger)) >= threshold
 
 
 class PoseJumpGuard:

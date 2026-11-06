@@ -3,11 +3,11 @@
 迁移自 XRoboToolkit-Teleop-Sample-Python/scripts/hardware/teleop_piper_xr.py，
 行为与参数保持兼容；数据记录复用 robotarm.record（与手柄链路同一格式）。
 
-默认 dry-run；传入 ``--live`` 后，长按 B 使能，之后才允许下发遥操命令。
+默认 dry-run；传入 ``--live`` 后，长按 Grip（或 Trigger）+B 使能，之后才允许下发遥操命令。
 需要统一 RobotArm 环境中的 placo / zmq / xrobotoolkit_sdk。
 
 按键：握住 RIGHT GRIP 接合离合，松开脱离；RIGHT TRIGGER 控制夹爪；
-长按 A 回零（保持使能）；长按 B 使能；RIGHT STICK 急停。
+长按 Grip/Trigger+A 回零（保持使能）；长按 Grip/Trigger+B 使能；RIGHT STICK 急停。
 """
 
 from __future__ import annotations
@@ -64,6 +64,11 @@ def make_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--rate", type=float, default=cfg["rate"], help="control frequency in Hz")
     parser.add_argument("--scale", type=float, default=cfg["scale"], help="XR translation scale")
+    parser.add_argument(
+        "--verbose-status",
+        action="store_true",
+        help="print high-rate IK, target, joint, button and arm-status diagnostics",
+    )
     parser.add_argument("--speed-percent", type=int, default=cfg["speed-percent"], help="Piper speed percentage")
     parser.add_argument(
         "--joint-control-mode",
@@ -86,6 +91,12 @@ def make_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--grip-threshold", type=float, default=cfg["grip-threshold"])
     parser.add_argument("--grip-release-threshold", type=float, default=cfg["grip-release-threshold"])
+    parser.add_argument(
+        "--command-modifier-threshold", "--command-trigger-threshold",
+        dest="command_modifier_threshold", type=float,
+        default=cfg.get("command-modifier-threshold", 0.8),
+        help="minimum Grip or Trigger value required with A/B commands",
+    )
     parser.add_argument(
         "--gripper-max-mm", type=float, default=cfg["gripper-max-mm"],
         help="gripper width at fully pressed trigger in mm",
@@ -176,6 +187,8 @@ def validate_args(args, np) -> None:
         raise ValueError("--posture-anchor must be engage or seed")
     if not 0 <= args.grip_release_threshold < args.grip_threshold <= 1:
         raise ValueError("grip thresholds must satisfy 0 <= release < engage <= 1")
+    if not math.isfinite(args.command_modifier_threshold) or not 0 < args.command_modifier_threshold <= 1:
+        raise ValueError("--command-modifier-threshold must be in (0, 1]")
     if args.max_step_rotation <= 0:
         raise ValueError("--max-step-rotation must be positive")
     if args.rate <= 0 or args.scale <= 0:
@@ -215,7 +228,9 @@ def validate_args(args, np) -> None:
     if args.wrist_camera_serial == args.global_camera_serial:
         raise ValueError("global and wrist camera serial numbers must differ")
     if args.record:
-        raise ValueError("PICO recording is disabled: hold B is reserved for enabling the arm")
+        raise ValueError(
+            "PICO recording is disabled: hold Grip/Trigger+B to enable the arm"
+        )
     if args.model != "piper":
         raise ValueError("local IK currently supports --model piper only")
 
@@ -266,7 +281,13 @@ def _main_single(argv: list[str] | None = None) -> int:
     import numpy as np
 
     from ...core.robot.piper import _load_sdk
-    from .control import PoseJumpGuard, Clutch, joint_limit_diagnostics, limit_joint_step
+    from .control import (
+        PoseJumpGuard,
+        Clutch,
+        joint_limit_diagnostics,
+        limit_joint_step,
+        command_button_chord,
+    )
     from .arm_ops import (
         arm_status_text,
         hold_arm_on_exit,
@@ -459,10 +480,16 @@ def _main_single(argv: list[str] | None = None) -> int:
                     "WARNING: current flange is outside the configured workspace; "
                     "recovery-only bounds will be used until the next clutch."
                 )
-            print("LIVE ready: hold B for 1 second to enable; direct mode needs no Grip.")
-            print("Buttons: hold B=enable, hold A=home (stay enabled), RIGHT STICK=E-stop")
+            print("LIVE ready: hold Grip/Trigger+B for 1 second to enable; direct mode needs no Grip.")
+            print(
+                "Buttons: hold Grip/Trigger+B=enable, hold Grip/Trigger+A=home (stay enabled), "
+                "RIGHT STICK=E-stop"
+            )
         else:
-            print("DRY-RUN: B does not enable hardware; restart with --live for arm control.")
+            print(
+                "DRY-RUN: Grip/Trigger+B does not enable hardware; "
+                "restart with --live for arm control."
+            )
 
         arm_ready = False
 
@@ -476,7 +503,10 @@ def _main_single(argv: list[str] | None = None) -> int:
         last_print = 0.0
         last_wait_print = 0.0
         jump_guard = PoseJumpGuard(args.max_hand_jump_m, args.max_hand_jump_deg)
-        print(f"Engagement mode: {args.engagement_mode}; hold B to enable/resume; no Grip required in direct mode.")
+        print(
+            f"Engagement mode: {args.engagement_mode}; hold Grip/Trigger+B to enable/resume; "
+            "no Grip required in direct mode."
+        )
         clutch = Clutch(args.grip_threshold, args.grip_release_threshold, mode=args.engagement_mode, blocked=args.live)
         previous_a = False
         previous_b = False
@@ -548,19 +578,29 @@ def _main_single(argv: list[str] | None = None) -> int:
             pose = np.asarray(state["right_controller_pose"], dtype=float)
             jump = jump_guard.update(pose) if fresh else None
             if jump:
-                print(f"INPUT PAUSED: {jump}; hold B to resume.")
+                if args.hand_jump_action == "pause":
+                    print(f"INPUT PAUSED: {jump}; hold Grip/Trigger+B to resume.")
+                else:
+                    print(f"INPUT REBASED: {jump}; discontinuity discarded.")
                 if xr_reference is not None:
                     hold_current_position()
                 xr_reference = None
                 flange_reference = None
-                clutch.pause()
+                if args.hand_jump_action == "pause":
+                    clutch.pause()
+                else:
+                    clutch.resume()
                 time.sleep(period)
                 continue
             active = clutch.update(grip, fresh and valid_xr_pose(pose))
             engaged = clutch.engaged
             trigger = float(np.clip(state["right_trigger"], 0.0, 1.0))
-            a_pressed = fresh and bool(state["A_button"])
-            b_pressed = fresh and bool(state["B_button"])
+            a_pressed = fresh and command_button_chord(
+                grip, trigger, state["A_button"], args.command_modifier_threshold
+            )
+            b_pressed = fresh and command_button_chord(
+                grip, trigger, state["B_button"], args.command_modifier_threshold
+            )
 
             if a_pressed and not previous_a:
                 a_pressed_at = loop_start
@@ -572,12 +612,10 @@ def _main_single(argv: list[str] | None = None) -> int:
                 and loop_start - a_pressed_at >= args.button_hold_seconds
             ):
                 a_long_fired = True
-                if grip >= args.grip_release_threshold:
-                    print("Release RIGHT GRIP, then hold A again to home.")
-                elif args.live and arm_ready and gripper is not None:
+                if args.live and arm_ready and gripper is not None:
                     if recorder is not None and recorder.active:
                         recorder.mark_incomplete()
-                    print("A held: homing all six joints and closing the gripper...")
+                    print("Grip/Trigger+A held: homing all six joints and closing the gripper...")
                     xr_reference = None
                     flange_reference = None
                     clutch.blocked = True
@@ -597,7 +635,7 @@ def _main_single(argv: list[str] | None = None) -> int:
                     previous_b = b_pressed
                     continue
                 elif args.live:
-                    print("Arm is not enabled by this session; hold B first.")
+                    print("Arm is not enabled by this session; hold Grip/Trigger+B first.")
             if not a_pressed:
                 a_pressed_at = None
                 a_long_fired = False
@@ -613,9 +651,9 @@ def _main_single(argv: list[str] | None = None) -> int:
             ):
                 b_long_fired = True
                 if not args.live:
-                    print("DRY-RUN: enable skipped. Restart with --live, then hold B.")
-                elif (args.engagement_mode == "grip" and engaged) or a_pressed:
-                    print("Release RIGHT GRIP and A, then hold B again to enable.")
+                    print("DRY-RUN: enable skipped. Restart with --live, then hold Grip/Trigger+B.")
+                elif a_pressed:
+                    print("Release A, then hold the command modifier+B again to enable.")
                 else:
                     # Mark the attempt before touching hardware so partial
                     # enable failures also execute emergency-stop cleanup.
@@ -624,7 +662,7 @@ def _main_single(argv: list[str] | None = None) -> int:
                     xr_reference = None
                     flange_reference = None
                     clutch.blocked = True
-                    print("B held: enabling all six joints at the current position...")
+                    print("Grip/Trigger+B held: preparing arm control at the current position...")
                     current_joints = wait_for_joint_angles(robot)
                     violations = joint_limit_violations(current_joints, args.joint_limit_tolerance)
                     if violations:
@@ -644,6 +682,9 @@ def _main_single(argv: list[str] | None = None) -> int:
                     last_joint_command = joint_feedback.copy()
                     last_cartesian_target = ik.flange_pose(joint_feedback)
                     arm_ready = True
+                    # Grip/Trigger+B suppresses motion while held.  Re-arm now
+                    # so releasing B captures the reference without requiring
+                    # an extra Grip release/re-press cycle.
                     clutch.resume()
                     print("Piper enabled. Joint motor enables:", enable_states)
                     print("Control ready; direct mode follows without Grip. Status:", arm_status_text(robot))
@@ -653,12 +694,15 @@ def _main_single(argv: list[str] | None = None) -> int:
                 b_pressed_at = None
                 b_long_fired = False
 
+            control_active = active and not (a_pressed or b_pressed)
+
             if (
                 args.live
                 and arm_ready
                 and fresh
-                and active
+                and control_active
                 and gripper is not None
+                and not (a_pressed or b_pressed)
                 and loop_start >= next_gripper_command
             ):
                 max_width_step = args.gripper_speed_mm_s / 1000.0 * 0.05
@@ -686,7 +730,7 @@ def _main_single(argv: list[str] | None = None) -> int:
                     print("Gripper force hold released by Trigger")
                 next_gripper_command = loop_start + 0.05
 
-            if active and (not args.live or arm_ready):
+            if control_active and (not args.live or arm_ready):
                 if xr_reference is None:
                     current_joints = wait_for_joint_angles(robot)
                     feedback = ik.flange_pose(current_joints)
@@ -827,7 +871,7 @@ def _main_single(argv: list[str] | None = None) -> int:
                             and loop_start - last_limit_notice >= 1.0):
                         print("JOINT_LIMIT: 当前姿态或关节限速限制了跟随，请减慢动作或松手调整姿态")
                         last_limit_notice = loop_start
-                    if loop_start - last_print >= 0.25:
+                    if args.verbose_status and loop_start - last_print >= 0.25:
                         actual_ee = ik.flange_pose(current_joints)
                         status = [
                             f"loop_hz={1.0/max(tick_elapsed,1e-6):.1f}",
@@ -877,7 +921,7 @@ def _main_single(argv: list[str] | None = None) -> int:
                 xr_reference = None
                 flange_reference = None
                 ik.set_posture_anchor(None)
-                if loop_start - last_wait_print >= 1.0:
+                if args.verbose_status and loop_start - last_wait_print >= 1.0:
                     print(
                         "waiting:",
                         f"grip={grip:.2f}",

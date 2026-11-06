@@ -89,7 +89,7 @@ def build_plan(args):
         if not (base / name).is_file():
             raise ValueError(f"Missing base processor: {name}")
     reviews = args.quality_reviews or default_reviews_path(root)
-    if args.quality_reviews or reviews.exists():
+    if args.quality_reviews or reviews.exists() or (root / "meta/trim_provenance.json").exists():
         episodes, counts = select_training_episodes(root, reviews, args.seed)
         quality = dict(counts)
     else:

@@ -1,0 +1,9 @@
+# Confirmed 2026-10-22: this adapter connects to the leader arm (then can1).
+# The name follows the USB adapter, not the arm or the USB socket.
+[Match]
+Driver=gs_usb
+Property=ID_SERIAL_SHORT=003200324648570A20303731
+
+[Link]
+NamePolicy=
+Name=can_leader1

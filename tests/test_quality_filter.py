@@ -4,8 +4,11 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from robotarm.modeling.quality_filter import derive_reviews, select_training_episodes
+from robotarm.modeling.quality_filter import default_reviews_path, derive_reviews, select_training_episodes
+from robotarm.modeling.dataset_trim import exported_reviews
+from robotarm.modeling.dataset_browser import DatasetStore
 
 
 class QualityFilterTest(unittest.TestCase):
@@ -64,6 +67,89 @@ class QualityFilterTest(unittest.TestCase):
             "status": "reject", "trim": {"start_frame": 100, "end_frame": 280}}})
         self.addCleanup(temporary.cleanup)
         self.assertEqual(select_training_episodes(root, reviews)[0], [1])
+
+
+class ExportedReviewsTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name) / "trimmed"
+        (self.root / "meta").mkdir(parents=True)
+        self.info = {"fps": 20, "total_episodes": 2, "total_frames": 10}
+        (self.root / "meta/info.json").write_text(json.dumps(self.info))
+        self.manifest = {
+            "format": "robotarm_dataset_trim_v1", "fps": 20,
+            "range_semantics": "[start_frame, end_frame)", "total_frames": 10,
+            "source_dataset": "/unavailable/source", "reviews_snapshot": {}, "episodes": [],
+        }
+        for index, source_id in enumerate((2, 8)):
+            review = {"status": "keep" if index == 0 else "", "note": "保留备注",
+                      "trim": {"start_frame": 3, "end_frame": 8, "source_length": 12, "fps": 20}}
+            self.manifest["reviews_snapshot"][str(source_id)] = review
+            self.manifest["episodes"].append({"source_episode": source_id, "output_episode": index,
+                "start_frame": 3, "end_frame": 8, "source_length": 12, "frames": 5, "review": review})
+        self.path = self.root / "meta/trim_provenance.json"
+        self.write_manifest()
+        self.enterContext(patch("robotarm.modeling.quality_filter.ARTIFACTS_ROOT", Path(temporary.name) / "artifacts"))
+        self.reviews = default_reviews_path(self.root)
+
+    def write_manifest(self):
+        self.path.write_text(json.dumps(self.manifest))
+
+    def test_existing_export_is_remapped_without_writes_or_source_access(self):
+        document = exported_reviews(self.root)
+        self.assertEqual(set(document["episodes"]), {"0", "1"})
+        self.assertEqual(document["episodes"]["0"], {"status": "keep", "note": "保留备注"})
+        selected, counts = select_training_episodes(self.root, self.reviews, 1000)
+        self.assertEqual(sorted(selected), [0, 1])
+        self.assertEqual(counts["keep"], 1)
+        self.assertEqual(counts["unreviewed"], 1)
+        self.assertEqual(selected, select_training_episodes(self.root, self.reviews, 1000)[0])
+        self.assertFalse(self.reviews.exists())
+
+    def test_browser_inherits_then_saved_review_takes_precedence(self):
+        rows = [{"episode_index": i, "length": 5} for i in range(2)]
+        with patch.object(DatasetStore, "_load_episode_rows", return_value=rows):
+            store = DatasetStore(self.root, self.reviews)
+        self.assertEqual(store.reviews()["0"]["status"], "keep")
+        self.assertNotIn("trim", store.reviews()["0"])
+        store.save_review(0, "reject", "new review")
+        self.assertEqual(select_training_episodes(self.root, self.reviews)[0], [1])
+        self.assertEqual(store.reviews()["1"]["note"], "保留备注")
+        store.save_review(1, "keep", "", {"start_s": .05, "end_s": .2})
+        with self.assertRaisesRegex(ValueError, "unapplied trim"):
+            select_training_episodes(self.root, self.reviews)
+
+    def test_missing_custom_review_or_non_export_still_errors(self):
+        with self.assertRaisesRegex(ValueError, "not found"):
+            select_training_episodes(self.root, self.root / "typo.json")
+        self.path.unlink()
+        with self.assertRaisesRegex(ValueError, "not found"):
+            select_training_episodes(self.root, self.reviews)
+
+    def test_incomplete_export_is_rejected_even_with_manual_reviews(self):
+        (self.root / "TRIM_INCOMPLETE.txt").write_text("failed")
+        self.reviews.parent.mkdir(parents=True)
+        self.reviews.write_text(json.dumps({"episodes": {}}))
+        with self.assertRaisesRegex(ValueError, "尚未完成"):
+            select_training_episodes(self.root, self.reviews)
+
+    def test_invalid_manifest_is_not_silently_accepted(self):
+        mutations = [
+            lambda m: m.update(total_frames=11),
+            lambda m: m.update(fps=30),
+            lambda m: m["episodes"][1].update(output_episode=0),
+            lambda m: m["episodes"][1].update(source_episode=2),
+            lambda m: m["episodes"][0].update(frames=6),
+            lambda m: m["episodes"][0]["review"].update(status="reject"),
+        ]
+        original = json.dumps(self.manifest)
+        for mutation in mutations:
+            self.manifest = json.loads(original)
+            mutation(self.manifest)
+            self.write_manifest()
+            with self.subTest(manifest=self.manifest), self.assertRaisesRegex(ValueError, "invalid trim provenance"):
+                select_training_episodes(self.root, self.reviews)
 
 
 class ShuffledSplitTest(unittest.TestCase):

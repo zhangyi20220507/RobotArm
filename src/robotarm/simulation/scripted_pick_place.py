@@ -147,9 +147,12 @@ def step_to(
     label="",
     attach_cube=False,
     max_xyz_step=0.1,
+    stagnation_steps=None,
 ):
     target_xyz = np.asarray(target_xyz, dtype=np.float32)
     last_info = None
+    best_distance = float("inf")
+    stagnant_steps = 0
     for i in range(max_steps):
         tcp = current_tcp(env)
         delta = target_xyz - tcp
@@ -162,6 +165,15 @@ def step_to(
             render_cb(label)
         if np.linalg.norm(delta) < tol:
             break
+        if stagnation_steps is not None:
+            distance = float(np.linalg.norm(target_xyz - current_tcp(env)))
+            if distance < best_distance - 0.0005:
+                best_distance = distance
+                stagnant_steps = 0
+            else:
+                stagnant_steps += 1
+            if stagnant_steps >= stagnation_steps:
+                break
         if bool(np.asarray(terminated).any() or np.asarray(truncated).any()):
             break
     return last_info

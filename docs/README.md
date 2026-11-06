@@ -18,7 +18,7 @@ Piper 主从臂／手柄采集、LeRobot 训练、离线分析与在线执行工
 | 训练、续训、实时loss | [训练](#6-act训练续训与loss页面) |
 | Open-loop、A/B/C/D、HTML报告 | [离线分析](#7-分析模型) |
 | π0微调、迁回、延迟测试 | [π0工作流](#8-π0与π05离线训练测试) |
-| 真机执行、审批、按键 | [在线运行](#9-在线运行先shadow再执行) |
+| 真机执行、审批、按键 | [在线运行](#9-在线运行act直接执行与可选shadow) |
 | 仿真、PPO、模型查看器 | [仿真](#10-仿真与模型可视化) |
 | 查全部功能名／脚本／常见问题 | [命令清单](#11-全部cli功能清单)、[辅助脚本](#12-辅助脚本)、[排查](#13-常见问题) |
 
@@ -95,11 +95,14 @@ robotarm simulation viewer -- --help
 在线入口常用连字符，如 `--n-action-steps`。
 
 2026-10-19核对：ACT 的 YAML 覆盖为 `n_action_steps: 30`、关节 step/lead=2.5°/6°、
-原始关节差门槛12°、原始夹爪差门槛30mm；π0 的原始关节差门槛15°。这些是配置快照，**不是新推荐值**。
-本次未修改这些值。要消费20步请显式加 `--n-action-steps 20`；不要将当前默认值当成历史实验参数。
+ACT原始关节差软告警/严重遥测阈值为12°/15°、原始夹爪差告警为30mm；π0 的原始关节差硬门槛为15°。
+这些是配置快照，**不是新推荐值**。
+本次未修改这些值。2026-10-28当前ACT真机抖动测试采用显式
+`--n-action-steps 1 --temporal-ensemble-coeff 0.01`；这两个参数必须配套，不能只写其中一个。
+不要将当前YAML默认值当成已验证的真机运行参数。
 
 `approval-required: false` 当前跳过审批文件检查，不代表验证通过；仍需执行开关和运行时门控。
-开启审批请按[部署流程](#9-在线运行先shadow再执行)操作，不为绕过失败日志而放宽门槛。
+开启审批请按[部署流程](#9-在线运行act直接执行与可选shadow)操作，不为绕过失败日志而放宽门槛。
 
 查看当前在线配置（只读，不连接硬件）：
 
@@ -166,6 +169,48 @@ sudo ip link set can_follower1 up type can bitrate 1000000
 
 `read-status`只读反馈，Ctrl+C退出；接口已UP但需更改配置时，先停控制程序再按现场情况处理。
 
+#### 固定系统 CAN 名称（重启、重新插拔后保持）
+
+2026-10-22 用户确认的适配器对应关系如下；内核分配的`can0/can1`编号可能随插拔变化，
+规则按唯一序列号匹配，不按编号或USB插口匹配。更换适配器后需重新核对序列号，不能直接复用。
+
+| 当时接口 | USB-CAN 序列号 | 固定名称 |
+|---|---|---|
+| `can0`（从臂） | `004300414148570D20343133` | `can_follower1` |
+| `can1`（主臂） | `003200324648570A20303731` | `can_leader1` |
+
+先核对当前硬件标识：
+
+```bash
+udevadm info --query=property --path=/sys/class/net/can0
+udevadm info --query=property --path=/sys/class/net/can1
+```
+
+从项目根目录安装规则（需要管理员权限；已有同名自定义规则时先检查内容，勿直接覆盖）：
+
+```bash
+sudo install -m 0644 scripts/system/10-robotarm-can-follower1.link /etc/systemd/network/10-robotarm-can-follower1.link
+sudo install -m 0644 scripts/system/10-robotarm-can-leader1.link /etc/systemd/network/10-robotarm-can-leader1.link
+sudo udevadm control --reload
+```
+
+安装规则不会立即修改当前接口。**退出所有机械臂控制/采集程序，确认机械臂安全静止并有可靠支撑后**，
+若接口与上表仍一致，可立即改名并按1Mbps重新启用；下面的`down`会中断CAN通信，不是机械臂安全停止命令：
+
+```bash
+sudo ip link set can0 down
+sudo ip link set can1 down
+sudo ip link set can0 name can_follower1
+sudo ip link set can1 name can_leader1
+sudo ip link set can_follower1 up type can bitrate 1000000
+sudo ip link set can_leader1 up type can bitrate 1000000
+ip -details -brief link show type can
+```
+
+也可在机械臂安全停机后重新插拔适配器或重启PC，让规则自动命名，再运行上面的两条`up`命令。
+`.link`只负责固定名称，不负责开机自动启用CAN，也不改变机械臂主从角色或使能状态。
+接口已是目标名称时不重复执行`can0/can1`改名命令；不要交换这两块适配器所连接的机械臂。
+
 ### 3.3 使能、失能、复位、独立回零
 
 先退出其他控制程序，确认对象及路径。**失能/复位/角色切换前托稳机械臂，可能失去保持力。**
@@ -202,7 +247,7 @@ robotarm data-acquisition restore-piper-role -- \
 
 ```bash
 robotarm data-acquisition collect-leader-follower -- \
-  --execute --allow-enabled-start \
+  --execute --allow-enabled-start --parallel-home \
   --leader-channel can_leader1 --follower-channel can_follower1 \
   --global-camera-serial 347522071736 --wrist-camera-serial 260322272554 \
   --setup-id leader_follower_v1 \
@@ -229,7 +274,8 @@ robotarm data-acquisition collect-leader-follower -- \
 
 `s`查看状态、`d`丢弃录制。默认跟随50Hz、录制20FPS，`--control-rate`与`--record-fps`不是一个参数。
 `--setup-id`标记装定批次；`--task`必须写实际示教任务，例如仅抓取与抓取后放入孔中不要误用同一个描述。
-新会话默认写入`data/raw/piper_raw/<时间戳>/`。
+新会话默认写入`data/raw/piper_raw/<时间戳>/`。相机预览、对齐、跟随、回零及未录制退出
+都不会创建时间戳目录；第一次按`r`开始 episode 时才创建`session.json`和`episodes/`。
 
 #### 主从对齐、参数与动作记录
 
@@ -243,13 +289,22 @@ robotarm data-acquisition collect-leader-follower -- \
 | f | 开始/暂停跟随；对齐中取消对齐 |
 | s | 打印两臂模式、角度、目标、误差和反馈年龄 |
 | r / d | 开始/保存 episode / 丢弃 episode |
-| h | 非录制时先主臂后从臂回零，闭合两侧夹爪 |
+| h | 非录制时双臂回零并闭合夹爪；回零前若在 f 跟随，完成后自动恢复 |
 | q | 保持位置退出 |
 | x | 从臂急停，主臂尝试使能保持后退出 |
 
 一条 episode：l → a → 等待对齐完成 → f → r → 完成任务 → r。
-启动或保存后可按 h，完成后保持使能，不自动录下一条。主臂用固件回零指令，
-速度由控制器决定；从臂用 10% MOVE_J。回零中退出急停当前臂。
+启动或保存后可按 h，完成后保持使能且不自动录下一条；按 h 前若在 f 跟随模式，程序会用
+回零后的实测位置重新建立 MOVE_JS 保持目标并自动恢复跟随；原本暂停则继续暂停。主臂用固件回零指令，
+速度由控制器决定；从臂用 10% MOVE_J。部分固件在主臂回零期间不发布关节帧，程序会在
+短时等待后退出固件回零态、恢复普通反馈，并用角色切换后的新六关节反馈确认零位；若固件
+回零尚未完成，则自动用有反馈验证的 10% MOVE_J 补完，不会仅凭等待时间或
+`motion_status` 判定成功。主臂夹爪若 1.5 秒内完全没有闭合进展，会保持实测开度、打印警告
+并继续恢复跟随，不再使已经回零的双臂急停；重新进入跟随后操作一次主臂夹爪即可同步。
+默认顺序模式回零中退出只急停当前臂。
+确认两条回零轨迹互不相交且周围无人员、杯子和障碍物后，可在启动命令增加
+`--parallel-home`：按 h 后主臂固件回零和从臂 10% MOVE_J 同时开始，各自独立验证到位；
+任意一臂失败或中断都会电子急停两臂。此选项不提供双臂碰撞检测。
 
 | 参数 | 含义 |
 |---|---|
@@ -261,6 +316,7 @@ robotarm data-acquisition collect-leader-follower -- \
 | `--stale-timeout` | 从臂反馈超时，默认 0.2 秒 |
 | `--leader-init-timeout` | 等待主臂完整初值，默认 30 秒 |
 | `--home-timeout` / `--home-gripper-speed-mm-s` | 回零各阶段超时 / 夹爪闭合速度，默认 60 秒 / 10 mm/s |
+| `--parallel-home` | 按 h 时双臂并行回零；默认关闭，任一侧异常会急停两臂 |
 
 主臂已在零力模式时按提示轻移三个关节对并操作夹爪。主臂静止可保持最后输入，
 从臂始终检查反馈新鲜度。a 对齐使用 10% MOVE_J、目标最大 5°/s；跟随前误差须在 2° 内
@@ -359,16 +415,16 @@ robotarm data-acquisition xr-bridge -- --endpoint tcp://127.0.0.1:60062 --rate 1
 # 终端2：单臂只读；核对坐标/工作空间后，同参数加 --live 才允许遥操
 robotarm data-acquisition piper-xr -- \
   --arms 1 --xr-bridge --xr-bridge-endpoint tcp://127.0.0.1:60062 \
-  --channel can_follower1 --firmware v189 --scale 0.4
+  --channel can_follower1 --firmware v189 --scale 0.8
 
 # 双臂只读；确认后加 --live
 robotarm data-acquisition piper-xr -- \
   --arms 2 --xr-bridge --left-channel can_leader1 --right-channel can_follower1 \
-  --firmware v189 --scale 0.4
+  --firmware v189 --scale 0.8
 ```
 
-单臂长按B使能、Grip接合/松开保持、松开Grip后长按A回零、右摇杆按下急停。
-双臂Y/B使能、X/A回零，任一摇杆按下急停两臂。
+单臂长按右 Grip+B 使能、Grip接合/松开保持、长按右 Grip+A 回零、右摇杆按下急停。
+双臂长按同侧 Grip+Y/B 使能、同侧 Grip+X/A 回零，任一摇杆按下急停两臂；也兼容把该物理键映射到 Trigger 的控制器配置。
 `--scale`调位移比例，方向与安全工作空间配置见[PICO手册](#pico控制参数与排查)。
 独立双臂入口`robotarm data-acquisition piper-bimanual-xr`也保留；优先用上面的`--arms 2`统一入口。
 
@@ -382,10 +438,11 @@ robotarm data-acquisition piper-xr -- \
 保持XRoboToolkit PC Service和bridge运行，启动命令见上节。无`--live`仍需读取CAN反馈，但不使能、不发送运动目标；确认后在同参数命令加`--live`，长按B才使能。
 
 `--firmware v189` 跳过逐通道固件探测（S-V1.8-9 / S-V1.9-0 都用 v189 驱动），
-启动更快，也不再打印探测线程的 `Bad file descriptor` 回溯。`--scale 0.4` 表示
-手走 10 cm、末端走 4 cm，减少撞工作空间边界和丢位移；需要 1:1 时用 `1.0`。
+启动更快，也不再打印探测线程的 `Bad file descriptor` 回溯。`--scale 0.8` 表示
+手走 10 cm、末端走 8 cm；当前默认 `2.0` 表示慢速、小幅输入按 2:1 映射，机械臂
+移动距离约为此前默认值的两倍。首次真机可显式使用较低比例核对方向和工作空间。
 
-启动时松开右握持键和 A，长按 B 约 1 秒；看到 `Piper enabled. Joint motor enables: [True, True, True, True, True, True]` 后，再松开并握紧右握持键接合。不加 `--live` 时 B 只打印提示，不操作硬件。短按 B 无动作，`--record` 已禁用。握持达到 0.9 接合，低于 0.7 释放；默认以位置为优先、尽量保持接合时的法兰朝向（奇异位形附近允许朝向让步）。添加 `--orientation` 可让朝向随右手柄旋转。右扳机松开时夹爪闭合、按下时张开；长按 A 回零并保持使能，右摇杆按下急停。
+长按右 Grip+B 约 1 秒；看到 `Piper enabled. Joint motor enables: [True, True, True, True, True, True]` 后，松开 B 即以当时手柄位置建立新基准并进入跟随，不必额外松开再握 Grip。不加 `--live` 时组合键只打印提示，不操作硬件。短按无动作，`--record` 已禁用。Grip 达到 0.9 接合，低于 0.7 释放；默认以位置为优先、尽量保持接合时的法兰朝向（奇异位形附近允许朝向让步）。添加 `--orientation` 可让朝向随右手柄旋转。右 Trigger 仍只控制夹爪；长按右 Grip+A 回零并保持使能，右摇杆按下急停。命令修饰键阈值默认 0.8，可用 `--command-modifier-threshold` 调整。
 
 PICO 默认配置独立存放在 `src/robotarm/config/xr.yaml`，不再读取共享文件的 `piper-xr` 段。当前单臂默认控制频率 100 Hz、双臂 50 Hz，平移目标限速 0.12 m/s，单关节命令限速 0.45 rad/s（约 25.8°/秒）。使用 `--translation-speed`（m/s）和 `--joint-speed`（rad/s）调整；同时保留每步限幅，取更严格者。控制周期延误时不补发大步长。不要复制旧示例中的每步限幅到新的频率上，否则会改变速度上限。目标推进基于限幅后关节命令的正解，减少目标积累。
 
@@ -397,6 +454,8 @@ PICO 默认配置独立存放在 `src/robotarm/config/xr.yaml`，不再读取共
 | `--max-target-lead` / `--max-relative-translation` | 相对反馈超前／单次接合范围，单位m |
 | `--xyz-min` / `--xyz-max` | 基座坐标系工作空间；双臂分别用left-/right-前缀 |
 | `--posture-anchor engage` / `seed` | 固定接合姿态参考／随上一周期种子变化 |
+| `--engage-settle-seconds` / `--engage-deadband-m` | 接合后重建参考的时间／首条运动命令所需的主动手部位移；默认0.25秒、2毫米 |
+| `--verbose-status` | 临时恢复高频按键、机械臂状态、IK、目标和关节诊断；默认关闭以避免终端刷屏 |
 
 XR 超过 0.2 秒不更新时脱离；恢复后必须松手再接合。松手/断流/逆解拒绝时发送当前关节位置作为保持目标，正常退出（包括回零期间 Ctrl+C）时发送当前位置保持命令，保持使能，不发送软件急停；运行异常或右摇杆主动急停仍发送软件急停。停止效果仍需在真实控制器上验证。回零期间也监测 XR 断流、退出信号和右摇杆急停。
 
@@ -411,6 +470,9 @@ python -m unittest discover -s tests -p test_pico_control.py -v
 通过统一入口 `piper-xr -- --arms 2` 启动双臂控制：默认左手柄控制 `can_leader1`，右手柄控制 `can_follower1`。
 旧入口 `piper-bimanual-xr` 仍可使用，行为相同。
 升级代码后必须重启 XR bridge，因为旧 bridge 消息不包含左手柄字段。
+双臂默认使用 `--tracking-frame head`：每次 Grip 接合时冻结头显水平朝向，将操作者
+前方/右方/上方映射到机械臂 `+X/-Y/+Z`。PICO 重定位或操作者站位变化不再要求手工修改
+世界坐标 yaw；接合后转头也不会改变本次映射。两侧 mirror 默认均为 `none`，仍可分别覆盖。
 
 确认两个手柄方向和两台机械臂反馈后再增加 `--live`。首次真机建议缩小映射比例、
 一次只接合一只手；方向和镜像按实测填写（`--left/right-xr-yaw-deg`、
@@ -419,25 +481,26 @@ python -m unittest discover -s tests -p test_pico_control.py -v
 ```bash
 robotarm data-acquisition piper-xr -- \
   --arms 2 --xr-bridge --left-channel can_leader1 --right-channel can_follower1 --firmware v189 \
-  --left-xr-mirror lr --right-xr-mirror lr \
-  --scale 0.4 \
+  --tracking-frame head --left-xr-mirror none --right-xr-mirror none \
+  --scale 2.0 \
   --live
 ```
 
 降低映射比例可减少目标位移；降低速度上限也会使快速手部输入更容易被丢弃。调整时同时核对工作空间、限速和实际跟随误差，不以取消限制解决跟随问题。
 
 程序首先等待 bridge 的左右手柄姿态有效、时间戳持续更新，然后才连接机械臂。
-出现 `Waiting for fresh left and right controller poses` 时，Y/B 尚未生效；
+出现 `Waiting for fresh left and right controller poses` 时，Grip/Trigger+Y/B 尚未生效；
 先确认 `xr-bridge` 正在监听相同端口、头显应用已打开 Send、两只手柄均已唤醒。
 等待日志每 2 秒显示时间戳和左右姿态状态；出现 `Both XR controllers are ready`
-并完成机械臂连接后，再松开两侧 Grip、长按 Y/B。启动等待超时不会连接机械臂或发送急停。
+并完成机械臂连接后，再长按同侧 Grip+Y/B。启动等待超时不会连接机械臂或发送急停。
 
 按键映射：左/右 Grip 接合对应机械臂；Trigger 松开时对应夹爪闭合，按下时按比例
-张开。松开两侧
-Grip 后，长按 Y/B 分别使能左/右臂。松开对应侧 Grip 后，长按 X/A 分别让左/右
+张开。长按同侧 Grip+Y/B 分别使能左/右臂。长按同侧 Grip+X/A 分别让左/右
 臂回零；回零开始时另一臂也会立即保持，回零结束后两只手都必须松开再重新接合。
-不要同时长按 X+A；在没有完整双臂连杆碰撞检测时，程序会拒绝联合回零。需要两臂
-都回零时，先单独完成一臂，松开 X/A，再单独回零另一臂。
+同时长按两侧 Grip+X/A 会执行顺序回零：右臂保持时先回左臂，再由左臂保持、回右臂，
+不会让两臂同时运动。该顺序仍不等于完整的双臂连杆碰撞检测，执行前必须清空两条回零路径。
+组合键长按期间
+暂停对应夹爪更新，松开面键后 Trigger 恢复控制夹爪。
 按下任意一侧摇杆会对两臂发送电子急停。XR 消息过期时两臂保持，恢复后必须先
 松开 Grip 再重新接合。
 
@@ -476,7 +539,7 @@ Grip 后，长按 Y/B 分别使能左/右臂。松开对应侧 Grip 后，长按
 
 修正逐关节截断造成的方向偏差：关节速度、跟随误差和位置限制统一用同一个比例缩放整组关节增量。若不存在满足限制的等比例步长，则保持并要求重新接合。
 
-日志 `hand_delta` 为 XR 原始坐标位移，`requested_delta` 为工作空间限制后的机械臂基座目标位移（均为米）。当前固定映射为机器人 X=-XR Z、机器人 Y=-XR X、机器人 Z=XR Y，依赖头显跟踪坐标与机器人朝向对齐；站位不会自动校准映射。默认 scale=1.0，手移动 10 cm 对应目标 10 cm，单次接合相对目标最多 20 cm；关节速度上限也会限制实际跟随速度。
+日志 `hand_delta` 为 XR 原始坐标位移，`requested_delta` 为工作空间限制后的机械臂基座目标位移（均为米）。双臂默认在每次接合时用头显 yaw 自动建立操作者坐标：向前对应机器人 `+X`、向右对应 `-Y`、向上对应 `+Z`；俯仰和侧倾不会混入平移映射。`--tracking-frame world` 可恢复固定世界坐标映射。默认 scale=2.0，手移动 10 cm 对应目标20 cm，单次接合相对目标最多20 cm；关节速度上限也会限制实际跟随速度。
 
 可用 `--xr-yaw-deg` 绕机器人竖直轴校准水平映射，例如 90 表示将默认映射后的 +X 转向 +Y；竖直方向保持不变。此参数不会根据站位自动估计，先在 dry-run 查看 `requested_delta` 的方向。改变头显跟踪原点后应重新检查。
 
@@ -537,7 +600,7 @@ PICO 单臂和双臂现在都使用带验证的 Placo IK。求解以“上一周
 
 #### 接合方式与误操作保护
 
-单臂、双臂默认 `--engagement-mode grip`：长按 Y/B 使能左/右臂（单臂用 B）后，
+单臂、双臂默认 `--engagement-mode grip`：长按同侧 Grip+Y/B 使能左/右臂（单臂用右 Grip+B）后，
 **握住 Grip（≥0.9）才跟随，松开 Grip 立即脱离并保持当前位置**——松手即暂停，
 重新握住即从新手部基准继续，不会追补松手期间的动作。Trigger 仍控制夹爪，
 摇杆按下仍为急停。朝向跟随需要 `--orientation`。重新接合前保持手柄稳定；
@@ -547,7 +610,7 @@ PICO 单臂和双臂现在都使用带验证的 Placo IK。求解以“上一周
 
 默认关节限速0.45 rad/s，每周期最大关节步长0.009 rad，朝向步长1.2°（每步限制还需与实际控制频率一起核对）。IK 每个候选最多做四次收敛迭代，最终指令仍通过关节限速和反馈误差检查。
 
-相邻有效手柄数据位置变化超过 `--max-hand-jump-m 0.05`，或旋转变化超过 `--max-hand-jump-deg 30`，触发 `INPUT PAUSED`，保持当前位置并停止夹爪指令。双臂任一侧触发会暂停两侧，分别重新长按 Y/B 恢复；不会自行恢复。grip 模式下数据过期或逆解拒绝需要松开 Grip 后再重新握紧恢复；`INPUT PAUSED` 例外，必须长按使能键。恢复时重新捕获基准，不追赶暂停期间的手柄动作。该检测针对手柄位姿突变，不是完整的碰撞检测。
+相邻有效手柄数据位置变化超过 `--max-hand-jump-m 0.05`，或旋转变化超过 `--max-hand-jump-deg 30`，默认触发 `INPUT REBASED`：机械臂保持当前位置、丢弃跳变并在下一帧自动建立新手柄基准，不再要求重新按 Y/B。双臂任一侧跳变会同时重建两侧基准。需要旧的严格锁存行为时使用 `--hand-jump-action pause`，此时打印 `INPUT PAUSED` 并要求重新长按对应 Grip+Y/B。数据过期或逆解拒绝仍按各自保护逻辑处理。该检测针对手柄位姿突变，不是完整的碰撞检测。
 
 ```bash
 robotarm data-acquisition piper-xr -- \
@@ -669,9 +732,46 @@ robotarm data-acquisition convert-piper-raw -- \
 | `--image-writer-threads` / `--encoder-threads` | 图像写入／视频编码线程数 |
 | `--overwrite` | 会删除已有输出重建；不是增量合并，日常命令不使用 |
 
-已有`--append`接口当前存在相机角色变量初始化顺序问题，不作为可用推荐流程；
-需要增加数据时，把原来的源session和新增session一起转换到**新目录**。
+需要向已有LeRobot数据集增加新raw数据时，优先使用事务式`extend-dataset`。它先复制到临时目录，
+完成追加和回读校验后再发布；能继承Dataset Browser标记，也能处理已经裁剪导出、缺少
+`piper_raw_session.json`的数据集。`new`模式保留旧目录并创建新数据集：
+
+```bash
+robotarm modeling extend-dataset -- \
+  --mode new \
+  --base-dataset data/lerobot/BASE_DATASET \
+  --new-raw data/raw/piper_raw/NEW_SESSION \
+  --output data/lerobot/NEW_DATASET
+
+# 上述命令默认只预检；确认后原样重跑并加：
+#   --execute
+```
+
+`append`模式不传`--output`，成功后原子替换原目录，并保留一个
+`*_backup_before_append_时间`完整备份。新episode默认标记为`review`和
+`cup_orientation=sideways`，审核通过前不会被`--quality-filter`选入训练；可用
+`--new-status keep`或`--new-label upright|uncertain|none`显式修改。
+底层`convert-piper-raw --append`会原地修改目标，不提供事务和审查标记迁移，日常不要直接调用。
 `robotarm modeling convert-dataset`是同一转换器的兼容入口，通常统一用`data-acquisition convert-piper-raw`。
+
+2026-10-27新增的59条侧倒杯数据，统一放回未裁剪的122条数据集后再审核、裁剪。推荐保留旧目录，
+生成181条未裁剪工作集：
+
+```bash
+# 第一次不加 --execute，只做兼容性、数量和标记迁移预检
+./scripts/extend_lerobot_dataset.py \
+  --mode new \
+  --base-dataset data/lerobot/piper_pick_cup_20261019_direct_122eps \
+  --new-raw data/raw/piper_raw/20261027_150825_390106 \
+  --output data/lerobot/piper_pick_cup_20261019_direct_181eps_untrimmed_20261027
+
+# 确认预检显示 122 + 59 = 181 后，原样重跑并在末尾增加：
+#   --execute
+```
+
+脚本继承原122条的keep/review/reject、备注、姿态标签和未应用裁剪范围；新59条编号为122～180，
+默认写入`review + cup_orientation=sideways`。完成后打开181条工作集，逐条把新数据改为keep/reject并
+设置裁剪范围，再从页面导出最终训练集。不要把122条原集、181条工作集及其裁剪副本同时送入一次训练。
 
 ### 5.3 浏览、质量审查、读取数量
 
@@ -684,12 +784,52 @@ python -m json.tool data/lerobot/piper_cup_20261019_122eps_v1/meta/info.json
 ```
 
 浏览器默认 <http://127.0.0.1:8766>。数据动作采用六关节 rad + 夹爪 m 的绝对命令目标。
-页面顶部的 **English / 中文** 按钮可即时切换界面语言，并在当前浏览器记住选择。
+页面顶部并排显示 **中文 / English**，有蓝色底色的一项是当前语言；点击另一项可即时切换，
+并在当前浏览器记住选择。
 切换不会重载episode或丢弃未保存的标记、备注与裁剪范围；任务文字、数据集名和用户备注保持原文。
 质量标记与数据分开保存，不用 `lerobot-replay` 代替只读预览。
 ↑/↓切episode，←/→逐帧，空格播放；在页面标记keep/review/reject。
 审查文件默认`artifacts/reports/dataset_quality/<数据集名>.json`；`--quality-filter`训练时排除review/reject，
 未审查条目默认仍会被保留，不等于已经人工验收。
+
+每条episode还可保存结构化标签。当前预置“杯子姿态”：`upright`（直立）、
+`sideways`（侧倒）、`uncertain`（其他/不确定）。标签写入同一份审查JSON的
+`episodes.<编号>.labels`，不会修改源LeRobot数据；左侧可按标签筛选，导出区也可只导出
+某个标签或未标记条目。标签字段由浏览器的schema统一校验，后续可以继续增加抓取方式、
+杯口方向或成功类型，而不用改变已有审查记录。
+
+#### 直立/侧倒数据比例与验证
+
+截至2026-10-28，人工统计约为直立52条、侧倒120多条，episode比例约`1:2.3`。这可以用于优先解决
+侧倒抓取的第一轮训练，但若实际部署中两种姿态接近等概率，不应把它视为最终平衡数据集。ACT更接近
+按帧产生训练样本，轨迹较长的类别会获得更多样本，因此训练前还要比较两类的**有效总帧数**，不能只看条数。
+
+- 侧倒抓取是当前专项问题时，可以先保留现有约30%直立、70%侧倒的比例训练一版。
+- 同时要求稳定保持直立能力时，优先再采40～60条多样化直立轨迹，使episode比例接近`1:1～1:1.5`；
+  暂不补采时，可在训练采样层提高直立权重，不要通过复制文件制造重复episode。
+- 两类分别留出至少10条、且不参与训练的验证轨迹；分别报告直立成功率和侧倒成功率，不能只看总体成功率。
+- 侧倒数据应覆盖杯口朝左/右/前/后、不同桌面位置和旋转角度；大量同姿态重复不能替代覆盖度。
+- 先完成reject和裁剪，再统计比例。失败轨迹、长时间停顿以及未裁掉的回零段都不应计入有效训练量。
+
+可直接从审查JSON统计已标姿态的episode数量；把`DATASET`替换为实际数据集名：
+
+```bash
+python - <<'PY'
+import json
+from collections import Counter
+from pathlib import Path
+
+dataset = "DATASET"
+path = Path("artifacts/reports/dataset_quality") / f"{dataset}.json"
+reviews = json.loads(path.read_text(encoding="utf-8")).get("episodes", {})
+usable = (
+    review.get("labels", {}).get("cup_orientation")
+    for review in reviews.values()
+    if review.get("status", "") in {"", "keep"}
+)
+print(Counter(label for label in usable if label))
+PY
+```
 
 #### 每条episode独立裁剪并导出
 
@@ -698,11 +838,11 @@ python -m json.tool data/lerobot/piper_cup_20261019_122eps_v1/meta/info.json
 1. 在左侧选择episode，在“当前 Episode 保留片段”填写起点和终点，例如`5`到`14`秒。
    也可逐帧定位后点“当前帧设起点”“当前帧后设终点”；后者包含当前这一帧。
 2. 勾选“只播放所选片段”预览，绿色曲线区域表示保留范围；自动质量指标仍针对整条原轨迹。
-3. 点击“保存标记与裁剪”。每条轨迹独立保存，可给下一条设置不同范围；切换时未保存会提示。
+3. 选择“杯子姿态”并点击“保存标记、标签与裁剪”。每条轨迹独立保存，可给下一条设置不同标签和范围；切换时未保存会提示。
    “恢复整条”并保存可撤销该条裁剪；质量状态的“清除”不会自动撤销裁剪。
-4. 填写一个尚不存在的新数据集名称，点“导出已保存的裁剪数据集”。
+4. 导出区选择“全部可导出条目”或指定标签，填写一个尚不存在的新数据集名称，点“导出已保存的裁剪数据集”。
    导出在源数据集旁边创建新目录，包含保留及未审查条目，排除复查和剔除条目。
-   未设置裁剪的条目保留整条；左侧搜索/状态筛选只影响显示，不改变导出范围。
+   未设置裁剪的条目保留整条；左侧状态/标签筛选只影响显示，导出范围只由导出区标签选择决定。
 5. 等页面显示完成，再用新目录浏览或训练。导出期间保持服务运行；仅保存标记不会改变训练数据。
    导出进度条每秒刷新：显示本次参与导出的总条数、已完成条数、百分比及正在处理的原 Episode；
    同时显示帧处理进度和视频编码阶段，支持中英文切换。每条视频编码并保存成功后才计为完成一条。
@@ -715,7 +855,11 @@ python -m json.tool data/lerobot/piper_cup_20261019_122eps_v1/meta/info.json
 
 裁剪标记仍存在`artifacts/reports/dataset_quality/<数据集名>.json`的`trim`字段；
 导出目录的`meta/trim_provenance.json`保存审查快照及原episode/帧范围映射。
-新目录不沿用旧数据集的episode编号审查文件，应重新审核；不要将原数据和裁剪副本混入同一次训练。
+新目录不能直接套用旧数据集的episode编号审查文件。没有新审核文件时，审核页面及`--quality-filter`
+会自动读取新目录内的`meta/trim_provenance.json`，按新旧编号映射继承状态和备注，并移除已应用的裁剪范围。
+这也兼容此前已导出的数据集，无需重新导出或逐条重新标记；`--quality-shuffle-seed 1000`仍正常生效。
+重新审核并保存后，以新的审核文件为准；显式指定但不存在的`--quality-reviews`不会静默回退。
+导出未完成、清单不匹配或普通数据集缺审核文件仍会报错。不要将原数据和裁剪副本混入同一次训练。
 原数据带有未应用的裁剪标记时，`--quality-filter`和π0 LoRA审查入口会拒绝静默训练完整轨迹，
 提示先导出；**不使用审查入口而直接训练原目录，仍会训练原始完整轨迹**。
 裁掉起始动作会改变示教起始状态分布，真机仍需匹配裁剪后示教的初始条件。
@@ -732,6 +876,23 @@ python -m robotarm.modeling.quality_filter \
 ```
 
 含裁剪范围的审查文件不支持此直接迁移，以免帧范围套用到不同时间轴。
+
+若同一个实际任务在历史合并过程中产生了多个语言标签，可发布一个统一 task 的新数据集。
+该命令默认只预览；加`--execute`后保留源目录，复制可变元数据并硬链接视频，不重新编码视频：
+
+```bash
+robotarm modeling relabel-dataset-task -- \
+  --dataset-root data/lerobot/piper_pick_cup_direct_223eps_trimmed_20261028 \
+  --output-root data/lerobot/piper_pick_cup_direct_223eps_trimmed_single_task_20261029 \
+  --task "Pick up the cup in different poses"
+
+# 核对预览中的episode、帧数和旧标签分布后，原样重跑并追加：
+#   --execute
+```
+
+新目录会同步更新`tasks.parquet`、episode任务、帧级`task_index`、统计量和`total_tasks`，
+并写入`meta/task_relabel.json`记录旧标签分布。此操作只统一语言条件，不改变动作轨迹；
+如果旧数据实际包含不同的后续行为，应先按目标行为裁剪，不能仅靠改文字把它们视为同一任务。
 
 元数据修复入口`robotarm modeling normalize-piper-metadata`是旧pick-up数据专用规则，
 会修改元数据并要求`--backup-root`；不要拿它自动统一今天新任务的文字。详见[采集手册](#4-采集与遥操)。
@@ -782,7 +943,8 @@ python scripts/train_monitor.py \
   --run-dir artifacts/checkpoints/act_cup_20261019_chunk50_new_v1 --port 8420 --interval 2
 ```
 
-打开 <http://127.0.0.1:8420>。关闭监控不会停止训练；目录未创建时监控会等待。
+打开 <http://127.0.0.1:8420>。页面右上角并排显示 `中文`／`English`，有底色的一项是当前语言；
+选择保存在当前浏览器；关闭监控不会停止训练，目录未创建时监控会等待。
 续训命令和优化器状态要求见[训练手册](#续训与留出集包装入口)。
 
 ### 续训与留出集包装入口
@@ -1039,7 +1201,7 @@ xdg-open artifacts/reports/pi0_lora/pi0_denoising_review.html
 
 ### 8.5 云端包上传、校验与启动
 
-先按[打包命令](#12-辅助脚本)生成新的独立快照。包包含代码、LF180完整LeRobot数据、
+先按[打包命令](#12-辅助脚本)生成新的独立快照。默认包包含代码、LF180完整LeRobot数据、
 pi0_base及processor、tokenizer缓存和审查副本，不包含原始session、ACT权重、Conda环境、
 登录凭据或原生硬件SDK。首次安装Python依赖仍需联网；模型与tokenizer可离线加载。
 本包用于离线训练，保留CLI源码不代表装有CAN、相机、PICO或仿真依赖。
@@ -1097,11 +1259,11 @@ ssh -N -L 8420:127.0.0.1:8420 USER@CLOUD_HOST
 带回文件见[迁回与重加载](#83-模型迁回与单帧重加载)；π0 flow-matching loss不能与ACT L1直接比较。
 历史云端压缩包是静态快照，2026-10-13包不含后来新增的异步在线代码，部署使用本地当前版本。
 
-## 9. 在线运行：先shadow，再执行
+## 9. 在线运行：ACT直接执行与可选shadow
 
-### 9.1 ACT shadow与审批
+### 9.1 ACT shadow与审批（可选）
 
-以下以ACT为例，显式使用20步，覆盖当前YAML里的30步。
+以下以ACT为例，显式使用单步消费和时间集成，覆盖当前YAML里的30步。
 确认与训练一致的相机装定、物体布局和起始姿态；先停其他遥操/相机程序。
 
 ```bash
@@ -1112,7 +1274,12 @@ robotarm modeling online-policy -- \
   --checkpoint "$TASK_CHECKPOINT" \
   --interface socketcan --channel can_follower1 --firmware v189 \
   --camera-serial 347522071736 --wrist-camera-serial 260322272554 \
-  --device cuda --rate 20 --camera-fps 20 --n-action-steps 20 \
+  --device cuda --rate 20 --camera-fps 20 \
+  --n-action-steps 1 --temporal-ensemble-coeff 0.01 \
+  --warn-inference-ms 60 --max-inference-ms 500 \
+  --warn-act-raw-joint-gap-deg 12 --max-act-raw-joint-gap-deg 15 \
+  --max-act-raw-gap-consecutive-steps 3 \
+  --max-act-subgoal-no-progress-steps 10 \
   --duration 60 --report "$TASK_SHADOW"
 
 # shadow结束并检查后，生成绑定权重和参数的审批
@@ -1125,20 +1292,74 @@ shadow 读取相机/反馈，但不发送模型运动。检查完整日志中的
 
 ### 9.2 ACT真机执行
 
-复用上一小节同终端定义的变量；若新开终端，先重新定义这三个变量。确保执行参数与审批一致：
+当前 `online-policy.approval-required: false`，可以跳过 shadow 和审批，直接启动这个
+ACT checkpoint 的执行入口。程序会先使能从臂、将六关节回到零位（运动途中保持夹爪开度，
+到位后闭合夹爪并确认反馈）、
+预热模型并准备 JS 控制；打印 `ACT ready at home; press X` 后仍保持暂停，按 X 才发送
+模型动作。抓取中或抓取后单击 R，会暂停当前试次、丢弃剩余预测动作，并在当前位置保持
+机械臂，先张开夹爪至最多 80 mm（已抓住的物体会在当前位置释放），确认夹爪反馈后再
+回零；到零位后闭合夹爪至示教起始开度，等待重新按 X。启动回零、长按 Y 回零及
+Ctrl+C 退出前回零也会在到位后闭合夹爪。新试次使用新的相机画面和关节
+状态。复位期间按 Ctrl+C 会发送电子急停；夹爪张开、闭合或回零超时也会电子急停。
+
+```bash
+robotarm modeling online-policy -- \
+  --checkpoint artifacts/checkpoints/act_cup_20261028_chunk30/checkpoints/100000/pretrained_model \
+  --interface socketcan --channel can_follower1 --firmware v189 \
+  --camera-serial 347522071736 --wrist-camera-serial 260322272554 \
+  --device cuda --rate 20 --camera-fps 20 \
+  --n-action-steps 1 --temporal-ensemble-coeff 0.01 \
+  --warn-inference-ms 60 --max-inference-ms 500 \
+  --warn-act-raw-joint-gap-deg 12 --max-act-raw-joint-gap-deg 15 \
+  --max-act-raw-gap-consecutive-steps 3 \
+  --max-act-subgoal-no-progress-steps 10 \
+  --duration 60 --report artifacts/logs/shadow/act_100000_direct_execute.jsonl \
+  --execute
+```
+
+跳过 shadow 只跳过执行前的审批流程；运行时的原始动作差值、限位、相机时效等
+看门狗仍然生效。如果回零后首个预测动作越过关节物理边界或包含非有限值，按 X 后会立即
+暂停；仅原始关节/夹爪差较大时按下述遥测告警与ACT动作消费背压处理。
+推理耗时使用两级门槛：`--warn-inference-ms 60`是软告警，超过后终端打印
+`WARNING: ... continuing execution`，并写入日志的`performance_warnings`，但仍发送本次经过
+安全限幅的动作；`--max-inference-ms 500`才是硬停门槛，超过后写入`watchdog_failures`并暂停。
+20Hz下一个周期为50ms，例如229ms的偶发尖峰约跨过4至5个周期；等待推理期间控制器保持
+上一目标，推理完成后继续执行。关节越界、原始动作异常、相机过期等门控不受软告警影响，
+仍会立即暂停。若需修改硬停值，应根据完整真机遥测评估，不应将其取消。
+原始关节差只作为预测遥测：超过`--warn-act-raw-joint-gap-deg 12`会告警，超过
+`--max-act-raw-joint-gap-deg 15`及其连续拍数会记录严重差距，但不会仅凭“移动中的原始预测
+离反馈越来越远”暂停。程序仍按200°/s²加速度、每拍2.5°步长和相对反馈6°超前量限幅；一旦
+触发最终超前/步长限幅，就按当前速度的制动距离生成一次性的有界子目标并冻结；实际命令仍
+始终限制在反馈前方6°以内。硬限幅期间暂停ACT动作消费（包括时间集成序列），让真机追赶；
+最终硬限幅一解除就恢复下一次推理，不要求Piper精确停在固定点，因此不会被约2°的JS跟随
+残差卡住。只有仍处于硬限幅状态且连续`--max-act-subgoal-no-progress-steps 10`拍没有达到
+最小反馈进展才暂停；20Hz下约为0.5秒。目标越过关节/夹爪物理边界或包含NaN/Inf仍立即暂停。
+当前抖动优化的推荐组合是`--n-action-steps 1 --temporal-ensemble-coeff 0.01`：每个控制周期
+只消费一步，同时对重叠chunk的ACT预测做时间集成，减小chunk内部和边界处的动作跳变。
+启用`--temporal-ensemble-coeff`时程序要求`n_action_steps=1`，否则拒绝启动。它只改变在线推理
+和动作消费方式，不改变checkpoint的`chunk_size`、训练监督长度或训练loss。每次用不同
+`--report`路径保存日志，不要放宽安全限值来掩盖问题。
+
+若将 `online-policy.approval-required` 改为 `true`，可复用上一小节同终端定义的
+变量走审批流程；若新开终端，先重新定义这三个变量，并确保执行参数与审批一致：
 
 ```bash
 robotarm modeling online-policy -- \
   --checkpoint "$TASK_CHECKPOINT" \
   --interface socketcan --channel can_follower1 --firmware v189 \
   --camera-serial 347522071736 --wrist-camera-serial 260322272554 \
-  --device cuda --rate 20 --camera-fps 20 --n-action-steps 20 \
+  --device cuda --rate 20 --camera-fps 20 \
+  --n-action-steps 1 --temporal-ensemble-coeff 0.01 \
+  --warn-inference-ms 60 --max-inference-ms 500 \
+  --warn-act-raw-joint-gap-deg 12 --max-act-raw-joint-gap-deg 15 \
+  --max-act-raw-gap-consecutive-steps 3 \
+  --max-act-subgoal-no-progress-steps 10 \
   --duration 60 --report artifacts/logs/shadow/act_090000_manual_execute.jsonl \
   --approval "$TASK_APPROVAL" --execute
 ```
 
-启动保持暂停，按X开始。`approval-required: false`当前会跳过审批文件检查，不表示安全检查或任务已通过。
-需要强制审批时在YAML改为true；权重/运行参数改变后重做验证。
+启动先自动回零并保持暂停，按 X 开始。需要强制审批时在 YAML 改为 true；
+权重或运行参数改变后重新验证。
 
 完全使用YAML默认参数时，可一条命令做shadow＋审批（不发送模型运动）：
 
@@ -1149,50 +1370,140 @@ robotarm modeling validate-runtime -- \
   --seconds 60 --min-samples 1000
 ```
 
-该入口不接受`--n-action-steps`等在线覆盖；它此时用YAML的30步，**不能冒充上面20步命令的验证**。
+该入口不接受`--n-action-steps`或`--temporal-ensemble-coeff`等在线覆盖；它此时用YAML的30步，
+**不能冒充上面单步＋时间集成命令的验证**。
 需要覆盖参数时用显式shadow→approve→execute。
 
 | 输入 | 执行模式行为 |
 |---|---|
+| V | 开始／结束一次评估录制；不改变模型控制状态，同一程序可录制多段 |
 | X | 开始/暂停一轮模型控制 |
-| 长按Y 0.3秒 | 暂停并回零，夹爪保持 |
-| Ctrl+C | 回零后退出，**不是急停** |
+| I | 仅在`--hg-dagger`下：人工主臂接管；再次按I保存本段专家纠正并交还模型 |
+| R | ACT 当前试次暂停，当前位置张开夹爪，回零后闭合；再按 X 开始新试次 |
+| 长按Y 0.3秒 | 暂停并回零，运动途中保持夹爪开度，到位后闭合 |
+| Ctrl+C | 通常回零并闭合夹爪后退出；回零过程中按下则电子急停 |
 | Alt+S | 电子急停 |
 | 视频窗口F/F11、双击、Esc | 切换全屏／返回窗口；窗口默认置顶、可调整大小 |
 
-在线视频窗口获得焦点时也支持X/长按Y，`S`为电子急停。shadow不执行按键回零/急停。
+在线视频窗口获得焦点时也支持V、X、R、长按Y，`S`为电子急停。shadow不执行按键回零/急停，
+但仍可用V录制模型输入和预测结果。
 `--duration`在shadow中为总时长，在execute中为每次按X启动的试次上限，到时暂停。
+
+按V后才会创建录制目录，默认位于
+`artifacts/policy_recordings/<启动时间>/recording_<编号>/`；再次按V立即停止采样，MP4在后台封装，
+不会等待编码完成后才恢复控制。一次`online-policy`进程中可以反复按V，生成多个编号递增的录制目录。
+录制跨越暂停、X启动/停止以及R/Y回零；R/Y的阻塞运动阶段仍继续记录相机和关节反馈。输出同时包含：
+
+| 文件 | 内容 |
+|---|---|
+| `combined.mp4` | global与wrist横向拼接在同一画面，并叠加录制时间、trial和执行/暂停状态 |
+| `global.mp4`、`wrist.mp4` | 两路无叠字的独立原始相机视频 |
+| `frames.npz` | 与视频采样对齐的7维state、安全action、原始模型action、相机时间戳/帧号、trial和按键事件 |
+| `joints.csv` | 便于直接查看的关节rad/deg、夹爪m/mm、安全action和原始action |
+| `recording.json` | 帧数、时长、丢帧、文件映射和完整/异常状态 |
+| 上级`session.json` | checkpoint、task、策略类型、相机序列号和录制参数 |
+
+默认录制FPS为控制频率与相机FPS的较小值。可用
+`--recording-root PATH --recording-fps 20 --recording-encoder-queue-size 120`覆盖。
+需要系统已安装`ffmpeg`；仅在首次按V时才检查并启动编码器。编码队列满、磁盘不足或写盘失败只会终止
+当前录制并标为`incomplete`，不会自行继续发送或停止机械臂命令；机械臂安全仍由原有watchdog控制。
+若退出程序前没有再次按V，当前片段会保存为`incomplete_recording_<编号>`，避免把非显式结束的数据冒充完整录像。
+
+#### HG-DAgger人工接管与纠正数据
+
+HG-DAgger使用人工专家直接控制门控：模型正常运行，专家发现将要失败时按`I`取得独占控制，
+完成恢复后再次按`I`交还模型。程序只把人工接管区间写成监督episode；接管前的失败模型动作
+不会成为训练action。当前实现使用`can_leader1`主臂，接管首拍自动记录“从臂姿态－映射后主臂
+姿态”的离合偏置，因此不要求两臂在按`I`时绝对对齐，也不会因控制源切换而跳到主臂绝对姿态。
+
+```bash
+robotarm modeling online-policy -- \
+  --checkpoint artifacts/checkpoints/act_cup_20261028_chunk30/checkpoints/100000/pretrained_model \
+  --interface socketcan --channel can_follower1 --firmware v189 \
+  --camera-serial 347522071736 --wrist-camera-serial 260322272554 \
+  --device cuda --rate 20 --camera-fps 20 \
+  --n-action-steps 1 --temporal-ensemble-coeff 0.01 \
+  --warn-inference-ms 60 --max-inference-ms 500 \
+  --warn-act-raw-joint-gap-deg 12 --max-act-raw-joint-gap-deg 15 \
+  --max-act-raw-gap-consecutive-steps 3 \
+  --max-act-subgoal-no-progress-steps 10 \
+  --hg-dagger --hg-leader-interface socketcan --hg-leader-channel can_leader1 \
+  --hg-task "Pick up the cup in different poses" \
+  --hg-setup-id cup_hg_dagger_v1 \
+  --duration 60 --report artifacts/logs/shadow/act_100000_hg_dagger.jsonl \
+  --execute
+```
+
+启动顺序：等待ACT回零和模型预热；程序随后把主臂切到零力模式，需扶住主臂；按`X`运行模型；
+将要失败时按`I`接管并完成纠正；再次按`I`保存并让模型从当前最新观测重新规划。同一次进程
+可以重复接管多次，每次显式`I`→`I`生成一个complete episode。按`X`、`R`、`Y`、急停、
+watchdog或退出中断的接管片段会标为incomplete，默认转换不会用于训练。
+`--duration`只累计模型控制时间，人工接管期间暂停该计时，不会在恢复动作中途因试次超时切断专家控制。
+
+首个接管发生前不会创建数据目录。默认输出到
+`data/raw/piper_raw/<时间戳>/episodes/episode_<编号>/`，包含`global.mp4`、`wrist.mp4`、
+`frames.npz`和`episode.json`。训练action是经过现有加速度、单步、超前量和关节边界限制后
+实际下发的专家目标；`novice_action`、`expert_requested_action`、`leader_state`和跟随误差只在
+原始NPZ中作为诊断字段。HG-DAgger不会关闭相机、关节边界、反馈进展或急停看门狗。
+
+采集后不要只用纠正片段单独训练；将它们聚合到原BC数据，并先人工审核。下面直接从raw创建
+新的聚合数据集，第一次去掉`--execute`做预检；`SESSION`替换为本次时间戳目录：
+
+```bash
+robotarm modeling extend-dataset -- \
+  --mode new \
+  --base-dataset data/lerobot/piper_pick_cup_direct_223eps_trimmed_single_task_20261029 \
+  --new-raw data/raw/piper_raw/SESSION \
+  --output data/lerobot/piper_pick_cup_223eps_hg_round1 \
+  --new-status review --new-label none \
+  --execute
+```
+
+本入口实现的是HG-DAgger的人工门控、专家恢复采集和数据聚合闭环；尚未加入论文中基于多个
+novice策略分歧自动学习的doubt阈值。当前安全性仍依赖人在模型进入不可恢复状态前及时按`I`。
 
 预测不合理先查输入/模型/时序，不以放宽软件限位或取消watchdog解决。
 
 #### ACT限幅与日志字段
 
-下表是 2026-10-19 配置快照，不代表已验证适合所有模型；修改后以实际启动日志为准。
+下表是 2026-10-29 配置快照，不代表已验证适合所有模型；修改后以实际启动日志为准。
 
 | 参数 | 当前 ACT 值 | 含义 |
 |---|---:|---|
 | `--max-joint-step-deg` | 2.5 | 单周期相对上次命令的变化上限 |
 | `--max-joint-lead-deg` | 6 | 命令相对反馈的超前上限 |
 | `--max-gripper-step-mm` / `--max-gripper-lead-mm` | 8 / 16 | 夹爪步长 / 超前上限 |
-| `--max-act-raw-joint-gap-deg` | 12 | 原始预测相对反馈最大关节差，超限暂停 |
-| `--max-act-raw-gripper-gap-mm` | 30 | 原始夹爪预测相对反馈差上限 |
+| `--warn-act-raw-joint-gap-deg` | 12 | 原始关节差软告警；继续执行限幅后的安全目标 |
+| `--max-act-raw-joint-gap-deg` | 15 | 原始关节严重差距遥测阈值，不单独触发停机 |
+| `--max-act-raw-gap-consecutive-steps` | 3 | 连续严重差距的告警/日志计数，不单独触发停机 |
+| `--max-act-raw-gripper-gap-mm` | 30 | 原始夹爪差距告警阈值；执行仍由背压目标限幅 |
 | `--max-act-raw-gripper-bound-tolerance-mm` | 1 | 原始夹爪边界容差，实际目标仍为合法开度 |
-| `--max-act-clamp-hold-steps` | 10 | 同一限幅动作持续保持的周期上限 |
-| `--max-inference-ms` / `--max-camera-age-ms` | 60 / 50 | 推理耗时 / 观测年龄上限，ms |
-| `--n-action-steps` | YAML 当前为 30 | 在线消费步数；上述例子显式覆盖为 20，不改变chunk_size和训练loss |
+| `--max-act-raw-joint-bound-tolerance-deg` | 1 | ACT 原始关节预测允许的小幅越界；执行目标仍硬限幅到安全范围，超过容差才停机 |
+| `--max-act-subgoal-no-progress-steps` | 10 | 硬限幅背压期间连续无反馈进展的停机拍数；旧参数名仍兼容 |
+| `--act-subgoal-min-progress-deg` / `--act-subgoal-min-gripper-progress-mm` | 0.05 / 0.1 | 清零无进展计数所需的最小误差下降量 |
+| `--warn-inference-ms` / `--max-inference-ms` | 60 / 500 | ACT 推理耗时软告警 / 硬停上限，ms；告警不打断执行 |
+| `--max-camera-age-ms` | 50 | 观测年龄硬停上限，ms |
+| `--n-action-steps` | YAML 当前为 30 | 在线消费步数；当前ACT真机命令显式覆盖为1 |
+| `--temporal-ensemble-coeff` | CLI显式为0.01 | 启用ACT时间集成以平滑重叠chunk；要求`n_action_steps=1`，不改变训练loss |
 | `--max-chunk-inference-ms` | 按策略覆盖 | 异步整块推理时限，与同步推理门槛区分 |
 | `--report` | 显式指定 | 本次JSONL日志路径，用于诊断和审批，避免同名覆盖 |
 
-真实步长/超前限幅时保持当前 ACT 动作，追上后再消费下一条；容差内夹爪端点修正不累计
-等待跟随次数。超出原始预测门槛时，不靠多次小步追到异常目标。
+真实步长/超前限幅时，发送端锁定有界目标并暂停ACT动作消费；最终硬限幅解除后立即恢复
+时间集成推理，不等待精确位置收敛。原始关节差超过12°/15°仅告警和记录；只有硬限幅仍在
+生效且反馈连续无进展，或原始动作越过物理边界/非有限值，才触发安全暂停。
 
 | 日志字段 | 含义 |
 |---|---|
 | state / raw_action / safe_action | 反馈 / 原始预测 / 限幅目标，rad/m |
-| act_tracking_action | 容差内夹爪端点修正后的比较目标 |
+| act_tracking_action / act_control_action | 最新预测修正值 / 本拍控制器输入（锁存后为固定目标） |
 | action_clamped / act_tracking_clamped | 原始预测被修改 / 修正后仍需等待跟随 |
 | act_gripper_boundary_corrected | 是否修正夹爪端点 |
-| act_action_held / act_hold_steps | 保持旧动作 / 连续周期数 |
+| act_subgoal_active / created / reached | 背压目标是否活动 / 本拍创建 / 本拍解除（兼容字段名） |
+| act_policy_clock_frozen / act_backpressure_* | ACT时间序列是否暂停消费 / 背压创建、解除及无进展拍数 |
+| act_subgoal_*_error / *_progress | 固定目标误差和本拍反馈进展，单位见字段名 |
+| act_subgoal_no_progress_steps / act_hold_steps | 连续无进展拍数；后者为兼容字段 |
+| act_raw_action_warnings / act_raw_gap_hard_steps | 原始差距告警 / 连续超过严重遥测阈值的拍数 |
+| performance_warnings | 非致命性能告警（例如推理超过软阈值） |
 | command_sent / watchdog_failures | 是否真正下发 / 暂停原因 |
 
 报告：`artifacts/logs/shadow/<run>_<step>_<hash12>[_execute].jsonl`；暂停时查完整记录。
@@ -1214,9 +1525,10 @@ robotarm modeling online-policy -- \
   --duration 60 --report artifacts/logs/shadow/pi0_020000_manual.jsonl
 ```
 
-先用上面命令只读验证。确认后在同参数命令追加`--execute --experimental-pi0-execute`，
-并改用新的execute日志路径；若启用了审批还需提供匹配的`--approval`。
-当前属于实验功能，未完成稳定闭环验收，不能因为shadow跑完就跳过故障检查。
+上面命令是可选的只读分析模式，用于测量模型延迟、队列时序和原始动作，不发送运动命令。
+Pi0真机执行不要求先运行shadow，也不检查shadow审批文件；在同参数命令追加
+`--execute --experimental-pi0-execute`并改用新的execute日志路径即可。
+当前属于实验功能，运行时安全看门狗仍然生效。
 
 π0 需要匹配的LoRA adapter、基础权重和保存的processors，使用异步动作块。
 其 `n_action_steps=20` 是观测时刻起1秒窗口，会跳过过期前缀，不是推理完成后还能执行1秒。
@@ -1304,7 +1616,14 @@ MJCF用MuJoCo，URDF用Placo/Meshcat；文件参数是下划线，不是`--xml-p
 
 ### 仿真环境、采集语义与续采
 
-#### `PiperPickCupToContainer-v1`（推荐）
+#### `PiperLiftCup-v1`：当前无把手杯抓起任务
+
+当前实采任务的仿真见[抓杯仿真启动说明](simulation_lift_cup.md)。使用 Piper、棕色桌垫、
+60/48/90 mm 无把手杯，支持直立/横躺/混合姿态，以稳定抓起离桌为成功条件。
+`robotarm simulation lift-cup -- --cup-pose upright --seed 0 --render` 可运行可视化演示，
+`--record --output 新目录` 可导出视频和评估结果。
+
+#### `PiperPickCupToContainer-v1`（入箱任务）
 
 目标是把带把手的白色杯子抓起，搬运到蓝色容器内，松开后稳定直立。环境包含：
 
@@ -1410,7 +1729,7 @@ ManiSkill 官方支持的 YCB 资源（例如 `ycb:025_mug`），但需先单独
 
 ## 11. 全部CLI功能清单
 
-以下与当前注册入口逐一对应，共46个（data-acquisition 11、modeling 20、simulation 15）。
+以下与当前注册入口逐一对应，共48个（data-acquisition 11、modeling 21、simulation 16）。
 每个Python入口的完整参数通常可用`robotarm <组> <命令> -- --help`查看；
 `train`/`train-with-holdout`是shell包装，按第6节的位置参数格式使用。
 
@@ -1441,6 +1760,8 @@ ManiSkill 官方支持的 YCB 资源（例如 `ycb:025_mug`），但需先单独
 | `robotarm modeling check-pi0-lora` | LoRA重新加载＋单帧离线预测，第8节 |
 | `robotarm modeling convert-dataset` | 与convert-piper-raw相同的兼容入口，第5节 |
 | `robotarm modeling dataset-browser` | 数据浏览、人工审查、逐episode裁剪与新数据集导出，第5节 |
+| `robotarm modeling extend-dataset` | 事务式追加raw数据、继承审查标记或生成新合并集，第5节 |
+| `robotarm modeling relabel-dataset-task` | 保留源目录，发布统一语言task的新数据集，第5节 |
 | `robotarm modeling normalize-piper-metadata` | 旧pick-up元数据修复工具，非通用任务重标记，修改前需备份 |
 | `robotarm modeling trajectory-studio` | Open-loop验证平台，第7节 |
 | `robotarm modeling evaluate` | checkpoint指定episode抽样误差，第7节 |
@@ -1461,6 +1782,7 @@ ManiSkill 官方支持的 YCB 资源（例如 `ycb:025_mug`），但需先单独
 |---|---|
 | `robotarm simulation realsense-stream` | 真实相机预览，不是仿真，第3节 |
 | `robotarm simulation viewer` | ManiSkill场景/相机查看器，第10节 |
+| `robotarm simulation lift-cup` | 当前无把手杯抓起任务、录像与评估，第10节 |
 | `robotarm simulation scripted-pick-place` | 旧方块任务脚本基线，第10节 |
 | `robotarm simulation force-scripted-pick-place` | 旧方块任务接触式脚本基线，第10节 |
 | `robotarm simulation force-pick-cup` | 杯子任务力保护基线，第10节 |
@@ -1492,6 +1814,7 @@ WeGo采集和旧replay-compare已不是当前入口；不要照历史实验记�
 | `scripts/cloud/run_smoke.sh` / `run_train.sh` | 云端试跑/正式训练包装，默认计划，追加`--execute`执行 |
 | `scripts/cloud/check_smoke.sh` | 试跑权重重新加载，离线预测一帧 |
 | `scripts/cloud/verify_bundle.py` | 在解压的云端包内验证逐文件校验和 |
+| `scripts/extend_lerobot_dataset.py` | `extend-dataset`直接脚本入口；默认只预检，`--execute`后写入 |
 | `robotarm.modeling.quality_filter` | `python -m ... --dataset-root ... --derive-from ...`，迁移同源审查结果 |
 | `robotarm.modeling.reports.best_practice_figures` | 从已有JSON重画台账PNG/SVG，不加载模型 |
 | `scripts/analyze_pi0_lora.py` / `compare_pi0_denoising.py` / `analyze_act_resume.py` | 旧兼容壳，优先用第7/8节统一报告命令 |
@@ -1502,16 +1825,22 @@ python scripts/xr_monitor.py --yaw 0 --mirror lr --no-plot
 python -m robotarm.modeling.reports.best_practice_figures
 ```
 
-云端打包器**当前固定LF180数据集和pi0_base**，不是任意数据集打包器；不要以为改输出名就换了训练数据。
-替换下面tokenizer缓存仓库目录（其中应有`refs/`、`snapshots/`），使用不存在的新输出名：
+云端打包器默认选择LF180；若要训练其他数据，必须显式传`--dataset-root`，只改输出包名不会切换数据。
+`--run-prefix`同时设置试跑、正式训练与监控输出名。基础权重仍为本地`pi0_base`。
+例如将原始122条抓杯数据的**已裁剪导出**（115条）打包；替换tokenizer缓存仓库目录
+（其中应有`refs/`、`snapshots/`），使用不存在的新输出名：
 
 ```bash
 python scripts/build_pi0_cloud_bundle.py \
-  --bundle-dir artifacts/cloud_exports/RobotArm_pi0_lora_cloud_new_v1 \
+  --dataset-root data/lerobot/piper_pick_cup_20261019_direct_122eps_trimmed_20261022 \
+  --run-prefix pi0_lora_cup122_trimmed \
+  --batch-size 4 \
+  --bundle-dir artifacts/cloud_exports/RobotArm_pi0_lora_cloud_cup122_trimmed_bs4_20261024 \
   --tokenizer-repo /PATH/TO/models--google--paligemma-3b-pt-224
 ```
 
-会创建独立目录、`.tar.gz`和`.sha256`，占用较多磁盘；训练配置及权重迁回说明见[云端手册](#85-云端包上传校验与启动)。
+会创建独立目录、`.tar.gz`和`.sha256`，占用较多磁盘。每个包根目录的`CLOUD_README.md`
+记录该包实际数据集、启动与监控命令；训练配置及权重迁回说明见[云端手册](#85-云端包上传校验与启动)。
 旧日期压缩包是静态快照，不会自动包含今天修改的代码。
 
 ## 13. 常见问题
@@ -1527,7 +1856,7 @@ python scripts/build_pi0_cloud_bundle.py \
 | 合并/转换输出已存在 | 改新输出名或使用已有结果；`--overwrite`可能删除结果，不是“继续” |
 | 数据仍是raw无法训练 | 先运行第5.2节转换，训练输入应有meta/info.json、data、videos |
 | 转换后数量与目录名不一致 | 看meta/info.json，complete/质量筛选可能改变数量，不按名字推断 |
-| Pi0需要run shadow first | 先真实shadow检查；实验执行还需专用开关及可能的审批，不只补一个标志就算验证 |
+| Pi0 shadow | 可选的延迟、队列和动作分析模式；真机执行不依赖shadow审批，但仍需`--execute --experimental-pi0-execute` |
 | clamp/raw gap/bound/underflow触发 | 查看本次JSONL、预测/反馈/限幅/时间戳，不盲目放宽门控 |
 | 配置改了却没生效 | 重启进程，检查CLI是否覆盖YAML、policies是否覆盖通用值，看启动日志 |
 | 报告能打开但图片/数据缺失 | artifact可能没迁移；保存HTML和JSON/CSV及引用资源，台账图在docs/best_practice_assets |

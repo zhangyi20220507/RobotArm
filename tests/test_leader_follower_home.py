@@ -1,5 +1,6 @@
 """Offline episode-to-home integration checks; all arms and recorders are mocks."""
 import math
+import threading
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
@@ -43,11 +44,14 @@ class LeaderFollowerHomeTests(unittest.TestCase):
         fg, lg = Mock(), Mock()
         ordered = Mock()
         with patch.object(lf, 'home_leader_native', return_value=[0.0] * 6) as native, patch.object(
+            lf, 'restore_and_verify_native_home', return_value=[0.0] * 6
+        ) as restore, patch.object(
             lf, 'exit_leader_drag_mode'
         ) as hold, patch.object(lf, 'close_gripper_slowly') as close, patch.object(
             lf, 'home_one_arm'
         ) as follower_home:
             ordered.attach_mock(native, 'native')
+            ordered.attach_mock(restore, 'restore')
             ordered.attach_mock(hold, 'hold')
             ordered.attach_mock(close, 'close')
             ordered.attach_mock(follower_home, 'follower')
@@ -58,7 +62,7 @@ class LeaderFollowerHomeTests(unittest.TestCase):
             )
         self.assertEqual(result, [0.0] * 6)
         self.assertEqual([call[0] for call in ordered.mock_calls],
-                         ['native', 'hold', 'close', 'follower'])
+                         ['native', 'restore', 'hold', 'close', 'follower'])
         leader.electronic_emergency_stop.assert_not_called()
         follower.electronic_emergency_stop.assert_not_called()
 
@@ -81,6 +85,161 @@ class LeaderFollowerHomeTests(unittest.TestCase):
         follower_home.assert_not_called()
         self.assertTrue(any('electronic emergency stop sent to can1' in str(call)
                             for call in output.call_args_list))
+
+    def test_silent_native_home_restores_and_verifies_before_follower(self):
+        follower, leader = Mock(), Mock()
+        ordered = Mock()
+
+        def silent(*_args, **kwargs):
+            kwargs['on_command_start']()
+            raise lf.NativeHomeFeedbackSilent('no fresh position feedback')
+
+        with patch.object(lf, 'home_leader_native', side_effect=silent) as native, patch.object(
+            lf, 'restore_and_verify_native_home', return_value=[0.0] * 6
+        ) as restore, patch.object(
+            lf, 'exit_leader_drag_mode'
+        ) as hold, patch.object(lf, 'close_gripper_slowly') as close, patch.object(
+            lf, 'home_one_arm'
+        ) as follower_home, patch('builtins.print'):
+            ordered.attach_mock(native, 'native')
+            ordered.attach_mock(restore, 'restore')
+            ordered.attach_mock(hold, 'hold')
+            ordered.attach_mock(close, 'close')
+            ordered.attach_mock(follower_home, 'follower')
+            result = lf.home_both_sequentially(
+                follower, {}, 'can0', leader, {}, 'can1',
+                Mock(), Mock(), 1.0, 10.0, 60, lambda:False,
+                [0.2] * 6, 0.02,
+            )
+
+        self.assertEqual(result, [0.0] * 6)
+        self.assertEqual(
+            [call[0] for call in ordered.mock_calls],
+            ['native', 'restore', 'hold', 'close', 'follower'],
+        )
+        leader.electronic_emergency_stop.assert_not_called()
+        follower.electronic_emergency_stop.assert_not_called()
+
+    def test_partial_silent_native_home_finishes_leader_with_move_j(self):
+        follower, leader = Mock(), Mock()
+
+        def silent(*_args, **kwargs):
+            kwargs['on_command_start']()
+            raise lf.NativeHomeFeedbackSilent('silent native home')
+
+        def move_j_home(robot, *_args, **_kwargs):
+            return [0.0] * 6
+
+        with patch.object(lf, 'home_leader_native', side_effect=silent), patch.object(
+            lf, 'restore_and_verify_native_home', return_value=[0.1] * 6
+        ) as restore, patch.object(
+            lf, 'home_one_arm', side_effect=move_j_home
+        ) as move_j, patch.object(lf, 'exit_leader_drag_mode'), patch.object(
+            lf, 'close_gripper_slowly'
+        ), patch('builtins.print'):
+            result = lf.home_both_sequentially(
+                follower, {}, 'can0', leader, {}, 'can1',
+                Mock(), Mock(), 1.0, 10.0, 60, lambda: False,
+                [0.2] * 6, 0.02,
+            )
+
+        self.assertEqual(result, [0.0] * 6)
+        self.assertTrue(restore.call_args.kwargs['allow_nonzero'])
+        self.assertEqual(move_j.call_count, 2)
+        self.assertIs(move_j.call_args_list[0].args[0], leader)
+        self.assertIsNone(move_j.call_args_list[0].args[3])
+        self.assertIs(move_j.call_args_list[1].args[0], follower)
+
+    def test_stalled_leader_gripper_does_not_invalidate_joint_home(self):
+        follower, leader = Mock(), Mock()
+        leader_gripper = Mock()
+        leader_gripper.get_gripper_status.return_value = SimpleNamespace(
+            msg=SimpleNamespace(mode='width', value=0.02),
+            timestamp=1000.0,
+        )
+        with patch.object(lf, 'home_leader_native', return_value=[0.0] * 6), patch.object(
+            lf, 'restore_and_verify_native_home', return_value=[0.0] * 6
+        ), patch.object(lf, 'exit_leader_drag_mode'), patch.object(
+            lf, 'close_gripper_slowly',
+            side_effect=lf.LeaderGripperHomeIncomplete('stalled'),
+        ), patch.object(
+            lf, 'home_one_arm', return_value=[0.0] * 6
+        ) as follower_home, patch.object(
+            lf.time, 'time', return_value=1000.0
+        ), patch('builtins.print'):
+            result = lf.home_both_sequentially(
+                follower, {}, 'can0', leader, {}, 'can1',
+                Mock(), leader_gripper, 1.0, 10.0, 60, lambda: False,
+                [0.2] * 6, 0.02,
+            )
+
+        self.assertEqual(result, [0.0] * 6)
+        follower_home.assert_called_once()
+        leader.electronic_emergency_stop.assert_not_called()
+        follower.electronic_emergency_stop.assert_not_called()
+        leader_gripper.move_gripper_m.assert_called_with(0.02, 1.0)
+
+    def test_parallel_home_starts_both_arms_before_either_completes(self):
+        follower, leader = Mock(), Mock()
+        leader_started = threading.Event()
+        follower_started = threading.Event()
+
+        def leader_home(*_args, **_kwargs):
+            leader_started.set()
+            self.assertTrue(follower_started.wait(1.0))
+            return [0.0] * 6
+
+        def follower_home(*_args, **_kwargs):
+            follower_started.set()
+            self.assertTrue(leader_started.wait(1.0))
+
+        with patch.object(lf, 'home_leader_native', side_effect=leader_home), patch.object(
+            lf, 'restore_and_verify_native_home', return_value=[0.0] * 6
+        ), patch.object(lf, 'exit_leader_drag_mode'), patch.object(
+            lf, 'close_gripper_slowly'
+        ), patch.object(lf, 'home_one_arm', side_effect=follower_home):
+            result = lf.home_both_in_parallel(
+                follower, {}, 'can0', leader, {}, 'can1',
+                Mock(), Mock(), 1.0, 10.0, 60, lambda: False,
+                [0.2] * 6, 0.02,
+            )
+
+        self.assertEqual(result, [0.0] * 6)
+        leader.electronic_emergency_stop.assert_not_called()
+        follower.electronic_emergency_stop.assert_not_called()
+
+    def test_parallel_home_failure_estops_both_arms(self):
+        follower, leader = Mock(), Mock()
+        follower_started = threading.Event()
+        on_estop = Mock()
+
+        def leader_home(*_args, **_kwargs):
+            self.assertTrue(follower_started.wait(1.0))
+            raise RuntimeError('leader fault')
+
+        def follower_home(*args, **_kwargs):
+            follower_started.set()
+            stop_requested = args[-1]
+            deadline = threading.Event()
+            for _ in range(1000):
+                if stop_requested():
+                    return
+                deadline.wait(0.001)
+            self.fail('parallel peer cancellation was not propagated')
+
+        with patch.object(lf, 'home_leader_native', side_effect=leader_home), patch.object(
+            lf, 'home_one_arm', side_effect=follower_home
+        ), patch('builtins.print'):
+            with self.assertRaisesRegex(RuntimeError, 'leader fault'):
+                lf.home_both_in_parallel(
+                    follower, {}, 'can0', leader, {}, 'can1',
+                    Mock(), Mock(), 1.0, 10.0, 60, lambda: False,
+                    [0.2] * 6, 0.02, on_estop=on_estop,
+                )
+
+        on_estop.assert_called_once()
+        leader.electronic_emergency_stop.assert_called_once()
+        follower.electronic_emergency_stop.assert_called_once()
 
     def test_leader_gripper_closes_at_bounded_speed_after_native_home(self):
         clock = FakeClock()
@@ -201,6 +360,59 @@ class LeaderFollowerHomeTests(unittest.TestCase):
                             for call in output.call_args_list))
         robot.move_leader_to_home.assert_called_once()
 
+    def test_restore_after_silent_home_requires_fresh_verified_zero_feedback(self):
+        clock = FakeClock()
+        config = {'joint_limits': {f'joint{i}': [-3.0, 3.0] for i in range(1, 7)}}
+        robot = Mock()
+        robot._parser = leader_pair_frames([0.2] * 6, clock.now - 10.0)
+        robot.get_joint_angles.return_value = SimpleNamespace(
+            msg=[0.2] * 6, timestamp=clock.now - 10.0,
+        )
+
+        def restore_feedback():
+            stamp = clock.now + 0.01
+            robot._parser = leader_pair_frames([0.0] * 6, stamp)
+            robot.get_joint_angles.return_value = SimpleNamespace(
+                msg=[0.0] * 6, timestamp=stamp,
+            )
+
+        robot.set_follower_mode.side_effect = restore_feedback
+        with patch.object(lf.time, 'monotonic', clock.time), patch.object(
+            lf.time, 'time', clock.time
+        ), patch.object(lf.time, 'sleep', clock.sleep), patch.object(
+            lf.base, 'ensure_arm_status_normal'
+        ), patch('builtins.print'):
+            result = lf.restore_and_verify_native_home(
+                robot, config, 'can1', 20.0, lambda:False
+            )
+
+        self.assertEqual(result, [0.0] * 6)
+        robot.restore_leader_drag_mode.assert_called_once_with()
+        robot.set_follower_mode.assert_called_once_with()
+
+    def test_restore_after_silent_home_rejects_nonzero_feedback(self):
+        clock = FakeClock()
+        config = {'joint_limits': {f'joint{i}': [-3.0, 3.0] for i in range(1, 7)}}
+        robot = Mock()
+
+        def restore_feedback():
+            stamp = clock.now + 0.01
+            robot._parser = leader_pair_frames([0.1] * 6, stamp)
+            robot.get_joint_angles.return_value = SimpleNamespace(
+                msg=[0.1] * 6, timestamp=stamp,
+            )
+
+        robot.set_follower_mode.side_effect = restore_feedback
+        with patch.object(lf.time, 'monotonic', clock.time), patch.object(
+            lf.time, 'time', clock.time
+        ), patch.object(lf.time, 'sleep', clock.sleep), patch.object(
+            lf.base, 'ensure_arm_status_normal'
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'verification failed'):
+                lf.restore_and_verify_native_home(
+                    robot, config, 'can1', 20.0, lambda:False
+                )
+
     def test_one_motor_zero_frame_then_feedback_stops_cannot_claim_home(self):
         clock = FakeClock()
         config = {'joint_limits': {f'joint{i}': [-3.0, 3.0] for i in range(1, 7)}}
@@ -256,6 +468,7 @@ class LeaderFollowerHomeTests(unittest.TestCase):
                 lf.home_leader_native(
                     robot, config, 'can1', [0.2]*6, 20.0, lambda:False
                 )
+        self.assertLess(clock.now - 1000.0, 4.0)
 
     def test_native_home_does_not_accept_precommand_cached_zero(self):
         clock = FakeClock()
@@ -302,7 +515,8 @@ class LeaderFollowerHomeTests(unittest.TestCase):
         on_estop.assert_not_called()
         self.assertTrue(any('no E-stop sent' in str(call) for call in output.call_args_list))
 
-    def run_keys(self, keys, *, control_only=False, leader_start=None):
+    def run_keys(self, keys, *, control_only=False, leader_start=None,
+                 parallel_home=False):
         leader,follower = Mock(),Mock()
         leader_gripper,follower_gripper = Mock(),Mock()
         leader._parser = None; leader._ctx = None; follower._ctx = None
@@ -344,6 +558,7 @@ class LeaderFollowerHomeTests(unittest.TestCase):
             'enter_follower_js':Mock(),
             'exit_leader_drag_mode':Mock(),
             'home_both_sequentially':Mock(return_value=[0.0]*6),
+            'home_both_in_parallel':Mock(return_value=[0.0]*6),
             'RawEpisodeRecorder':Mock(return_value=recorder),
             'time.monotonic':Mock(side_effect=(i*.005 for i in range(10000))),
             'time.sleep':Mock(),
@@ -358,6 +573,8 @@ class LeaderFollowerHomeTests(unittest.TestCase):
                 stack.enter_context(patch(prefix+name,replacement))
             output=stack.enter_context(patch('builtins.print'))
             arguments = ['--execute', '--allow-enabled-start']
+            if parallel_home:
+                arguments.append('--parallel-home')
             if control_only:
                 arguments.append('--control-only')
             else:
@@ -380,7 +597,10 @@ class LeaderFollowerHomeTests(unittest.TestCase):
         )
         self.assertEqual(replacements['home_both_sequentially'].call_args.args[-2], [0.0]*6)
         self.assertEqual(replacements['home_both_sequentially'].call_args.args[-1], .02)
-        self.assertTrue(any('both arms homed' in str(call) for call in output.call_args_list))
+        self.assertEqual(replacements['enter_follower_js'].call_count, 2)
+        self.assertEqual(leader.set_leader_mode.call_count, 2)
+        self.assertTrue(any('following mode restored automatically' in str(call)
+                            for call in output.call_args_list))
 
     def test_h_is_available_immediately_and_after_save(self):
         for control_only in (False, True):
@@ -390,6 +610,7 @@ class LeaderFollowerHomeTests(unittest.TestCase):
             self.assertEqual(result, 0)
             leader.set_leader_mode.assert_not_called()
             replacements['home_both_sequentially'].assert_called_once()
+            replacements['enter_follower_js'].assert_not_called()
             if control_only:
                 replacements['RawEpisodeRecorder'].assert_not_called()
             else:
@@ -409,14 +630,29 @@ class LeaderFollowerHomeTests(unittest.TestCase):
         self.assertEqual(replacements['home_both_sequentially'].call_count, 2)
 
     def test_h_after_drag_before_recording_uses_native_home(self):
-        result, _, _, recorder, replacements, _, _ = self.run_keys(['l', 'h', 'q'])
+        result, _, _, recorder, replacements, _, output = self.run_keys(['l', 'h', 'q'])
         self.assertEqual(result, 0)
         recorder.start_episode.assert_not_called()
         replacements['home_both_sequentially'].assert_called_once()
+        replacements['enter_follower_js'].assert_not_called()
+        self.assertTrue(any('following remains paused' in str(call)
+                            for call in output.call_args_list))
+
+    def test_parallel_home_option_selects_concurrent_helper(self):
+        result, _, _, _, replacements, _, output = self.run_keys(
+            ['h', 'q'], parallel_home=True
+        )
+        self.assertEqual(result, 0)
+        replacements['home_both_in_parallel'].assert_called_once()
+        replacements['home_both_sequentially'].assert_not_called()
+        self.assertTrue(any('PARALLEL HOME' in str(call)
+                            for call in output.call_args_list))
 
     def test_follower_failure_estops_only_follower_after_leader_hold(self):
         follower, leader = Mock(), Mock()
         with patch.object(lf, 'home_leader_native', return_value=[0.0]*6), patch.object(
+            lf, 'restore_and_verify_native_home', return_value=[0.0]*6
+        ), patch.object(
             lf, 'exit_leader_drag_mode'
         ), patch.object(lf, 'close_gripper_slowly'), patch.object(
             lf, 'home_one_arm', side_effect=RuntimeError('follower fault')
@@ -475,6 +711,8 @@ class LeaderFollowerHomeTests(unittest.TestCase):
         args=lf.make_parser().parse_args([])
         self.assertEqual(args.home_timeout,60)
         self.assertEqual(args.home_gripper_speed_mm_s,10)
+        self.assertFalse(args.parallel_home)
+        self.assertTrue(lf.make_parser().parse_args(['--parallel-home']).parallel_home)
         args.home_timeout=math.nan
         with self.assertRaisesRegex(ValueError,'numeric arguments'):
             lf.validate_args(args)

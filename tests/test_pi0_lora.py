@@ -1,5 +1,6 @@
 """Cloud launch contracts: no model allocation, downloads or hardware."""
 import json
+from collections import Counter
 from pathlib import Path
 import tempfile
 import unittest
@@ -49,6 +50,15 @@ class Pi0LoraTests(unittest.TestCase):
         flags = build_plan(parse_args(self.argv + ["--smoke"]))["flags"]
         self.assertEqual((flags["steps"], flags["save_freq"], flags["eval_steps"]), (20, 20, 20))
         self.assertEqual(flags["num_workers"], 0)
+
+    def test_trimmed_export_uses_inherited_review_validation(self):
+        (self.dataset / "meta/trim_provenance.json").write_text("{}")
+        with patch("robotarm.modeling.pi0_lora.select_training_episodes",
+                   return_value=([0, 1], Counter({"keep": 2}))) as select:
+            plan = build_plan(parse_args(self.argv))
+        select.assert_called_once()
+        self.assertEqual(plan["selected_episodes"], [0, 1])
+        self.assertEqual(plan["quality_counts"], {"keep": 2})
 
     def test_dry_run_never_checks_gpu_or_launches(self):
         with patch("robotarm.modeling.pi0_lora.check_dependencies", side_effect=AssertionError), \

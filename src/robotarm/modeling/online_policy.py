@@ -19,8 +19,23 @@ from pathlib import Path
 from ..config import defaults, policy_defaults
 from ..core.camera.realsense import RoleCameras
 from ..core.robot import piper as base
-from ..paths import ARTIFACTS_ROOT, MODELING_CONFIGS_ROOT, TRAINING_LOG_ROOT, WORKSPACE_ROOT
+from ..paths import (
+    ARTIFACTS_ROOT,
+    MODELING_CONFIGS_ROOT,
+    PIPER_RAW_ROOT,
+    TRAINING_LOG_ROOT,
+    WORKSPACE_ROOT,
+)
+from ..record.recorder import RawEpisodeRecorder
+from ..record.schema import HG_DAGGER_SAMPLE_FIELDS
 from ..teleop import keyboard as keyboard_api
+from .hg_dagger import LeaderExpert
+from .policy_recording import PolicyRecordingManager
+
+
+ACT_STREAM_SPEED_PERCENT = 100  # Same controller setting as gamepad collection.
+ACT_RESET_RELEASE_WIDTH_M = 0.08
+ACT_RESET_GRIPPER_TIMEOUT_S = 8.0
 
 
 def workspace_path(value: str) -> Path:
@@ -142,6 +157,20 @@ def transition_is_safe(current, target, bounds):
     return True
 
 
+def inference_timing_messages(
+    inference_ms: float,
+    warning_ms: float,
+    stop_ms: float,
+) -> tuple[list[str], list[str]]:
+    """Classify a synchronous inference overrun as a warning or hard stop."""
+    detail = f"inference {inference_ms:.1f}ms"
+    if inference_ms > stop_ms:
+        return [], [f"{detail} > {stop_ms:.1f}ms"]
+    if inference_ms > warning_ms:
+        return [f"{detail} > warning threshold {warning_ms:.1f}ms"], []
+    return [], []
+
+
 def read_valid_joints(robot, robot_config, timeout):
     joints = [
         float(value) for value in base.wait_for_feedback(robot, timeout).msg
@@ -172,7 +201,7 @@ def wait_mode_feedback(robot, expected, timeout):
 
 def prepare_js_control(
     robot, robot_config, gripper, gripper_width, gripper_force, timeout,
-    expected_js_mode,
+    expected_js_mode, stream_speed_percent=None,
 ):
     """Enter Piper JS mode without exposing a stale/default joint target."""
     joints = read_valid_joints(robot, robot_config, timeout)
@@ -183,6 +212,10 @@ def prepare_js_control(
     base.enable_arm_and_gripper(
         robot, gripper, gripper_width, gripper_force, timeout
     )
+    if stream_speed_percent is not None:
+        # An enable broadcast can reset controller settings; restore the
+        # collection speed only after that broadcast has completed.
+        robot.set_speed_percent(stream_speed_percent)
     time.sleep(0.1)
     joints = read_valid_joints(robot, robot_config, timeout)
     robot.move_j(joints)
@@ -190,6 +223,35 @@ def prepare_js_control(
     robot.move_js(joints)
     wait_mode_feedback(robot, expected_js_mode, timeout)
     return joints
+
+
+def move_gripper_and_wait(
+    gripper, target_width, force, tolerance, timeout, feedback_timeout,
+    emergency_stop_requested=None, progress_callback=None,
+):
+    """Wait for an R-reset gripper release/close before moving to the next phase."""
+    if not math.isfinite(target_width) or target_width < 0:
+        raise RuntimeError("invalid gripper reset target")
+    if emergency_stop_requested is not None and emergency_stop_requested():
+        raise InterruptedError("electronic emergency stop requested during gripper reset")
+    gripper.move_gripper_m(target_width, force)
+    deadline = time.monotonic() + timeout
+    measured = None
+    while time.monotonic() < deadline:
+        if emergency_stop_requested is not None and emergency_stop_requested():
+            raise InterruptedError("electronic emergency stop requested during gripper reset")
+        measured = base.wait_gripper_width(gripper, min(feedback_timeout, 0.2))
+        if not math.isfinite(measured) or not -0.003 <= measured <= 0.153:
+            raise RuntimeError("invalid gripper feedback during reset")
+        if progress_callback is not None:
+            progress_callback(max(measured, 0.0), target_width)
+        if abs(measured - target_width) <= tolerance:
+            return max(measured, 0.0)
+        time.sleep(0.05)
+    raise TimeoutError(
+        f"gripper reset did not reach {target_width * 1000:.0f} mm "
+        f"within {timeout:.1f}s (feedback={measured})"
+    )
 
 
 def clamp_step(
@@ -258,6 +320,207 @@ def action_was_clamped(raw, safe, tolerance=1e-6):
     return bool(np.any(np.abs(np.asarray(raw) - np.asarray(safe)) > tolerance))
 
 
+def limit_joint_target_acceleration(
+    desired, previous_target, previous_velocity, max_acceleration, dt,
+    max_velocity,
+):
+    """Shape a 7D target with a trapezoidal joint velocity profile.
+
+    Only the six arm joints are shaped; the gripper keeps its independent
+    position/rate limiter. Inputs and outputs use radians and seconds.
+    """
+    import numpy as np
+
+    desired = np.asarray(desired, dtype=np.float64)
+    previous = np.asarray(previous_target, dtype=np.float64)
+    velocity = np.asarray(previous_velocity, dtype=np.float64)
+    if desired.shape != (7,) or previous.shape != (7,) or velocity.shape != (6,):
+        raise RuntimeError("joint acceleration limiter received an invalid shape")
+    if not (
+        np.isfinite(desired).all()
+        and np.isfinite(previous).all()
+        and np.isfinite(velocity).all()
+    ):
+        raise RuntimeError("joint acceleration limiter received a non-finite value")
+    if dt <= 0 or not math.isfinite(dt):
+        raise ValueError("joint acceleration limiter dt must be positive")
+    if max_acceleration <= 0:
+        return desired.copy(), (desired[:6] - previous[:6]) / dt
+    if max_velocity <= 0 or not math.isfinite(max_velocity):
+        raise ValueError("joint acceleration limiter max velocity must be positive")
+
+    displacement = desired[:6] - previous[:6]
+    direction = np.sign(displacement)
+    # Slow down early enough to stop at the requested position. The ordinary
+    # step limiter remains the final hard velocity/position safety boundary.
+    braking_speed = np.sqrt(2.0 * max_acceleration * np.abs(displacement))
+    requested_velocity = direction * np.minimum(max_velocity, braking_speed)
+    velocity_delta = max_acceleration * dt
+    next_velocity = np.clip(
+        requested_velocity, velocity - velocity_delta, velocity + velocity_delta
+    )
+    # If the exact one-tick landing velocity is reachable without breaking the
+    # acceleration/velocity limits, use it and settle exactly at the target.
+    landing_velocity = displacement / dt
+    can_land = (
+        np.abs(landing_velocity - velocity) <= velocity_delta
+    ) & (np.abs(landing_velocity) <= max_velocity)
+    next_velocity[can_land] = landing_velocity[can_land]
+    shaped = desired.copy()
+    shaped[:6] = previous[:6] + next_velocity * dt
+    return shaped, next_velocity
+
+
+def act_subgoal_errors(target, current):
+    """Return joint L2/max error in radians and gripper error in metres."""
+    import numpy as np
+
+    target = np.asarray(target, dtype=np.float64)
+    current = np.asarray(current, dtype=np.float64)
+    if target.shape != (7,) or current.shape != (7,):
+        raise RuntimeError("ACT subgoal/action state shape is not 7D")
+    if not np.isfinite(target).all() or not np.isfinite(current).all():
+        raise RuntimeError("ACT subgoal/action state contains a non-finite value")
+    joint_errors = np.abs(target[:6] - current[:6])
+    return (
+        float(np.linalg.norm(joint_errors)),
+        float(np.max(joint_errors)),
+        abs(float(target[6] - current[6])),
+    )
+
+
+def update_act_backpressure_progress(
+    target, current, previous_joint_error, previous_gripper_error,
+    no_progress_steps, min_joint_progress, min_gripper_progress,
+):
+    """Measure feedback progress while an ACT target remains hard-clamped."""
+    if no_progress_steps < 0:
+        raise ValueError("ACT subgoal no-progress steps cannot be negative")
+    for name, value in (
+        ("min_joint_progress", min_joint_progress),
+        ("min_gripper_progress", min_gripper_progress),
+    ):
+        if value < 0 or not math.isfinite(value):
+            raise ValueError(f"{name} must be finite and non-negative")
+
+    joint_error, max_joint_error, gripper_error = act_subgoal_errors(
+        target, current
+    )
+    joint_progress = (
+        None if previous_joint_error is None
+        else previous_joint_error - joint_error
+    )
+    gripper_progress = (
+        None if previous_gripper_error is None
+        else previous_gripper_error - gripper_error
+    )
+    progressed = (
+        previous_joint_error is None
+        or previous_gripper_error is None
+        or joint_progress >= min_joint_progress
+        or gripper_progress >= min_gripper_progress
+    )
+    next_no_progress_steps = 0 if progressed else no_progress_steps + 1
+    return {
+        "joint_error": joint_error,
+        "max_joint_error": max_joint_error,
+        "gripper_error": gripper_error,
+        "joint_progress": joint_progress,
+        "gripper_progress": gripper_progress,
+        "progressed": progressed,
+        "no_progress_steps": next_no_progress_steps,
+    }
+
+
+def latch_act_subgoal(current_subgoal, safe_target, should_latch):
+    """Keep an existing ACT subgoal fixed or latch a new safe target."""
+    import numpy as np
+
+    if current_subgoal is not None:
+        subgoal = np.asarray(current_subgoal, dtype=np.float64)
+        if subgoal.shape != (7,) or not np.isfinite(subgoal).all():
+            raise RuntimeError("ACT latched subgoal is invalid")
+        return subgoal, False
+    if not should_latch:
+        return None, False
+    subgoal = np.asarray(safe_target, dtype=np.float64)
+    if subgoal.shape != (7,) or not np.isfinite(subgoal).all():
+        raise RuntimeError("ACT safe subgoal is invalid")
+    return subgoal.copy(), True
+
+
+def update_act_backpressure_target(
+    current_subgoal, candidate_subgoal, tracking_clamped, raw_action_ok,
+):
+    """Latch only while the final safety limiter is actively applying pressure.
+
+    Releasing on ``not tracking_clamped`` deliberately does not require the
+    robot to settle at an exact point.  Piper JS can retain a small steady
+    position residual even though the requested action is safe to advance.
+    """
+    if current_subgoal is not None:
+        if not raw_action_ok or not tracking_clamped:
+            return None, False, True
+        retained, _ = latch_act_subgoal(current_subgoal, candidate_subgoal, True)
+        return retained, False, False
+    if tracking_clamped and raw_action_ok:
+        created, _ = latch_act_subgoal(None, candidate_subgoal, True)
+        return created, True, False
+    return None, False, False
+
+
+def bounded_act_subgoal(
+    desired, current, joint_bounds, joint_velocity, max_joint_lead,
+    max_gripper_lead, gripper_max, max_joint_acceleration,
+):
+    """Build one fixed local target with enough room for smooth braking.
+
+    The command itself remains bounded by ``max_joint_lead`` every tick.  The
+    fixed subgoal may be farther away by the current velocity's braking
+    distance so the acceleration limiter can stop at it without continually
+    moving the endpoint forward.
+    """
+    import numpy as np
+
+    desired = np.asarray(desired, dtype=np.float64)
+    current = np.asarray(current, dtype=np.float64)
+    velocity = np.asarray(joint_velocity, dtype=np.float64)
+    if desired.shape != (7,) or current.shape != (7,) or velocity.shape != (6,):
+        raise RuntimeError("ACT bounded subgoal received an invalid shape")
+    if len(joint_bounds) != 6:
+        raise RuntimeError("ACT bounded subgoal requires six joint bounds")
+    if not (
+        np.isfinite(desired).all()
+        and np.isfinite(current).all()
+        and np.isfinite(velocity).all()
+    ):
+        raise RuntimeError("ACT bounded subgoal received a non-finite value")
+    if max_joint_lead <= 0 or max_gripper_lead <= 0 or gripper_max <= 0:
+        raise ValueError("ACT bounded subgoal limits must be positive")
+    if max_joint_acceleration < 0 or not math.isfinite(max_joint_acceleration):
+        raise ValueError("ACT bounded subgoal acceleration must be non-negative")
+
+    braking_distance = (
+        np.square(velocity) / (2.0 * max_joint_acceleration)
+        if max_joint_acceleration > 0
+        else np.zeros(6, dtype=np.float64)
+    )
+    local_reach = max_joint_lead + braking_distance
+    joints = np.clip(
+        desired[:6], current[:6] - local_reach, current[:6] + local_reach
+    )
+    joints = np.asarray([
+        np.clip(value, low, high)
+        for value, (low, high) in zip(joints, joint_bounds)
+    ], dtype=np.float64)
+    gripper = float(np.clip(
+        desired[6],
+        max(0.0, current[6] - max_gripper_lead),
+        min(gripper_max, current[6] + max_gripper_lead),
+    ))
+    return np.asarray([*joints, gripper], dtype=np.float64)
+
+
 def act_tracking_action(raw, gripper_max, gripper_bound_tolerance):
     """Use legal gripper endpoints for tolerated prediction overshoot.
 
@@ -280,6 +543,7 @@ def act_action_within_envelope(
     raw, current, joint_bounds, gripper_max,
     max_raw_joint_gap, max_raw_gripper_gap,
     raw_gripper_bound_tolerance=0.0,
+    raw_joint_bound_tolerance=0.0,
 ):
     """Reject ACT targets outside hard bounds or the demonstrated gap envelope.
 
@@ -291,13 +555,52 @@ def act_action_within_envelope(
         raw, current, joint_bounds, gripper_max,
         max_raw_joint_gap, max_raw_gripper_gap,
         raw_gripper_bound_tolerance,
+        raw_joint_bound_tolerance,
     )
+
+
+def act_joint_gap_failure(raw, current, max_raw_joint_gap):
+    """Return the largest raw joint-gap violation, if the inputs are usable."""
+    import numpy as np
+
+    raw = np.asarray(raw, dtype=np.float64)
+    current = np.asarray(current, dtype=np.float64)
+    if (
+        raw.shape != (7,)
+        or current.shape != (7,)
+        or not np.isfinite(raw).all()
+        or not np.isfinite(current).all()
+    ):
+        return None
+    joint_gaps = np.abs(raw[:6] - current[:6])
+    largest_joint = int(np.argmax(joint_gaps))
+    if joint_gaps[largest_joint] <= max_raw_joint_gap:
+        return None
+    return (
+        f"raw joint gap J{largest_joint + 1}="
+        f"{math.degrees(joint_gaps[largest_joint]):.2f}deg > "
+        f"{math.degrees(max_raw_joint_gap):.2f}deg"
+    )
+
+
+def update_act_raw_gap_streak(failure, steps, max_steps):
+    """Count a severe ACT raw joint gap for warning telemetry."""
+    if max_steps < 1:
+        raise ValueError("max_steps must be positive")
+    next_steps = steps + 1 if failure is not None else 0
+    persistent_failure = None
+    if failure is not None and next_steps >= max_steps:
+        persistent_failure = (
+            failure + f"; persisted for {next_steps} consecutive ticks"
+        )
+    return next_steps, persistent_failure
 
 
 def act_action_envelope_failures(
     raw, current, joint_bounds, gripper_max,
     max_raw_joint_gap, max_raw_gripper_gap,
     raw_gripper_bound_tolerance=0.0,
+    raw_joint_bound_tolerance=0.0,
 ):
     """Return human-readable reasons an ACT target cannot be executed."""
     import numpy as np
@@ -311,13 +614,25 @@ def act_action_envelope_failures(
 
     reasons = []
     outside = []
+    if (
+        raw_joint_bound_tolerance < 0.0
+        or not math.isfinite(raw_joint_bound_tolerance)
+    ):
+        raise ValueError(
+            "raw joint bound tolerance must be finite and non-negative"
+        )
     for index, (value, (low, high)) in enumerate(
         zip(raw[:6], joint_bounds), start=1
     ):
-        if not low <= value <= high:
+        if not (
+            low - raw_joint_bound_tolerance
+            <= value
+            <= high + raw_joint_bound_tolerance
+        ):
             outside.append(
                 f"J{index}={math.degrees(value):.2f}deg "
-                f"outside [{math.degrees(low):.2f}, {math.degrees(high):.2f}]deg"
+                f"outside [{math.degrees(low):.2f}, {math.degrees(high):.2f}]deg "
+                f"beyond {math.degrees(raw_joint_bound_tolerance):.2f}deg tolerance"
             )
     if outside:
         reasons.append("raw joint bound: " + ", ".join(outside))
@@ -335,14 +650,11 @@ def act_action_envelope_failures(
             f"{gripper_high * 1000.0:.2f}]mm"
         )
 
-    joint_gaps = np.abs(raw[:6] - current[:6])
-    largest_joint = int(np.argmax(joint_gaps))
-    if joint_gaps[largest_joint] > max_raw_joint_gap:
-        reasons.append(
-            f"raw joint gap J{largest_joint + 1}="
-            f"{math.degrees(joint_gaps[largest_joint]):.2f}deg > "
-            f"{math.degrees(max_raw_joint_gap):.2f}deg"
-        )
+    joint_gap_failure = act_joint_gap_failure(
+        raw, current, max_raw_joint_gap
+    )
+    if joint_gap_failure is not None:
+        reasons.append(joint_gap_failure)
     gripper_gap = abs(float(raw[6] - current[6]))
     if gripper_gap > max_raw_gripper_gap:
         reasons.append(
@@ -496,12 +808,15 @@ class AsyncPlanner:
 
 
 class KeyboardIntentTracker:
-    """Convert keyboard events into X-toggle, Y-hold, and Alt+S stop intents."""
+    """Convert keyboard events into X, Y, R, V and emergency-stop intents."""
 
     def __init__(self, hold_seconds, repeat_gap=0.75):
         self.hold_seconds = hold_seconds
         self.repeat_gap = repeat_gap
         self.last_x = None
+        self.last_r = None
+        self.last_v = None
+        self.last_i = None
         self.y_started = None
         self.last_y = None
         self.y_event_count = 0
@@ -509,6 +824,8 @@ class KeyboardIntentTracker:
 
     def update(self, events, now):
         x_toggle = False
+        reset_home = False
+        recording_toggle = False
         emergency_stop = False
         for key, observed_at in events:
             if key == "x":
@@ -518,6 +835,20 @@ class KeyboardIntentTracker:
                 ):
                     x_toggle = True
                 self.last_x = observed_at
+            elif key == "r":
+                if (
+                    self.last_r is None
+                    or observed_at - self.last_r > self.repeat_gap
+                ):
+                    reset_home = True
+                self.last_r = observed_at
+            elif key == "v":
+                if (
+                    self.last_v is None
+                    or observed_at - self.last_v > self.repeat_gap
+                ):
+                    recording_toggle = True
+                self.last_v = observed_at
             elif key == "y":
                 if (
                     self.last_y is None
@@ -541,14 +872,41 @@ class KeyboardIntentTracker:
         )
         if y_hold:
             self.y_fired = True
-        return x_toggle, y_hold, emergency_stop
+        return x_toggle, y_hold, reset_home, emergency_stop, recording_toggle
+
+    def intervention_toggle(self, events):
+        """Debounce the HG-DAgger I gate without changing update()'s API."""
+        toggle = False
+        for key, observed_at in events:
+            if key != "i":
+                continue
+            if self.last_i is None or observed_at - self.last_i > self.repeat_gap:
+                toggle = True
+            self.last_i = observed_at
+        return toggle
+
+    def after_home(self, now):
+        """Require a fresh X press; suppress R key repeats after homing."""
+        self.last_x = None
+        self.last_r = now
+        self.last_i = None
+        self.y_started = None
+        self.last_y = None
+        self.y_event_count = 0
+        self.y_fired = False
 
 
 def home_arm_to_zero(
     robot, robot_config, gripper, gripper_width, gripper_force,
-    feedback_timeout, speed_percent, timeout,
+    feedback_timeout, speed_percent, timeout, emergency_stop_requested=None,
+    progress_callback=None,
 ):
-    """Move all six joints to zero with MOVE_J and verified feedback."""
+    """Move all six joints to zero, then close the gripper with verified feedback."""
+    def check_emergency_stop():
+        if emergency_stop_requested is not None and emergency_stop_requested():
+            raise InterruptedError("electronic emergency stop requested during homing")
+
+    check_emergency_stop()
     target = [0.0] * 6
     bounds = deployment_joint_bounds(robot_config)
     if not within_joint_bounds(target, bounds):
@@ -561,6 +919,7 @@ def home_arm_to_zero(
     base.enable_arm_and_gripper(
         robot, gripper, gripper_width, gripper_force, feedback_timeout
     )
+    check_emergency_stop()
     # The all-joint enable broadcast is a controller state change that can
     # discard a previously sent motion mode. Speed and J mode must be
     # re-asserted AFTER enabling (same order as the SDK demo and as
@@ -573,6 +932,7 @@ def home_arm_to_zero(
     joints = read_valid_joints(robot, robot_config, feedback_timeout)
     robot.move_j(joints)
     gripper.move_gripper_m(gripper_width, gripper_force)
+    check_emergency_stop()
     robot.move_j(target)
 
     started = time.monotonic()
@@ -582,15 +942,22 @@ def home_arm_to_zero(
     no_motion_deadline = None
     print(
         f"Homing: MOVE_J to zero at {speed_percent}% speed; "
-        "gripper holds its current width.",
+        "gripper holds its width during travel, then closes at home.",
         flush=True,
     )
     while time.monotonic() < deadline:
+        check_emergency_stop()
         joints = read_valid_joints(
             robot, robot_config, min(feedback_timeout, 0.2)
         )
         status = robot.get_arm_status()
         max_error = max(abs(value) for value in joints)
+        if progress_callback is not None:
+            progress_callback(
+                [*joints, gripper_width],
+                [*target, gripper_width],
+                "homing",
+            )
         if status is not None:
             code = base.value_as_int(status.msg.arm_status)
             err = getattr(status.msg, "err_status", None)
@@ -624,7 +991,22 @@ def home_arm_to_zero(
             and max_error <= tolerance
         ):
             robot.move_j(joints)
-            print("\nHoming complete; arm is at zero.")
+            print("\nArm is at zero; closing gripper.", flush=True)
+            move_gripper_and_wait(
+                gripper, 0.0, gripper_force, 0.003,
+                ACT_RESET_GRIPPER_TIMEOUT_S, feedback_timeout,
+                emergency_stop_requested,
+                (
+                    None
+                    if progress_callback is None
+                    else lambda measured, commanded: progress_callback(
+                        [*joints, measured],
+                        [*joints, commanded],
+                        "home_gripper_close",
+                    )
+                ),
+            )
+            print("Homing complete; arm and gripper are at zero.", flush=True)
             return joints
         if (
             time.monotonic() >= no_motion_deadline
@@ -641,6 +1023,45 @@ def home_arm_to_zero(
         f"homing did not complete within {timeout:.1f} seconds "
         f"(joint_error={math.degrees(max_error):.2f} deg)"
     )
+
+
+def reset_act_to_home(
+    robot, robot_config, gripper, args, expected_js_mode,
+    emergency_stop_requested, progress_callback=None,
+):
+    """Release any object at the current pose, home, and restore ACT's start grip."""
+    if emergency_stop_requested():
+        raise InterruptedError("electronic emergency stop requested during ACT reset")
+    joints = read_valid_joints(robot, robot_config, args.feedback_timeout)
+    robot.move_js(joints)  # Hold the present arm pose while releasing the object.
+    release_width = min(args.gripper_max_mm / 1000.0, ACT_RESET_RELEASE_WIDTH_M)
+    print(f"R reset: holding arm; opening gripper to {release_width * 1000:.0f} mm before homing.", flush=True)
+    open_width = move_gripper_and_wait(
+        gripper, release_width, args.gripper_force, 0.005,
+        ACT_RESET_GRIPPER_TIMEOUT_S, args.feedback_timeout,
+        emergency_stop_requested,
+        (
+            None
+            if progress_callback is None
+            else lambda measured, commanded: progress_callback(
+                [*joints, measured],
+                [*joints, commanded],
+                "reset_gripper_open",
+            )
+        ),
+    )
+    home_arm_to_zero(
+        robot, robot_config, gripper, open_width, args.gripper_force,
+        args.feedback_timeout, args.home_speed_percent, args.home_timeout,
+        emergency_stop_requested,
+        progress_callback,
+    )
+    closed_width = max(0.0, base.wait_gripper_width(gripper, args.feedback_timeout))
+    prepare_js_control(
+        robot, robot_config, gripper, closed_width, args.gripper_force,
+        args.feedback_timeout, expected_js_mode, ACT_STREAM_SPEED_PERCENT,
+    )
+    return closed_width
 
 
 def policy_overrides(policy_type: str) -> dict:
@@ -679,6 +1100,11 @@ def validate_execution_approval(
     path: Path, digest: str, policy_type: str, runtime: dict
 ) -> bool:
     """Validate execution approval when required; return whether it was checked."""
+    # Pi0 shadow remains available for latency/action analysis, but it is not
+    # a prerequisite for execution.  Motion still requires the explicit Pi0
+    # experimental switch and all runtime watchdogs remain active.
+    if policy_type == "pi0":
+        return False
     if not approval_required():
         return False
     if not path.is_file():
@@ -745,6 +1171,62 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--wrist-camera-serial", default=cfg["wrist-camera-serial"],
                         help="wrist camera RealSense serial (used when checkpoint needs it)")
     parser.add_argument("--camera-fps", type=int, default=cfg["camera-fps"])
+    parser.add_argument(
+        "--recording-root",
+        type=Path,
+        default=ARTIFACTS_ROOT / "policy_recordings",
+        help=(
+            "V-key recording output root; the session directory is created "
+            "only when recording starts"
+        ),
+    )
+    parser.add_argument(
+        "--recording-fps",
+        type=int,
+        default=None,
+        help="recording FPS; defaults to min(control rate, camera FPS)",
+    )
+    parser.add_argument(
+        "--recording-encoder-queue-size",
+        type=int,
+        default=120,
+        help="queued frames per asynchronous video encoder",
+    )
+    parser.add_argument(
+        "--hg-dagger",
+        action="store_true",
+        help=(
+            "enable human-gated DAgger: I takes over with a Piper leader arm, "
+            "I again saves the expert recovery and returns control to the policy"
+        ),
+    )
+    parser.add_argument("--hg-leader-interface", default="socketcan")
+    parser.add_argument("--hg-leader-channel", default="can_leader1")
+    parser.add_argument(
+        "--hg-leader-init-timeout", type=float, default=30.0,
+        help="seconds to wait for leader feedback/drag input",
+    )
+    parser.add_argument(
+        "--hg-dataset-root", type=Path, default=PIPER_RAW_ROOT,
+        help="piper_raw HG-DAgger session root; created on first intervention",
+    )
+    parser.add_argument(
+        "--hg-task", default=None,
+        help="task label written to HG-DAgger episodes (required for ACT)",
+    )
+    parser.add_argument("--hg-setup-id", default="online_policy_hg_dagger_v1")
+    parser.add_argument("--hg-setup-note", default="")
+    parser.add_argument("--hg-record-fps", type=int, default=None)
+    parser.add_argument(
+        "--hg-joint-signs", type=int, nargs=6,
+        default=[1, 1, 1, 1, 1, 1],
+        metavar=("J1", "J2", "J3", "J4", "J5", "J6"),
+    )
+    parser.add_argument(
+        "--hg-joint-offsets-deg", type=float, nargs=6,
+        default=[0.0] * 6,
+        metavar=("J1", "J2", "J3", "J4", "J5", "J6"),
+    )
     parser.add_argument("--device", choices=("cuda", "cpu"), default=cfg["device"])
     parser.add_argument("--rate", type=float, default=cfg["rate"])
     parser.add_argument(
@@ -755,6 +1237,13 @@ def parse_args(argv: list[str] | None = None):
         ),
     )
     parser.add_argument("--max-inference-ms", type=float, default=cfg["max-inference-ms"])
+    parser.add_argument(
+        "--warn-inference-ms", type=float, default=cfg["warn-inference-ms"],
+        help=(
+            "soft synchronous-inference threshold in ms; exceeding it is "
+            "logged and execution continues until --max-inference-ms"
+        ),
+    )
     parser.add_argument(
         "--max-chunk-inference-ms", type=float, default=None,
         help=(
@@ -817,18 +1306,57 @@ def parse_args(argv: list[str] | None = None):
         ),
     )
     parser.add_argument("--max-joint-step-deg", type=float, default=cfg["max-joint-step-deg"])
+    parser.add_argument(
+        "--max-joint-acceleration-deg-s2", type=float,
+        default=cfg["max-joint-acceleration-deg-s2"],
+        help=(
+            "joint command acceleration limit; 0 disables it "
+            "(ACT default: 200 deg/s^2)"
+        ),
+    )
     parser.add_argument("--max-gripper-step-mm", type=float, default=cfg["max-gripper-step-mm"])
     parser.add_argument("--max-joint-lead-deg", type=float, default=cfg["max-joint-lead-deg"])
     parser.add_argument("--max-gripper-lead-mm", type=float, default=cfg["max-gripper-lead-mm"])
     parser.add_argument(
+        "--warn-act-raw-joint-gap-deg", type=float,
+        default=cfg["warn-act-raw-joint-gap-deg"],
+        help=(
+            "ACT raw joint-gap warning threshold; the safely limited target "
+            "continues to execute"
+        ),
+    )
+    parser.add_argument(
         "--max-act-raw-joint-gap-deg", type=float,
         default=cfg["max-act-raw-joint-gap-deg"],
-        help="ACT raw target-to-feedback joint gap watchdog",
+        help=(
+            "ACT raw target-to-feedback severe warning threshold; ACT uses "
+            "a frozen policy-clock backpressure target instead of stopping "
+            "on this telemetry alone"
+        ),
+    )
+    parser.add_argument(
+        "--max-act-raw-gap-consecutive-steps", type=int,
+        default=cfg["max-act-raw-gap-consecutive-steps"],
+        help=(
+            "consecutive ticks above the severe ACT raw joint-gap threshold "
+            "reported as telemetry (does not itself stop fixed-subgoal tracking)"
+        ),
     )
     parser.add_argument(
         "--max-act-raw-gripper-gap-mm", type=float,
         default=cfg["max-act-raw-gripper-gap-mm"],
-        help="ACT raw target-to-feedback gripper gap watchdog",
+        help=(
+            "ACT raw gripper-gap warning threshold; Pi0 retains it as a "
+            "raw-action watchdog"
+        ),
+    )
+    parser.add_argument(
+        "--max-act-raw-joint-bound-tolerance-deg", type=float,
+        default=cfg["max-act-raw-joint-bound-tolerance-deg"],
+        help=(
+            "small ACT raw joint-target overshoot allowed beyond the software "
+            "bounds; the executable target is still hard-clamped to the bounds"
+        ),
     )
     parser.add_argument(
         "--max-act-raw-gripper-bound-tolerance-mm", type=float,
@@ -836,9 +1364,35 @@ def parse_args(argv: list[str] | None = None):
         help="ACT raw gripper target tolerance beyond [0, gripper-max-mm]",
     )
     parser.add_argument(
-        "--max-act-clamp-hold-steps", type=int,
+        "--max-act-subgoal-no-progress-steps", "--max-act-clamp-hold-steps",
+        dest="max_act_clamp_hold_steps", type=int,
         default=cfg["max-act-clamp-hold-steps"],
-        help="maximum ticks ACT may hold one rate-limited action",
+        help=(
+            "maximum consecutive ticks without feedback progress toward a "
+            "hard-clamped ACT backpressure target (old "
+            "--max-act-clamp-hold-steps is an alias)"
+        ),
+    )
+    # Compatibility only: the first fixed-point implementation exposed these
+    # flags.  Backpressure now releases on the final limiter state, so exact
+    # position tolerances no longer participate in control.
+    parser.add_argument(
+        "--act-subgoal-joint-tolerance-deg", type=float, default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--act-subgoal-gripper-tolerance-mm", type=float, default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--act-subgoal-min-progress-deg", type=float,
+        default=cfg["act-subgoal-min-progress-deg"],
+        help="minimum joint-error reduction that resets the no-progress counter",
+    )
+    parser.add_argument(
+        "--act-subgoal-min-gripper-progress-mm", type=float,
+        default=cfg["act-subgoal-min-gripper-progress-mm"],
+        help="minimum gripper-error reduction that resets the no-progress counter",
     )
     parser.add_argument("--gripper-max-mm", type=float, default=cfg["gripper-max-mm"])
     parser.add_argument("--gripper-force", type=float, default=cfg["gripper-force"])
@@ -859,11 +1413,11 @@ def parse_args(argv: list[str] | None = None):
     )
     parser.add_argument(
         "--home-speed-percent", type=base.percentage, default=cfg["home-speed-percent"],
-        help="MOVE_J speed percentage for keyboard-Y homing",
+        help="MOVE_J speed percentage for ACT startup and keyboard-Y homing",
     )
     parser.add_argument(
         "--home-timeout", type=float, default=cfg["home-timeout"],
-        help="keyboard-Y homing timeout in seconds",
+        help="ACT startup and keyboard-Y homing timeout in seconds",
     )
     base.add_connection_arguments(parser, cfg)
     return parser.parse_args(argv)
@@ -873,16 +1427,33 @@ def validate_motion_limits(args, policy_type=None):
     """Validate base limits and any policy-specific limits after overrides."""
     if args.max_joint_step_deg <= 0 or args.max_gripper_step_mm <= 0:
         raise RuntimeError("step limits must be positive")
+    if (
+        args.max_joint_acceleration_deg_s2 < 0
+        or not math.isfinite(args.max_joint_acceleration_deg_s2)
+    ):
+        raise RuntimeError(
+            "max-joint-acceleration-deg-s2 must be finite and non-negative"
+        )
     if args.max_joint_lead_deg < args.max_joint_step_deg:
         raise RuntimeError("max-joint-lead-deg must be at least max-joint-step-deg")
     if args.max_gripper_lead_mm < args.max_gripper_step_mm:
         raise RuntimeError("max-gripper-lead-mm must be at least max-gripper-step-mm")
     if args.max_act_clamp_hold_steps < 1:
-        raise RuntimeError("max-act-clamp-hold-steps must be positive")
+        raise RuntimeError("max-act-subgoal-no-progress-steps must be positive")
+    if args.max_act_raw_gap_consecutive_steps < 1:
+        raise RuntimeError("max-act-raw-gap-consecutive-steps must be positive")
     for name in ("max_act_raw_joint_gap_deg", "max_act_raw_gripper_gap_mm"):
         value = getattr(args, name)
         if value is not None and value <= 0:
             raise RuntimeError(name.replace("_", "-") + " must be positive")
+    if (
+        args.max_act_raw_joint_bound_tolerance_deg < 0
+        or not math.isfinite(args.max_act_raw_joint_bound_tolerance_deg)
+    ):
+        raise RuntimeError(
+            "max-act-raw-joint-bound-tolerance-deg must be finite "
+            "and non-negative"
+        )
     if (
         args.max_act_raw_gripper_bound_tolerance_mm < 0
         or not math.isfinite(args.max_act_raw_gripper_bound_tolerance_mm)
@@ -891,11 +1462,30 @@ def validate_motion_limits(args, policy_type=None):
             "max-act-raw-gripper-bound-tolerance-mm must be finite "
             "and non-negative"
         )
+    for name in (
+        "act_subgoal_min_progress_deg",
+        "act_subgoal_min_gripper_progress_mm",
+    ):
+        value = getattr(args, name)
+        if value < 0 or not math.isfinite(value):
+            raise RuntimeError(
+                name.replace("_", "-") + " must be finite and non-negative"
+            )
     if policy_type in {"act", "pi0"} and (
         args.max_act_raw_joint_gap_deg is None
         or args.max_act_raw_gripper_gap_mm is None
     ):
         raise RuntimeError("ACT raw-action gap limits must be configured")
+    if (
+        policy_type == "act"
+        and args.warn_act_raw_joint_gap_deg is not None
+        and not 0 < args.warn_act_raw_joint_gap_deg
+        <= args.max_act_raw_joint_gap_deg
+    ):
+        raise RuntimeError(
+            "warn-act-raw-joint-gap-deg must be positive and no greater "
+            "than max-act-raw-joint-gap-deg"
+        )
 
 
 def validate_approval(
@@ -1006,14 +1596,43 @@ def main(argv: list[str] | None = None) -> int:
         for token in raw_argv
         if token.startswith("--")
     }
-    for alias, destination in {"max_plan_age_ms": "max_smolvla_plan_age_ms",
-                               "replan_lead_steps": "smolvla_replan_lead_steps"}.items():
+    for alias, destination in {
+        "max_plan_age_ms": "max_smolvla_plan_age_ms",
+        "replan_lead_steps": "smolvla_replan_lead_steps",
+        "max_act_subgoal_no_progress_steps": "max_act_clamp_hold_steps",
+    }.items():
         if alias in explicitly_set:
             explicitly_set.add(destination)
     if not 1 <= args.rate <= 20 or args.duration <= 0:
         raise RuntimeError("rate must be 1..20 Hz and duration must be positive")
     if not 1 <= args.camera_fps <= 60:
         raise RuntimeError("camera-fps must be 1..60")
+    if args.recording_fps is not None and not 1 <= args.recording_fps <= 60:
+        raise RuntimeError("recording-fps must be 1..60")
+    if args.recording_encoder_queue_size < 1:
+        raise RuntimeError("recording-encoder-queue-size must be positive")
+    recording_fps = args.recording_fps or max(
+        1, int(round(min(args.rate, args.camera_fps)))
+    )
+    hg_record_fps = args.hg_record_fps or max(
+        1, int(round(min(args.rate, args.camera_fps)))
+    )
+    if not 1 <= hg_record_fps <= 60:
+        raise RuntimeError("hg-record-fps must be 1..60")
+    if args.hg_dagger and not args.execute:
+        raise RuntimeError("--hg-dagger requires --execute")
+    if args.hg_dagger and str(args.hg_leader_channel) == str(args.channel):
+        raise RuntimeError("HG-DAgger leader and follower CAN channels must differ")
+    if args.hg_leader_init_timeout <= 0:
+        raise RuntimeError("hg-leader-init-timeout must be positive")
+    recording_root = args.recording_root.expanduser()
+    if not recording_root.is_absolute():
+        recording_root = WORKSPACE_ROOT / recording_root
+    recording_root = recording_root.resolve()
+    hg_dataset_root = args.hg_dataset_root.expanduser()
+    if not hg_dataset_root.is_absolute():
+        hg_dataset_root = WORKSPACE_ROOT / hg_dataset_root
+    hg_dataset_root = hg_dataset_root.resolve()
     if not 1 <= args.warmup_steps <= 20:
         raise RuntimeError("warmup-steps must be 1..20")
     if not 0.2 <= args.keyboard_hold_seconds <= 5.0:
@@ -1022,6 +1641,8 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError("home-timeout must be positive")
     if args.max_inference_ms <= 0 or args.max_camera_age_ms <= 0:
         raise RuntimeError("inference and camera-age limits must be positive")
+    if args.warn_inference_ms <= 0:
+        raise RuntimeError("warn-inference-ms must be positive")
     if (
         args.max_chunk_inference_ms is not None
         and args.max_chunk_inference_ms <= 0
@@ -1100,7 +1721,9 @@ def main(argv: list[str] | None = None) -> int:
             or config.use_relative_actions):
             raise RuntimeError("Pi0 runtime requires Piper 7D absolute joint actions")
         if args.execute and not args.experimental_pi0_execute:
-            raise RuntimeError("Pi0 execution requires --experimental-pi0-execute; run shadow first")
+            raise RuntimeError(
+                "Pi0 execution requires --experimental-pi0-execute"
+            )
     elif args.experimental_pi0_execute or args.base_checkpoint is not None:
         raise RuntimeError("Pi0-specific options require a Pi0 checkpoint")
     expected = set(config.input_features)
@@ -1133,6 +1756,11 @@ def main(argv: list[str] | None = None) -> int:
             setattr(args, destination, value)
     # Per-policy defaults are applied after argparse, so validate again here.
     # This catches contradictory overrides before an approval or robot command.
+    if not 0 < args.warn_inference_ms <= args.max_inference_ms:
+        raise RuntimeError(
+            "warn-inference-ms must be positive and no greater than "
+            "max-inference-ms"
+        )
     validate_motion_limits(args, policy_type)
     shadow_report, execute_report, generated_approval = runtime_artifact_paths(
         checkpoint, digest
@@ -1147,6 +1775,11 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError(f"{policy_type} requires a non-empty --task")
     elif task is not None:
         raise RuntimeError("--task is only supported by language-conditioned checkpoints")
+    hg_task = args.hg_task.strip() if args.hg_task is not None else task
+    if args.hg_dagger and not hg_task:
+        raise RuntimeError(
+            "--hg-dagger requires --hg-task for the correction dataset label"
+        )
     if args.experimental_smolvla_execute and policy_type != "smolvla":
         raise RuntimeError(
             "--experimental-smolvla-execute requires a SmolVLA checkpoint"
@@ -1280,21 +1913,42 @@ def main(argv: list[str] | None = None) -> int:
             ),
             "smolvla_replan_lead_steps": replan_lead_steps,
             "max_joint_step_deg": float(args.max_joint_step_deg),
+            "max_joint_acceleration_deg_s2": float(
+                args.max_joint_acceleration_deg_s2
+            ),
             "max_gripper_step_mm": float(args.max_gripper_step_mm),
             "max_joint_lead_deg": float(args.max_joint_lead_deg),
             "max_gripper_lead_mm": float(args.max_gripper_lead_mm),
             **({
+                "warn_act_raw_joint_gap_deg": (
+                    None if args.warn_act_raw_joint_gap_deg is None
+                    else float(args.warn_act_raw_joint_gap_deg)
+                ),
                 "max_act_raw_joint_gap_deg": float(
                     args.max_act_raw_joint_gap_deg
                 ),
+                "max_act_raw_gap_consecutive_steps": (
+                    args.max_act_raw_gap_consecutive_steps
+                ),
                 "max_act_raw_gripper_gap_mm": float(
                     args.max_act_raw_gripper_gap_mm
+                ),
+                "max_act_raw_joint_bound_tolerance_deg": float(
+                    args.max_act_raw_joint_bound_tolerance_deg
                 ),
                 "max_act_raw_gripper_bound_tolerance_mm": float(
                     args.max_act_raw_gripper_bound_tolerance_mm
                 ),
                 "max_act_clamp_hold_steps": args.max_act_clamp_hold_steps,
             } if policy_type in {"act", "pi0"} else {}),
+            **({
+                "act_subgoal_min_progress_deg": float(
+                    args.act_subgoal_min_progress_deg
+                ),
+                "act_subgoal_min_gripper_progress_mm": float(
+                    args.act_subgoal_min_gripper_progress_mm
+                ),
+            } if policy_type == "act" else {}),
             "gripper_max_mm": float(args.gripper_max_mm),
             "gripper_force": float(args.gripper_force),
             "max_camera_age_ms": float(args.max_camera_age_ms),
@@ -1303,10 +1957,17 @@ def main(argv: list[str] | None = None) -> int:
             args.approval.resolve(), digest, policy_type, approval_runtime
         )
         if not approval_checked:
-            print(
-                "[approval] disabled by modeling.yaml; skipping approval check",
-                flush=True,
-            )
+            if policy_type == "pi0":
+                print(
+                    "[approval] Pi0 execution does not require a prior "
+                    "shadow approval",
+                    flush=True,
+                )
+            else:
+                print(
+                    "[approval] disabled by modeling.yaml; skipping approval check",
+                    flush=True,
+                )
     config.pretrained_path = str(checkpoint)
     config.device = args.device
     dataset_metadata = load_dataset_metadata(checkpoint)
@@ -1345,6 +2006,8 @@ def main(argv: list[str] | None = None) -> int:
             f"n_action_steps={config.n_action_steps} "
             f"(checkpoint={checkpoint_n_action_steps}), "
             f"rate={args.rate:g}Hz/{training_fps}Hz_train, "
+            "joint_acceleration_limit="
+            f"{args.max_joint_acceleration_deg_s2:g}deg/s^2, "
             f"cameras={'+'.join(camera_roles)}@{args.camera_fps}FPS, "
             "temporal_ensemble_coeff="
             f"{getattr(config, 'temporal_ensemble_coeff', None)} "
@@ -1370,6 +2033,13 @@ def main(argv: list[str] | None = None) -> int:
 
     robot = None
     cameras = None
+    recorder = None
+    hg_expert = None
+    hg_recorder = None
+    hg_intervening = False
+    hg_last_sample = None
+    hg_started_at = None
+    last_novice_action = None
     report = args.report.resolve()
     report.parent.mkdir(parents=True, exist_ok=True)
     keyboard = keyboard_api.TerminalKeyEventReader()
@@ -1378,13 +2048,19 @@ def main(argv: list[str] | None = None) -> int:
     motion_enabled = False
     arm_prepared = False
     command_target = None
+    previous_joint_velocity = None
     held_act_action = None
+    latched_act_subgoal = None
+    act_subgoal_previous_joint_error = None
+    act_subgoal_previous_gripper_error = None
     act_hold_steps = 0
+    act_raw_gap_hard_steps = 0
     planner = None
     start_pending = False
     pending_plan_request_id = 0
     homing_active = False
     emergency_stopped = False
+    record_blocking_motion = None
     # Piper JS is encoded as move_mode=J plus mit_mode=MIT. The controller's
     # mode_feedback therefore remains MOVE_J (1); MOVE_MIT (4/6) is reserved
     # for the separate per-joint MIT API.
@@ -1409,6 +2085,50 @@ def main(argv: list[str] | None = None) -> int:
             window_title="RobotArm Online Policy Cameras",
         )
         cameras.wait_ready()
+        recorder = PolicyRecordingManager(
+            recording_root,
+            recording_fps,
+            640,
+            480,
+            list(cameras.workers),
+            cameras.metadata,
+            {
+                "checkpoint": str(checkpoint),
+                "checkpoint_sha256": digest,
+                "policy_type": policy_type,
+                "task": task,
+                "execute": bool(args.execute),
+                "control_rate_hz": float(args.rate),
+                "report": str(report),
+            },
+            args.recording_encoder_queue_size,
+            cv2_module=cv2,
+            np_module=np,
+        )
+        def homing_emergency_stop_requested():
+            cameras.show(cameras.latest(), recorder.active)
+            return (
+                any(key == "alt+s" for key, _ in keyboard.poll())
+                or any(key in (ord("s"), ord("S")) for key in cameras.poll_keys())
+            )
+
+        if args.execute and policy_type == "act":
+            # The ACT deployment starts from the demonstrated zero pose.  Do
+            # this before warming the policy so its first live observation is
+            # taken at home, and keep model control disarmed until X is pressed.
+            home_gripper_width = min(
+                max(base.wait_gripper_width(gripper, args.feedback_timeout), 0.0),
+                args.gripper_max_mm / 1000.0,
+            )
+            print("ACT startup: enabling the arm and moving to home.", flush=True)
+            homing_active = True
+            home_arm_to_zero(
+                robot, robot_config, gripper, home_gripper_width,
+                args.gripper_force, args.feedback_timeout,
+                args.home_speed_percent, args.home_timeout,
+                homing_emergency_stop_requested,
+            )
+            homing_active = False
         # CUDA and the policy allocate/compile lazily on the first call. Warm up
         # before watchdog accounting, then reset ACT's temporal/action state.
         warm_joints = [
@@ -1439,6 +2159,28 @@ def main(argv: list[str] | None = None) -> int:
             reset()
         if policy_type != "pi0":
             print(f"Policy warm-up: {args.warmup_steps} steps complete", flush=True)
+        if args.execute and policy_type == "act":
+            if homing_emergency_stop_requested():
+                emergency_stopped = True
+                robot.electronic_emergency_stop()
+                print("\nAlt+S before X: electronic emergency stop sent.")
+                return 130
+            home_gripper_width = base.wait_gripper_width(
+                gripper, args.feedback_timeout
+            )
+            prepare_js_control(
+                robot, robot_config, gripper, home_gripper_width,
+                args.gripper_force, args.feedback_timeout, expected_js_mode,
+                ACT_STREAM_SPEED_PERCENT,
+            )
+            arm_prepared = True
+            # A key pressed while homing or warming up must not arm motion.
+            if homing_emergency_stop_requested():
+                emergency_stopped = True
+                robot.electronic_emergency_stop()
+                print("\nAlt+S before X: electronic emergency stop sent.")
+                return 130
+            print("ACT ready at home; press X to start model control.", flush=True)
         active_actions = deque()
         active_plan = None
         planner_requested = False
@@ -1486,19 +2228,87 @@ def main(argv: list[str] | None = None) -> int:
                                                   time.monotonic(), args.rate, config.n_action_steps)
             else:
                 active_actions.extend(active_plan["actions"])
-        if args.execute:
+        if args.hg_dagger:
             print(
-                "Keyboard: tap X to start/stop; hold "
-                f"Y for {args.keyboard_hold_seconds:.1f}s to home and remain "
-                "paused; Ctrl+C homes and exits; Alt+S immediately performs "
-                "an electronic emergency stop. Other keys are disabled.",
+                f"[HG-DAgger] connecting expert leader {args.hg_leader_channel}...",
                 flush=True,
             )
-            print("Camera window: X start/stop; hold Y home; S emergency stop; F fullscreen; Esc windowed.", flush=True)
+            hg_expert = LeaderExpert(
+                interface=args.hg_leader_interface,
+                channel=str(args.hg_leader_channel),
+                firmware=args.firmware,
+                feedback_timeout=args.feedback_timeout,
+                init_timeout=args.hg_leader_init_timeout,
+                signs=args.hg_joint_signs,
+                offsets_deg=args.hg_joint_offsets_deg,
+                gripper_max=args.gripper_max_mm / 1000.0,
+                gripper_force=args.gripper_force,
+            )
+            hg_recorder = RawEpisodeRecorder(
+                hg_dataset_root,
+                hg_task,
+                args.hg_setup_id,
+                args.hg_setup_note,
+                hg_record_fps,
+                640,
+                480,
+                camera_serials,
+                {
+                    "model": "Piper",
+                    "control_mode": "human_gated_dagger_move_js",
+                    "firmware": args.firmware,
+                    "control_rate_hz": args.rate,
+                    "leader": {
+                        "interface": args.hg_leader_interface,
+                        "channel": str(args.hg_leader_channel),
+                        "role": "zero_force_drag_expert",
+                    },
+                    "follower": {
+                        "interface": args.interface,
+                        "channel": str(args.channel),
+                        "role": "policy_or_expert_move_js",
+                    },
+                    "checkpoint": str(checkpoint),
+                    "checkpoint_sha256": digest,
+                    "policy_type": policy_type,
+                    "action_source": "safety_limited_expert_action_only",
+                    "observation_source": "follower_feedback",
+                    "gate": "manual_keyboard_i",
+                    "clutch": "follower_minus_mapped_leader_at_takeover",
+                    "joint_signs": list(args.hg_joint_signs),
+                    "joint_offsets_deg": list(args.hg_joint_offsets_deg),
+                },
+                preview=False,
+                encoder_queue_size=args.recording_encoder_queue_size,
+                extra_sample_fields=HG_DAGGER_SAMPLE_FIELDS,
+                cameras=cameras,
+            )
+            print(
+                "[HG-DAgger] ready: press I during an active X trial to take "
+                "over; press I again to save the recovery and return to the policy.",
+                flush=True,
+            )
+        if args.execute:
+            controls = "Keyboard: tap V to start/save recording; tap X to start/stop; "
+            if args.hg_dagger:
+                controls += "tap I to take over/return; "
+            controls += (
+                "tap R to reset ACT to home; hold "
+                f"Y for {args.keyboard_hold_seconds:.1f}s to home and remain "
+                "paused; Ctrl+C homes and exits; Alt+S immediately performs "
+                "an electronic emergency stop."
+            )
+            print(controls, flush=True)
+            print(
+                "Camera window: V record/save; X start/stop; "
+                + ("I expert take over/return; " if args.hg_dagger else "")
+                + "R reset ACT; hold Y home; S emergency stop; F fullscreen; Esc windowed.",
+                flush=True,
+            )
         else:
             print(
-                "Keyboard: X/Y/Alt+S motion controls are disabled in shadow "
-                "mode; Ctrl+C exits without moving the arm.",
+                "Keyboard: V starts/saves recording; X/Y/R/Alt+S motion controls "
+                "are disabled in shadow mode; Ctrl+C exits without moving the arm.",
                 flush=True,
             )
         period = 1.0 / args.rate
@@ -1513,6 +2323,34 @@ def main(argv: list[str] | None = None) -> int:
         chunk_generated_at = (
             active_plan["completed_at"] if async_planned else None
         )
+        def record_blocking_motion(state_values, action_values, event):
+            """Keep V-key recordings aligned while R/Y homing blocks the loop."""
+            if not recorder.active:
+                return
+            now = time.monotonic()
+            recorder.capture(
+                now,
+                cameras.latest(),
+                state_values,
+                action_values,
+                action_values,
+                trial_id,
+                False,
+                True,
+                event,
+            )
+
+        def finish_hg_intervention(*, complete: bool) -> None:
+            nonlocal hg_intervening, hg_last_sample, hg_started_at
+            if hg_recorder is not None and hg_recorder.active:
+                if complete:
+                    hg_recorder.save_episode()
+                else:
+                    hg_recorder.mark_incomplete()
+            hg_intervening = False
+            hg_last_sample = None
+            hg_started_at = None
+
         with report.open("w", encoding="utf-8") as log:
             while args.execute or time.monotonic() < shadow_deadline:
                 tick = time.monotonic()
@@ -1522,16 +2360,45 @@ def main(argv: list[str] | None = None) -> int:
                         events.append(("x", tick))
                     elif key in (ord("y"), ord("Y")):
                         events.append(("y", tick))
+                    elif key in (ord("r"), ord("R")):
+                        events.append(("r", tick))
                     elif key in (ord("s"), ord("S")):
                         events.append(("alt+s", tick))
-                x_toggle, home_requested, stop_requested = key_tracker.update(events, tick)
+                    elif key in (ord("v"), ord("V")):
+                        events.append(("v", tick))
+                    elif key in (ord("i"), ord("I")):
+                        events.append(("i", tick))
+                intervention_toggle = key_tracker.intervention_toggle(events)
+                (
+                    x_toggle,
+                    home_requested,
+                    reset_requested,
+                    stop_requested,
+                    recording_toggle,
+                ) = key_tracker.update(events, tick)
+                if recording_toggle:
+                    try:
+                        if recorder.active:
+                            recorder.stop()
+                        else:
+                            recorder.start()
+                    except Exception as exc:
+                        print(
+                            "\n[record] Could not toggle recording: "
+                            f"{type(exc).__name__}: {exc}; model control continues",
+                            flush=True,
+                        )
+                for message in recorder.drain_messages():
+                    print(f"\n{message}", flush=True)
                 trial_timed_out = (
                     args.execute
                     and motion_enabled
+                    and not hg_intervening
                     and trial_started_at is not None
                     and tick - trial_started_at >= args.duration
                 )
                 if trial_timed_out:
+                    finish_hg_intervention(complete=False)
                     motion_enabled = False
                     start_pending = False
                     trial_started_at = None
@@ -1539,8 +2406,13 @@ def main(argv: list[str] | None = None) -> int:
                     active_plan = None
                     planner_requested = False
                     command_target = None
+                    previous_joint_velocity = None
                     held_act_action = None
+                    latched_act_subgoal = None
+                    act_subgoal_previous_joint_error = None
+                    act_subgoal_previous_gripper_error = None
                     act_hold_steps = 0
+                    act_raw_gap_hard_steps = 0
                     if planner is None and callable(reset):
                         reset()
                     print(
@@ -1555,6 +2427,7 @@ def main(argv: list[str] | None = None) -> int:
                         print("\nAlt+S ignored: electronic stop is disabled without --execute.")
                         continue
                     motion_enabled = False
+                    finish_hg_intervention(complete=False)
                     emergency_stopped = True
                     robot.electronic_emergency_stop()
                     if planner is not None:
@@ -1562,12 +2435,19 @@ def main(argv: list[str] | None = None) -> int:
                         planner = None
                     print("\nAlt+S: electronic emergency stop sent; program exits.")
                     return 130
-                if home_requested:
+                if home_requested or reset_requested:
                     if not args.execute:
                         print(
-                            "\nY ignored: homing is disabled without --execute."
+                            "\nY/R ignored: homing is disabled without --execute."
                         )
                         continue
+                    if reset_requested and policy_type != "act":
+                        print("\nR reset is available only for ACT execution.")
+                        if not home_requested:
+                            continue
+                    is_act_reset = reset_requested and policy_type == "act"
+                    home_label = "R reset" if is_act_reset else "Y hold"
+                    finish_hg_intervention(complete=False)
                     motion_enabled = False
                     start_pending = False
                     trial_started_at = None
@@ -1575,30 +2455,65 @@ def main(argv: list[str] | None = None) -> int:
                     active_plan = None
                     planner_requested = False
                     held_act_action = None
+                    latched_act_subgoal = None
+                    act_subgoal_previous_joint_error = None
+                    act_subgoal_previous_gripper_error = None
                     act_hold_steps = 0
+                    act_raw_gap_hard_steps = 0
                     if planner is None and callable(reset):
                         reset()
-                    print("\nY hold received: pausing model control and homing.")
+                    print(f"\n{home_label} received: pausing model control and homing.")
                     homing_active = True
-                    held_gripper_width = min(
-                        max(
-                            base.wait_gripper_width(
-                                gripper, min(args.feedback_timeout, 0.2)
+                    if is_act_reset:
+                        reset_act_to_home(
+                            robot, robot_config, gripper, args, expected_js_mode,
+                            homing_emergency_stop_requested,
+                            record_blocking_motion,
+                        )
+                        arm_prepared = True
+                    else:
+                        held_gripper_width = min(
+                            max(
+                                base.wait_gripper_width(
+                                    gripper, min(args.feedback_timeout, 0.2)
+                                ),
+                                0.0,
                             ),
+                            args.gripper_max_mm / 1000.0,
+                        )
+                        home_arm_to_zero(
+                            robot, robot_config, gripper, held_gripper_width,
+                            args.gripper_force, args.feedback_timeout,
+                            args.home_speed_percent, args.home_timeout,
+                            homing_emergency_stop_requested,
+                            record_blocking_motion,
+                        )
+                    if policy_type == "act" and not is_act_reset:
+                        held_gripper_width = max(
                             0.0,
-                        ),
-                        args.gripper_max_mm / 1000.0,
-                    )
-                    home_arm_to_zero(
-                        robot, robot_config, gripper, held_gripper_width,
-                        args.gripper_force, args.feedback_timeout,
-                        args.home_speed_percent, args.home_timeout,
-                    )
-                    homing_active = False
-                    arm_prepared = False
+                            base.wait_gripper_width(gripper, args.feedback_timeout),
+                        )
+                        prepare_js_control(
+                            robot, robot_config, gripper, held_gripper_width,
+                            args.gripper_force, args.feedback_timeout,
+                            expected_js_mode, ACT_STREAM_SPEED_PERCENT,
+                        )
+                        arm_prepared = True
+                    elif policy_type != "act":
+                        arm_prepared = False
                     command_gate = False
                     command_target = None
-                    print("Homing complete; model control remains paused. Tap X to resume.")
+                    previous_joint_velocity = None
+                    # Clear inputs accumulated during the blocking home/JS
+                    # transition, including an early X press.
+                    if homing_emergency_stop_requested():
+                        emergency_stopped = True
+                        robot.electronic_emergency_stop()
+                        print("\nAlt+S during reset: electronic emergency stop sent.")
+                        return 130
+                    homing_active = False
+                    key_tracker.after_home(time.monotonic())
+                    print("Homing complete; model control remains paused. Press X for a new trial.")
                     continue
                 if args.execute and x_toggle:
                     motion_enabled = not motion_enabled
@@ -1606,16 +2521,23 @@ def main(argv: list[str] | None = None) -> int:
                     if motion_enabled:
                         trial_id += 1
                         trial_started_at = tick
+                        previous_joint_velocity = None
                         print(f"\nTrial {trial_id} started.", flush=True)
                     else:
+                        finish_hg_intervention(complete=False)
                         trial_started_at = None
                         active_actions.clear()
                         active_plan = None
                         planner_requested = False
                         command_target = None
+                        previous_joint_velocity = None
                         print(f"\nTrial {trial_id} paused.", flush=True)
                     held_act_action = None
+                    latched_act_subgoal = None
+                    act_subgoal_previous_joint_error = None
+                    act_subgoal_previous_gripper_error = None
                     act_hold_steps = 0
+                    act_raw_gap_hard_steps = 0
                     if async_planned:
                         if motion_enabled:
                             # Do not start from a chunk generated while the arm
@@ -1652,14 +2574,87 @@ def main(argv: list[str] | None = None) -> int:
                     **image_inputs,
                 }
                 add_smolvla_task(batch, policy_type, task)
+                if intervention_toggle:
+                    if not args.hg_dagger:
+                        print("\nI ignored: start with --hg-dagger to enable expert takeover.")
+                    elif not motion_enabled:
+                        print("\n[HG-DAgger] I ignored while model control is paused; press X first.")
+                    elif hg_intervening:
+                        if trial_started_at is not None and hg_started_at is not None:
+                            # The duration budget measures novice/model control;
+                            # never cut off an expert in the middle of recovery.
+                            trial_started_at += tick - hg_started_at
+                        finish_hg_intervention(complete=True)
+                        active_actions.clear()
+                        active_plan = None
+                        planner_requested = False
+                        start_pending = async_planned
+                        command_target = state.copy()
+                        previous_joint_velocity = None
+                        held_act_action = None
+                        latched_act_subgoal = None
+                        act_hold_steps = 0
+                        act_raw_gap_hard_steps = 0
+                        if planner is None and callable(reset):
+                            reset()
+                        toggle_event = "hg_return_to_policy"
+                        print(
+                            "\n[HG-DAgger] expert recovery saved; control returned "
+                            "to a freshly reset policy.",
+                            flush=True,
+                        )
+                    else:
+                        assert hg_expert is not None and hg_recorder is not None
+                        hg_last_sample = hg_expert.engage(
+                            state.tolist(), joint_bounds
+                        )
+                        hg_recorder.start_episode()
+                        hg_intervening = True
+                        hg_started_at = tick
+                        active_actions.clear()
+                        active_plan = None
+                        planner_requested = False
+                        start_pending = False
+                        command_target = state.copy()
+                        previous_joint_velocity = None
+                        held_act_action = None
+                        latched_act_subgoal = None
+                        act_hold_steps = 0
+                        act_raw_gap_hard_steps = 0
+                        if planner is None and callable(reset):
+                            reset()
+                        toggle_event = "hg_takeover"
+                        print(
+                            "\n[HG-DAgger] EXPERT CONTROL active; only expert "
+                            "actions are being recorded. Press I to save/return.",
+                            flush=True,
+                        )
                 planner_underflow = False
                 plan_observation_age_ms = None
                 chunk_inference_ms = None
                 act_action_held = False
                 act_hold_timeout = False
                 act_raw_action_ok = True
+                act_raw_action_within_envelope = True
                 act_raw_action_failures = []
-                if planner is not None:
+                act_raw_action_warnings = []
+                act_subgoal_created = False
+                act_subgoal_reached = False
+                act_subgoal_joint_error = None
+                act_subgoal_max_joint_error = None
+                act_subgoal_gripper_error = None
+                act_subgoal_joint_progress = None
+                act_subgoal_gripper_progress = None
+                if hg_intervening:
+                    queue_depth_before = len(active_actions) if planner is not None else action_queue_depth(policy)
+                    queue_depth_after = queue_depth_before
+                    action_index_in_chunk = None
+                    chunk_refresh = False
+                    chunk_age_ms = None
+                    inference_ms = 0.0
+                    inference_limit_ms = args.max_inference_ms
+                    raw = state.copy()
+                elif planner is not None:
                     if planner.failure is not None:
                         raise RuntimeError(
                             f"async planner failed: {planner.failure}"
@@ -1737,9 +2732,14 @@ def main(argv: list[str] | None = None) -> int:
                         prediction = None
                         inference_ms = 0.0
                         raw = state.copy()
-                    elif policy_type == "act" and held_act_action is not None:
-                        # Do not consume the next ACT action while the robot is
-                        # still catching up to the current rate-limited target.
+                    elif (
+                        policy_type == "act"
+                        and held_act_action is not None
+                    ):
+                        # Freeze both queued ACT and the temporal-ensemble
+                        # policy clock while the final safety limiter is under
+                        # pressure.  Advancing select_action() here would pop a
+                        # temporal step although the robot has not caught up.
                         prediction = None
                         inference_ms = 0.0
                         raw = held_act_action.copy()
@@ -1756,44 +2756,251 @@ def main(argv: list[str] | None = None) -> int:
                     action_index_in_chunk = None
                     chunk_age_ms = None
                     inference_limit_ms = args.max_inference_ms
+                hg_sample = None
+                if hg_intervening:
+                    assert hg_expert is not None
+                    novice_raw = (
+                        state.copy()
+                        if last_novice_action is None
+                        else np.asarray(last_novice_action).copy()
+                    )
+                    hg_sample = hg_last_sample or hg_expert.sample(joint_bounds)
+                    hg_last_sample = None
+                    raw = np.asarray(hg_sample.requested_action, dtype=np.float64)
+                else:
+                    novice_raw = np.asarray(raw).copy()
+                    last_novice_action = novice_raw.copy()
                 tracking_raw = (
                     act_tracking_action(
                         raw, args.gripper_max_mm / 1000.0,
                         args.max_act_raw_gripper_bound_tolerance_mm / 1000.0,
                     ) if policy_type in {"act", "pi0"} else raw
                 )
+                control_raw = (
+                    latched_act_subgoal
+                    if (
+                        policy_type == "act"
+                        and not hg_intervening
+                        and latched_act_subgoal is not None
+                    )
+                    else tracking_raw
+                )
+                limiter_previous = (
+                    state if command_target is None else command_target
+                )
+                limiter_velocity = (
+                    np.zeros(6, dtype=np.float64)
+                    if previous_joint_velocity is None
+                    else previous_joint_velocity
+                )
+                shaped_action, proposed_joint_velocity = (
+                    limit_joint_target_acceleration(
+                        control_raw, limiter_previous, limiter_velocity,
+                        math.radians(args.max_joint_acceleration_deg_s2),
+                        period,
+                        math.radians(args.max_joint_step_deg) / period,
+                    )
+                )
                 target = clamp_step(
-                    tracking_raw, state, math.radians(args.max_joint_step_deg),
+                    shaped_action, state, math.radians(args.max_joint_step_deg),
                     args.max_gripper_step_mm / 1000.0, args.gripper_max_mm / 1000.0,
                     joint_bounds, command_target,
                     math.radians(args.max_joint_lead_deg),
                     args.max_gripper_lead_mm / 1000.0,
                 )
                 action_clamped = action_was_clamped(raw, target)
-                tracking_clamped = action_was_clamped(tracking_raw, target)
-                if policy_type in {"act", "pi0"}:
-                    act_raw_action_failures = act_action_envelope_failures(
-                        raw, state, joint_bounds,
-                        args.gripper_max_mm / 1000.0,
-                        math.radians(args.max_act_raw_joint_gap_deg),
-                        args.max_act_raw_gripper_gap_mm / 1000.0,
-                        args.max_act_raw_gripper_bound_tolerance_mm / 1000.0,
-                    )
+                smoothing_applied = action_was_clamped(
+                    control_raw[:6], shaped_action[:6]
+                )
+                # This flag intentionally excludes normal acceleration shaping;
+                # it represents only the final hard safety clamp.
+                tracking_clamped = action_was_clamped(shaped_action, target)
+                if policy_type in {"act", "pi0"} and not hg_intervening:
+                    if policy_type == "act":
+                        # Only malformed/non-finite actions and physical bounds
+                        # are immediate raw-action failures.  A moving raw
+                        # target may legitimately outrun feedback, so joint and
+                        # gripper gaps are telemetry while a fixed, already
+                        # clamped subgoal applies backpressure to execution.
+                        immediate_failures = act_action_envelope_failures(
+                            raw, state, joint_bounds,
+                            args.gripper_max_mm / 1000.0,
+                            math.inf,
+                            math.inf,
+                            args.max_act_raw_gripper_bound_tolerance_mm / 1000.0,
+                            math.radians(
+                                args.max_act_raw_joint_bound_tolerance_deg
+                            ),
+                        )
+                        strict_bound_failures = act_action_envelope_failures(
+                            raw, state, joint_bounds,
+                            args.gripper_max_mm / 1000.0,
+                            math.inf,
+                            math.inf,
+                            args.max_act_raw_gripper_bound_tolerance_mm / 1000.0,
+                            0.0,
+                        )
+                        if strict_bound_failures and not immediate_failures:
+                            act_raw_action_warnings.append(
+                                strict_bound_failures[0]
+                                + "; within raw prediction tolerance; executable "
+                                "target is hard-clamped to the safe joint bounds"
+                            )
+                        warning_threshold = (
+                            args.warn_act_raw_joint_gap_deg
+                            if args.warn_act_raw_joint_gap_deg is not None
+                            else args.max_act_raw_joint_gap_deg
+                        )
+                        joint_gap_warning = act_joint_gap_failure(
+                            raw, state, math.radians(warning_threshold)
+                        )
+                        joint_gap_hard = act_joint_gap_failure(
+                            raw, state,
+                            math.radians(args.max_act_raw_joint_gap_deg),
+                        )
+                        (
+                            act_raw_gap_hard_steps,
+                            _persistent_joint_gap_failure,
+                        ) = update_act_raw_gap_streak(
+                            joint_gap_hard,
+                            act_raw_gap_hard_steps,
+                            args.max_act_raw_gap_consecutive_steps,
+                        )
+                        if joint_gap_warning is not None:
+                            warning = (
+                                joint_gap_warning
+                                + "; raw telemetry only; ACT action consumption "
+                                "is paced by safety backpressure"
+                            )
+                            if joint_gap_hard is not None:
+                                warning += (
+                                    "; severe gap for "
+                                    f"{act_raw_gap_hard_steps} consecutive ticks"
+                                )
+                            act_raw_action_warnings.append(warning)
+                        gripper_gap = abs(float(raw[6] - state[6]))
+                        if gripper_gap > (
+                            args.max_act_raw_gripper_gap_mm / 1000.0
+                        ):
+                            act_raw_action_warnings.append(
+                                "raw gripper gap="
+                                f"{gripper_gap * 1000.0:.2f}mm > "
+                                f"{args.max_act_raw_gripper_gap_mm:.2f}mm; "
+                                "raw telemetry only; ACT action consumption is "
+                                "paced by safety backpressure"
+                            )
+                        act_raw_action_failures = list(immediate_failures)
+                        act_raw_action_within_envelope = not (
+                            immediate_failures
+                            or joint_gap_warning is not None
+                            or gripper_gap
+                            > args.max_act_raw_gripper_gap_mm / 1000.0
+                        )
+                    else:
+                        act_raw_action_failures = act_action_envelope_failures(
+                            raw, state, joint_bounds,
+                            args.gripper_max_mm / 1000.0,
+                            math.radians(args.max_act_raw_joint_gap_deg),
+                            args.max_act_raw_gripper_gap_mm / 1000.0,
+                            args.max_act_raw_gripper_bound_tolerance_mm / 1000.0,
+                        )
+                        act_raw_gap_hard_steps = 0
+                        act_raw_action_within_envelope = not act_raw_action_failures
                     act_raw_action_ok = not act_raw_action_failures
                     if policy_type == "act" and args.execute and motion_enabled:
-                        if tracking_clamped and act_raw_action_ok:
-                            act_hold_steps = (
-                                act_hold_steps + 1 if act_action_held else 1
+                        candidate_subgoal = bounded_act_subgoal(
+                            tracking_raw,
+                            state,
+                            joint_bounds,
+                            proposed_joint_velocity,
+                            math.radians(args.max_joint_lead_deg),
+                            args.max_gripper_lead_mm / 1000.0,
+                            args.gripper_max_mm / 1000.0,
+                            math.radians(args.max_joint_acceleration_deg_s2),
+                        )
+                        (
+                            latched_act_subgoal,
+                            act_subgoal_created,
+                            act_subgoal_reached,
+                        ) = update_act_backpressure_target(
+                            latched_act_subgoal,
+                            candidate_subgoal,
+                            tracking_clamped,
+                            act_raw_action_ok,
+                        )
+                        if act_subgoal_created:
+                            # Freeze ACT's action consumption until this local
+                            # target no longer needs the final hard limiter.
+                            (
+                                act_subgoal_joint_error,
+                                act_subgoal_max_joint_error,
+                                act_subgoal_gripper_error,
+                            ) = act_subgoal_errors(latched_act_subgoal, state)
+                            act_subgoal_previous_joint_error = (
+                                act_subgoal_joint_error
                             )
-                            held_act_action = np.asarray(raw).copy()
+                            act_subgoal_previous_gripper_error = (
+                                act_subgoal_gripper_error
+                            )
+                            act_hold_steps = 0
+                            held_act_action = latched_act_subgoal.copy()
+                        elif act_subgoal_reached:
+                            # The command is no longer being hard-clamped.  Do
+                            # not wait for Piper JS to settle at an exact point;
+                            # resume ACT from the next observation/time step.
+                            held_act_action = None
+                            act_subgoal_previous_joint_error = None
+                            act_subgoal_previous_gripper_error = None
+                            act_hold_steps = 0
+                        elif latched_act_subgoal is not None:
+                            held_act_action = latched_act_subgoal.copy()
+                            subgoal_progress = update_act_backpressure_progress(
+                                latched_act_subgoal,
+                                state,
+                                act_subgoal_previous_joint_error,
+                                act_subgoal_previous_gripper_error,
+                                act_hold_steps,
+                                math.radians(args.act_subgoal_min_progress_deg),
+                                args.act_subgoal_min_gripper_progress_mm / 1000.0,
+                            )
+                            act_subgoal_joint_error = subgoal_progress[
+                                "joint_error"
+                            ]
+                            act_subgoal_max_joint_error = subgoal_progress[
+                                "max_joint_error"
+                            ]
+                            act_subgoal_gripper_error = subgoal_progress[
+                                "gripper_error"
+                            ]
+                            act_subgoal_joint_progress = subgoal_progress[
+                                "joint_progress"
+                            ]
+                            act_subgoal_gripper_progress = subgoal_progress[
+                                "gripper_progress"
+                            ]
+                            act_hold_steps = subgoal_progress[
+                                "no_progress_steps"
+                            ]
+                            # Keep the last acknowledged baseline so small
+                            # feedback increments accumulate across ticks.
+                            if subgoal_progress["progressed"]:
+                                act_subgoal_previous_joint_error = (
+                                    act_subgoal_joint_error
+                                )
+                                act_subgoal_previous_gripper_error = (
+                                    act_subgoal_gripper_error
+                                )
+                            act_hold_timeout = (
+                                act_hold_steps >= args.max_act_clamp_hold_steps
+                            )
                         else:
                             held_act_action = None
                             act_hold_steps = 0
-                        act_hold_timeout = (
-                            act_hold_steps > args.max_act_clamp_hold_steps
-                        )
                     else:
                         held_act_action = None
+                        latched_act_subgoal = None
+                        act_subgoal_previous_joint_error = None
+                        act_subgoal_previous_gripper_error = None
                         act_hold_steps = 0
                 execution_ready = transition_is_safe(
                     joints, target[:6], joint_bounds
@@ -1826,17 +3033,19 @@ def main(argv: list[str] | None = None) -> int:
                         <= args.max_smolvla_plan_age_ms
                     )
                 )
+                performance_warnings, inference_failures = inference_timing_messages(
+                    inference_ms,
+                    args.warn_inference_ms,
+                    inference_limit_ms,
+                )
+                performance_warnings.extend(act_raw_action_warnings)
                 watchdog_failures = []
                 if camera_age_ms > args.max_camera_age_ms:
                     watchdog_failures.append(
                         f"camera age {camera_age_ms:.1f}ms > "
                         f"{args.max_camera_age_ms:.1f}ms"
                     )
-                if inference_ms > inference_limit_ms:
-                    watchdog_failures.append(
-                        f"inference {inference_ms:.1f}ms > "
-                        f"{inference_limit_ms:.1f}ms"
-                    )
+                watchdog_failures.extend(inference_failures)
                 if not execution_ready:
                     watchdog_failures.append("safe target transition is outside joint bounds")
                 if not mode_ready:
@@ -1849,7 +3058,9 @@ def main(argv: list[str] | None = None) -> int:
                     watchdog_failures.extend(act_raw_action_failures)
                     if act_hold_timeout:
                         watchdog_failures.append(
-                            f"ACT target remained clamped for {act_hold_steps} ticks > "
+                            "ACT hard-clamped backpressure target made no "
+                            "feedback progress for "
+                            f"{act_hold_steps} consecutive ticks >= "
                             f"{args.max_act_clamp_hold_steps}"
                         )
                 if (
@@ -1875,15 +3086,26 @@ def main(argv: list[str] | None = None) -> int:
                     and not start_pending
                 ):
                     motion_enabled = False
+                    finish_hg_intervention(complete=False)
                     trial_started_at = None
                     toggle_event = "watchdog_stop"
                     held_act_action = None
+                    latched_act_subgoal = None
+                    act_subgoal_previous_joint_error = None
+                    act_subgoal_previous_gripper_error = None
+                    previous_joint_velocity = None
                     if planner is None and callable(reset):
                         reset()
                     detail = "; ".join(watchdog_failures) or "unknown safety condition"
                     print(
                         f"\nWATCHDOG: Trial {trial_id} paused before the next "
                         f"command: {detail}",
+                        flush=True,
+                    )
+                elif args.execute and motion_enabled and performance_warnings:
+                    print(
+                        "\nWARNING: " + "; ".join(performance_warnings)
+                        + "; continuing execution.",
                         flush=True,
                     )
                 may_command = (
@@ -1895,6 +3117,7 @@ def main(argv: list[str] | None = None) -> int:
                         robot, robot_config, gripper, gripper_width,
                         args.gripper_force, args.feedback_timeout,
                         expected_js_mode,
+                        ACT_STREAM_SPEED_PERCENT if policy_type == "act" else None,
                     )
                     arm_prepared = True
                     mode_feedback = expected_js_mode
@@ -1904,19 +3127,72 @@ def main(argv: list[str] | None = None) -> int:
                         may_command = False
                 if may_command and not command_gate:
                     command_gate = True
+                command_joint_velocity = None
+                command_joint_acceleration = None
                 if may_command:
                     robot.move_js(target[:6].tolist())
                     gripper.move_gripper_m(float(target[6]), args.gripper_force)
+                    command_joint_velocity = (
+                        np.asarray(target[:6]) - np.asarray(limiter_previous[:6])
+                    ) / period
+                    command_joint_acceleration = (
+                        command_joint_velocity - limiter_velocity
+                    ) / period
+                    previous_joint_velocity = command_joint_velocity.copy()
                     command_target = target.copy()
                 elif command_gate:
                     robot.move_js(joints)
                     gripper.move_gripper_m(gripper_width, args.gripper_force)
                     command_gate = False
                     command_target = state.copy()
+                    previous_joint_velocity = None
                 elif args.execute:
                     command_target = state.copy()
+                    previous_joint_velocity = None
 
-                cameras.show(frames, args.execute and motion_enabled)
+                if (
+                    hg_intervening
+                    and may_command
+                    and hg_recorder is not None
+                    and hg_sample is not None
+                ):
+                    hg_recorder.capture(
+                        tick,
+                        state.tolist(),
+                        target.tolist(),
+                        list(robot.fk(joints)),
+                        [
+                            float(requested - actual)
+                            for requested, actual in zip(raw[:6], state[:6])
+                        ],
+                        {
+                            "leader_state": hg_sample.leader_state,
+                            "novice_action": np.asarray(novice_raw).tolist(),
+                            "expert_requested_action": np.asarray(raw).tolist(),
+                            "following_error": (
+                                np.asarray(target) - np.asarray(state)
+                            ).tolist(),
+                            "leader_feedback_age": hg_sample.feedback_age,
+                        },
+                        show_preview=False,
+                    )
+
+                recorder.capture(
+                    tick,
+                    frames,
+                    state,
+                    target if may_command else state,
+                    raw,
+                    trial_id,
+                    bool(args.execute and motion_enabled),
+                    bool(may_command),
+                    toggle_event,
+                )
+                cameras.show(
+                    frames,
+                    recorder.active
+                    or bool(hg_recorder is not None and hg_recorder.active),
+                )
                 control_loop_ms = (time.monotonic() - tick) * 1000.0
                 control_deadline_missed = control_loop_ms > period * 1000.0
 
@@ -1929,6 +3205,7 @@ def main(argv: list[str] | None = None) -> int:
                     "camera_age_ms": camera_age_ms, "inference_ms": inference_ms,
                     "inference_limit_ms": inference_limit_ms,
                     "rate_hz": args.rate,
+                    "warn_inference_ms": args.warn_inference_ms,
                     "max_inference_ms": args.max_inference_ms,
                     "max_chunk_inference_ms": max_chunk_inference_ms,
                     "planner_mode": (
@@ -1950,15 +3227,33 @@ def main(argv: list[str] | None = None) -> int:
                     "camera_roles": camera_roles,
                     "camera_fps": args.camera_fps,
                     "max_joint_step_deg": args.max_joint_step_deg,
+                    "max_joint_acceleration_deg_s2": (
+                        args.max_joint_acceleration_deg_s2
+                    ),
                     "max_gripper_step_mm": args.max_gripper_step_mm,
                     "max_joint_lead_deg": args.max_joint_lead_deg,
                     "max_gripper_lead_mm": args.max_gripper_lead_mm,
+                    "warn_act_raw_joint_gap_deg": (
+                        args.warn_act_raw_joint_gap_deg
+                    ),
                     "max_act_raw_joint_gap_deg": args.max_act_raw_joint_gap_deg,
+                    "max_act_raw_gap_consecutive_steps": (
+                        args.max_act_raw_gap_consecutive_steps
+                    ),
                     "max_act_raw_gripper_gap_mm": args.max_act_raw_gripper_gap_mm,
+                    "max_act_raw_joint_bound_tolerance_deg": (
+                        args.max_act_raw_joint_bound_tolerance_deg
+                    ),
                     "max_act_raw_gripper_bound_tolerance_mm": (
                         args.max_act_raw_gripper_bound_tolerance_mm
                     ),
                     "max_act_clamp_hold_steps": args.max_act_clamp_hold_steps,
+                    "act_subgoal_min_progress_deg": (
+                        args.act_subgoal_min_progress_deg
+                    ),
+                    "act_subgoal_min_gripper_progress_mm": (
+                        args.act_subgoal_min_gripper_progress_mm
+                    ),
                     "gripper_max_mm": args.gripper_max_mm,
                     "gripper_force": args.gripper_force,
                     "control_period_ms": period * 1000.0,
@@ -1976,6 +3271,22 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                     "trial_timed_out": trial_timed_out,
                     "toggle_event": toggle_event, "command_sent": may_command,
+                    "recording_active": recorder.active,
+                    "hg_dagger_enabled": bool(args.hg_dagger),
+                    "hg_intervening": bool(hg_intervening),
+                    "hg_expert_action_recorded": bool(
+                        hg_intervening and may_command
+                    ),
+                    "hg_dataset_root": (
+                        None
+                        if hg_recorder is None or hg_recorder.root is None
+                        else str(hg_recorder.root)
+                    ),
+                    "recording_root": (
+                        None
+                        if recorder.session_root is None
+                        else str(recorder.session_root)
+                    ),
                     "n_action_steps": getattr(config, "n_action_steps", None),
                     **({
                         "chunk_size": getattr(config, "chunk_size", None),
@@ -1989,16 +3300,69 @@ def main(argv: list[str] | None = None) -> int:
                     "action_queue_depth_before": queue_depth_before,
                     "action_queue_depth_after": queue_depth_after,
                     "action_clamped": action_clamped,
+                    "joint_smoothing_applied": smoothing_applied,
+                    "shaped_action": np.asarray(shaped_action).tolist(),
+                    "proposed_joint_velocity_deg_s": np.degrees(
+                        proposed_joint_velocity
+                    ).tolist(),
+                    "command_joint_velocity_deg_s": (
+                        None if command_joint_velocity is None
+                        else np.degrees(command_joint_velocity).tolist()
+                    ),
+                    "command_joint_acceleration_deg_s2": (
+                        None if command_joint_acceleration is None
+                        else np.degrees(command_joint_acceleration).tolist()
+                    ),
                     **({
                         "act_tracking_action": np.asarray(tracking_raw).tolist(),
+                        "act_control_action": np.asarray(control_raw).tolist(),
                         "act_tracking_clamped": tracking_clamped,
                         "act_gripper_boundary_corrected": bool(raw[6] != tracking_raw[6]),
                     } if policy_type in {"act", "pi0"} else {}),
                     "act_action_held": act_action_held,
+                    "act_policy_clock_frozen": act_action_held,
                     "act_hold_steps": act_hold_steps,
                     "act_hold_timeout": act_hold_timeout,
+                    "act_backpressure_active": latched_act_subgoal is not None,
+                    "act_backpressure_created": act_subgoal_created,
+                    "act_backpressure_released": act_subgoal_reached,
+                    "act_backpressure_no_progress_steps": act_hold_steps,
+                    "act_subgoal_active": latched_act_subgoal is not None,
+                    "act_subgoal_created": act_subgoal_created,
+                    "act_subgoal_reached": act_subgoal_reached,
+                    "act_subgoal": (
+                        None if latched_act_subgoal is None
+                        else np.asarray(latched_act_subgoal).tolist()
+                    ),
+                    "act_subgoal_joint_error_deg": (
+                        None if act_subgoal_joint_error is None
+                        else math.degrees(act_subgoal_joint_error)
+                    ),
+                    "act_subgoal_max_joint_error_deg": (
+                        None if act_subgoal_max_joint_error is None
+                        else math.degrees(act_subgoal_max_joint_error)
+                    ),
+                    "act_subgoal_gripper_error_mm": (
+                        None if act_subgoal_gripper_error is None
+                        else act_subgoal_gripper_error * 1000.0
+                    ),
+                    "act_subgoal_joint_progress_deg": (
+                        None if act_subgoal_joint_progress is None
+                        else math.degrees(act_subgoal_joint_progress)
+                    ),
+                    "act_subgoal_gripper_progress_mm": (
+                        None if act_subgoal_gripper_progress is None
+                        else act_subgoal_gripper_progress * 1000.0
+                    ),
+                    "act_subgoal_no_progress_steps": act_hold_steps,
                     "act_raw_action_ok": act_raw_action_ok,
+                    "act_raw_action_within_envelope": (
+                        act_raw_action_within_envelope
+                    ),
+                    "act_raw_gap_hard_steps": act_raw_gap_hard_steps,
+                    "act_raw_action_warnings": act_raw_action_warnings,
                     "watchdog_failures": watchdog_failures,
+                    "performance_warnings": performance_warnings,
                     "chunk_age_ms": chunk_age_ms,
                     "num_inference_steps": getattr(
                         config, "num_inference_steps", None
@@ -2010,10 +3374,16 @@ def main(argv: list[str] | None = None) -> int:
                     "arm_prepared": arm_prepared,
                     "mode_feedback": mode_feedback,
                     "state": state.tolist(), "raw_action": raw.tolist(), "safe_action": target.tolist(),
+                    "novice_action_before_or_during_intervention": (
+                        np.asarray(novice_raw).tolist()
+                        if hg_intervening else None
+                    ),
                 }
                 log.write(json.dumps(row) + "\n")
                 log.flush()
-                if not healthy:
+                if hg_intervening and may_command:
+                    mode = "EXPERT"
+                elif not healthy:
                     mode = "WATCHDOG"
                 elif may_command:
                     mode = "EXEC"
@@ -2038,6 +3408,11 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         if robot is not None and args.execute:
             motion_enabled = False
+            if homing_active:
+                emergency_stopped = True
+                robot.electronic_emergency_stop()
+                print("\nCtrl+C during homing: electronic emergency stop sent.")
+                return 130
             print("\nCtrl+C received: pausing model control, homing, then exiting.")
             homing_active = True
             try:
@@ -2054,6 +3429,8 @@ def main(argv: list[str] | None = None) -> int:
                     robot, robot_config, gripper, held_gripper_width,
                     args.gripper_force, args.feedback_timeout,
                     args.home_speed_percent, args.home_timeout,
+                    homing_emergency_stop_requested,
+                    record_blocking_motion,
                 )
                 homing_active = False
                 arm_prepared = False
@@ -2090,6 +3467,16 @@ def main(argv: list[str] | None = None) -> int:
                 robot.move_js(hold)
             except Exception:
                 pass
+        # Restore the physical leader hold before waiting for any video
+        # encoder queues to drain during recorder shutdown.
+        if hg_expert is not None:
+            hg_expert.close()
+        if recorder is not None:
+            recorder.close()
+            for message in recorder.drain_messages():
+                print(f"\n{message}", flush=True)
+        if hg_recorder is not None:
+            hg_recorder.close()
         if cameras is not None:
             cameras.close()
         base.disconnect_quietly(robot)

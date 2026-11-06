@@ -4,6 +4,7 @@ What this file does:
   - Registers robot uid: ``piper``.
   - Registers env id: ``PiperPickCubeToBox-v1``.
   - Registers env id: ``PiperPickCupToContainer-v1`` (recommended).
+  - Registers env id: ``PiperLiftCup-v1`` (current handleless-cup dataset).
   - Loads the self-contained Piper URDF assets distributed with ``robotarm``.
   - Builds 5 colored objects, 3 colored bins, and D405/D435 camera sensors.
   - Adds gripper contact-force feedback to state observations.
@@ -981,3 +982,234 @@ class PiperPickCupToContainerEnv(BaseEnv):
 
     def compute_normalized_dense_reward(self, obs: Any, action: torch.Tensor, info: dict):
         return self.compute_dense_reward(obs, action, info) / 10.0
+
+
+@register_agent()
+class PiperLightCup(Piper):
+    """Same Piper mechanics, with a compliant drive for the light cup."""
+
+    uid = "piper_light_cup"
+    gripper_stiffness = 500
+    gripper_damping = 20
+    gripper_force_limit = 5
+
+
+@register_env("PiperLiftCup-v1", max_episode_steps=700)
+class PiperLiftCupEnv(PiperPickCupToContainerEnv):
+    """Lift a handleless cup from a brown mat, matching the real grasp dataset.
+
+    Dimensions are estimates, in metres. The cup is a rigid, hollow tapered
+    compound shape, not a deformable paper simulation. Its origin is at the
+    geometric centre so upright and sideways grasps share a sensible target.
+    Success requires the entire cup to clear the mat by 70 mm while held by
+    both fingers for ten consecutive control steps (0.5 s at 20 Hz).
+    """
+
+    SUPPORTED_ROBOTS = ["piper_light_cup"]
+    robot_base_x = -0.42
+
+    def __init__(
+        self, *args, cup_pose="mixed", cup_top_radius=0.030,
+        cup_bottom_radius=0.024, cup_height=0.090, hold_steps=10, **kwargs,
+    ):
+        if cup_pose not in ("upright", "side", "mixed"):
+            raise ValueError("cup_pose must be upright, side or mixed")
+        if not (0.004 < cup_bottom_radius <= cup_top_radius < 0.035):
+            raise ValueError("cup radii must fit the 70 mm Piper gripper")
+        if not 0.02 < cup_height < 0.20 or hold_steps < 1:
+            raise ValueError("invalid cup height or hold_steps")
+        self.cup_pose_mode = cup_pose
+        self.cup_radius = cup_top_radius
+        self.cup_bottom_radius = cup_bottom_radius
+        self.cup_height = cup_height
+        self.hold_steps = hold_steps
+        self.mat_top = 0.003
+        kwargs.setdefault("robot_uids", "piper_light_cup")
+        super().__init__(*args, **kwargs)
+
+    @property
+    def _default_sim_config(self):
+        from mani_skill.utils.structs.types import SimConfig, SceneConfig
+
+        # Thin, light cups need smaller timesteps than the older heavy mug.
+        return SimConfig(
+            sim_freq=500, control_freq=20,
+            scene_config=SceneConfig(contact_offset=0.001, solver_position_iterations=20,
+                                     solver_velocity_iterations=4),
+        )
+
+    def _load_agent(self, options: dict):
+        BaseEnv._load_agent(self, options, sapien.Pose(p=[self.robot_base_x, 0, 0]))
+
+    @property
+    def _default_sensor_configs(self):
+        configs = super()._default_sensor_configs
+        mount = sapien_utils.get_obj_by_name(self.agent.robot.get_links(), "gripper_base")
+        configs[0] = CameraConfig(
+            "observation.images.wrist",
+            sapien_utils.look_at(eye=[0.055, 0, 0.015], target=[0, 0, 0.22]),
+            640, 480, np.deg2rad(70), near=0.01, far=2.0, mount=mount,
+        )
+        return configs
+
+    def _load_scene(self, options: dict):
+        self.table_scene = TableSceneBuilder(self)
+        self.table_scene.build()
+        self.cup = self._build_cup()
+        self.cube = self.cup  # shared contact-based grasp helpers
+        visual = sapien.render.RenderMaterial(
+            base_color=[0.43, 0.29, 0.15, 1], roughness=0.95,
+        )
+        physics = sapien.physx.PhysxMaterial(0.8, 0.65, 0.0)
+        self.work_mat = self._build_material_box(
+            [0.33, 0.32, self.mat_top / 2], visual, physics, "brown_work_mat",
+            "kinematic", sapien.Pose(p=[-0.08, 0, self.mat_top / 2]),
+        )
+        self._hold_count = torch.zeros(self.num_envs, device=self.device, dtype=torch.int32)
+        self._hold_last_step = torch.zeros_like(self._hold_count)
+
+    def _build_cup(self):
+        from transforms3d.euler import euler2quat
+
+        builder = self.scene.create_actor_builder()
+        visual = sapien.render.RenderMaterial(
+            base_color=[0.94, 0.93, 0.88, 1], roughness=0.65,
+        )
+        material = sapien.physx.PhysxMaterial(0.8, 0.65, 0.0)
+        wall = 0.0015
+        slope = np.arctan2(self.cup_radius - self.cup_bottom_radius, self.cup_height)
+        mid_radius = (self.cup_radius + self.cup_bottom_radius) / 2 - wall / 2
+        # Overlapping tangent boxes form a hollow tapered wall. Save all corners
+        # so success uses the actual collision envelope, including tipped cups.
+        vertices = []
+        for i in range(24):
+            angle = i * 2 * np.pi / 24
+            pose = sapien.Pose(
+                p=[mid_radius * np.cos(angle), mid_radius * np.sin(angle), 0],
+                q=euler2quat(0, slope, angle),
+            )
+            size = np.array([
+                wall / 2, self.cup_radius * np.tan(np.pi / 24),
+                self.cup_height / (2 * np.cos(slope)),
+            ])
+            builder.add_box_collision(pose=pose, half_size=size, material=material, density=220)
+            builder.add_box_visual(pose=pose, half_size=size, material=visual)
+            for x in (-1, 1):
+                for y in (-1, 1):
+                    for z in (-1, 1):
+                        corner = pose.to_transformation_matrix() @ np.r_[size * [x, y, z], 1]
+                        vertices.append(corner[:3])
+        bottom = sapien.Pose(
+            p=[0, 0, -self.cup_height / 2 + wall / 2],
+            q=[np.sqrt(0.5), 0, np.sqrt(0.5), 0],
+        )
+        builder.add_cylinder_collision(
+            pose=bottom, radius=self.cup_bottom_radius, half_length=wall / 2,
+            material=material, density=220,
+        )
+        builder.add_cylinder_visual(
+            pose=bottom, radius=self.cup_bottom_radius, half_length=wall / 2, material=visual,
+        )
+        # Conservative square envelope also contains the round bottom.
+        for x in (-self.cup_bottom_radius, self.cup_bottom_radius):
+            for y in (-self.cup_bottom_radius, self.cup_bottom_radius):
+                for z in (-self.cup_height / 2, -self.cup_height / 2 + wall):
+                    vertices.append([x, y, z])
+        self._cup_vertices = torch.tensor(np.asarray(vertices), device=self.device, dtype=torch.float32)
+        builder.set_initial_pose(sapien.Pose(p=[0, 0, self.cup_height]))
+        return builder.build(name="white_handleless_cup")
+
+    def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
+        from transforms3d.euler import euler2quat
+
+        b = len(env_idx)
+        self.table_scene.initialize(env_idx)
+        qpos = self.agent.keyframes["rest"].qpos + self._episode_rng.normal(
+            0, self.robot_init_qpos_noise, (b, 8)
+        )
+        qpos[:, -2:] = [0.035, -0.035]
+        self.agent.reset(qpos)
+        self.agent.robot.set_pose(sapien.Pose([self.robot_base_x, 0, 0]))
+        xy = self._episode_rng.uniform([-0.070, -0.10], [-0.035, 0.10], (b, 2))
+        yaw = self._episode_rng.uniform(-np.pi, np.pi, b)
+        side = (
+            self._episode_rng.uniform(size=b) < 0.5 if self.cup_pose_mode == "mixed"
+            else np.full(b, self.cup_pose_mode == "side")
+        )
+        quat = np.array([euler2quat(0, np.pi / 2 if s else 0, a) for s, a in zip(side, yaw)])
+        pose = Pose.create_from_pq(
+            torch.zeros((b, 3), device=self.device),
+            torch.tensor(quat, dtype=torch.float32, device=self.device),
+        )
+        rotation = pose.to_transformation_matrix()[:, :3, :3]
+        min_z = torch.einsum("bij,vj->bvi", rotation, self._cup_vertices)[:, :, 2].amin(1)
+        xyz = torch.zeros((b, 3), device=self.device)
+        xyz[:, :2] = torch.tensor(xy, dtype=torch.float32, device=self.device)
+        xyz[:, 2] = self.mat_top - min_z + 0.001
+        self.cup.set_pose(Pose.create_from_pq(xyz, pose.q))
+        self._hold_count[env_idx] = 0
+        self._hold_last_step[env_idx] = 0
+        if self.domain_randomization and self._render_device is not None:
+            for scene_i in env_idx.detach().cpu().tolist():
+                brightness = float(self._episode_rng.uniform(0.85, 1.15))
+                self.scene.sub_scenes[scene_i].render_system.ambient_light = (
+                    np.array([0.24, 0.25, 0.28]) * brightness
+                ).tolist()
+
+    def evaluate(self):
+        rotation = self.cup.pose.to_transformation_matrix()[:, :3, :3]
+        lowest_z = (
+            torch.einsum("bij,vj->bvi", rotation, self._cup_vertices)[:, :, 2].amin(1)
+            + self.cup.pose.p[:, 2]
+        )
+        clearance = lowest_z - self.mat_top
+        left = self.scene.get_pairwise_contact_forces(self.agent.finger1_link, self.cup)
+        right = self.scene.get_pairwise_contact_forces(self.agent.finger2_link, self.cup)
+        left_norm = torch.linalg.norm(left, dim=1)
+        right_norm = torch.linalg.norm(right, dim=1)
+        # Piper finger joints translate on local Z; the inherited generic
+        # local-Y angle test does not describe these fingertip contact normals.
+        opposing = (left * right).sum(1) < -0.5 * left_norm * right_norm
+        grasped = (left_norm > 0.2) & (right_norm > 0.2) & opposing
+        lifted = clearance >= self.lift_height
+        stable = (
+            (torch.linalg.norm(self.cup.linear_velocity, dim=1) < 0.05)
+            & (torch.linalg.norm(self.cup.angular_velocity, dim=1) < 0.5)
+            & self.agent.is_static(0.2)
+        )
+        good = grasped & lifted & stable
+        # evaluate() may be called repeatedly for overlays/rewards. Count time
+        # only once per physics control step, after GPU state has been fetched.
+        advanced = self._elapsed_steps > self._hold_last_step
+        self._hold_count = torch.where(
+            advanced, torch.where(good, self._hold_count + 1, 0), self._hold_count,
+        )
+        self._hold_last_step = self._elapsed_steps.clone()
+        return dict(
+            success=good & (self._hold_count >= self.hold_steps),
+            is_grasped=grasped, is_lifted=lifted, is_stable=stable,
+            cup_clearance=clearance, hold_count=self._hold_count.clone(),
+            fail=self.cup.pose.p[:, 2] < -0.10,
+        )
+
+    def _get_obs_extra(self, info):
+        left = self.scene.get_pairwise_contact_forces(self.agent.finger1_link, self.cup)
+        right = self.scene.get_pairwise_contact_forces(self.agent.finger2_link, self.cup)
+        return dict(
+            tcp_pose=self.agent.tcp_pose.raw_pose, cup_pose=self.cup.pose.raw_pose,
+            tcp_to_cup_pos=self.cup.pose.p - self.agent.tcp_pose.p,
+            left_finger_force=left, right_finger_force=right,
+            cup_clearance=info["cup_clearance"].unsqueeze(-1),
+            hold_progress=(info["hold_count"] / self.hold_steps).unsqueeze(-1),
+        )
+
+    def compute_dense_reward(self, obs, action, info):
+        distance = torch.linalg.norm(self.cup.pose.p - self.agent.tcp_pose.p, dim=1)
+        reward = 1 - torch.tanh(6 * distance)
+        reward += info["is_grasped"].float()
+        reward += 2 * torch.clamp(info["cup_clearance"] / self.lift_height, 0, 1) * info["is_grasped"]
+        reward += torch.clamp(info["hold_count"] / self.hold_steps, 0, 1)
+        return torch.where(info["success"], 5.0, reward)
+
+    def compute_normalized_dense_reward(self, obs, action, info):
+        return self.compute_dense_reward(obs, action, info) / 5.0

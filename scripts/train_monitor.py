@@ -242,6 +242,7 @@ PAGE = r"""<!doctype html>
     --grid: #e1e0d9; --baseline: #c3c2b7; --border: rgba(11,11,11,0.10);
     --series-1: #2a78d6; --series-2: #eb6834;
     --ok: #006300; --bad: #d03b3b; --tip-bg: #fff;
+    --language-selected: #175eb5; --language-selected-text: #fff;
   }
   @media (prefers-color-scheme: dark) {
     :root:where(:not([data-theme="light"])) {
@@ -251,6 +252,7 @@ PAGE = r"""<!doctype html>
       --grid: #2c2c2a; --baseline: #383835; --border: rgba(255,255,255,0.10);
       --series-1: #3987e5; --series-2: #d95926;
       --ok: #0ca30c; --bad: #d03b3b; --tip-bg: #242422;
+      --language-selected: #8abafa; --language-selected-text: #101820;
     }
   }
   * { box-sizing: border-box; }
@@ -262,6 +264,17 @@ PAGE = r"""<!doctype html>
   .wrap { max-width: 900px; margin: 0 auto; }
   header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
   h1 { font-size: 19px; margin: 0; letter-spacing: -0.01em; }
+  .language-switch { display: inline-flex; align-self: center; gap: 2px; margin-left: auto;
+                     padding: 3px; border: 1px solid var(--border); border-radius: 10px;
+                     background: var(--surface-1); white-space: nowrap; }
+  .language-switch button { min-width: 62px; padding: 5px 10px; border: 0; border-radius: 7px;
+                            background: transparent; color: var(--text-secondary); font-weight: 600; }
+  .language-switch button:hover:not(.selected) { background: var(--page); color: var(--text-primary); }
+  .language-switch button.selected { background: var(--language-selected);
+                                      color: var(--language-selected-text);
+                                      box-shadow: 0 1px 4px rgba(0,0,0,0.15); }
+  .language-switch button:focus-visible { outline: 2px solid var(--language-selected);
+                                          outline-offset: 2px; }
   .status { font-size: 12.5px; color: var(--text-secondary); }
   .status .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
                  background: var(--muted); margin-right: 6px; vertical-align: middle; }
@@ -321,29 +334,33 @@ PAGE = r"""<!doctype html>
 <body>
 <div class="wrap">
   <header>
-    <h1>训练监视</h1>
+    <h1 data-i18n="title">训练监视</h1>
     <div class="status" id="status"><span class="dot"></span><span id="statustext">连接中…</span></div>
+    <div class="language-switch" id="language-switch" role="group" aria-label="页面语言">
+      <button type="button" data-lang="zh" aria-pressed="true">中文</button>
+      <button type="button" data-lang="en" aria-pressed="false">English</button>
+    </div>
   </header>
   <div class="path" id="path"></div>
 
   <section class="stats">
-    <div class="tile"><div class="k">训练 L1（最新）</div><div class="v s1" id="m-train">—</div><div class="s" id="s-train"></div></div>
-    <div class="tile"><div class="k">验证 loss（最新）</div><div class="v s2" id="m-eval">—</div><div class="s" id="s-eval"></div></div>
-    <div class="tile"><div class="k">验证最低</div><div class="v s2" id="m-best">—</div><div class="s" id="s-best"></div></div>
-    <div class="tile"><div class="k">训练 / 验证 差距</div><div class="v" id="m-gap">—</div><div class="s">等比例差距</div></div>
+    <div class="tile"><div class="k" data-i18n="latestTrain">训练 L1（最新）</div><div class="v s1" id="m-train">—</div><div class="s" id="s-train"></div></div>
+    <div class="tile"><div class="k" data-i18n="latestEval">验证 loss（最新）</div><div class="v s2" id="m-eval">—</div><div class="s" id="s-eval"></div></div>
+    <div class="tile"><div class="k" data-i18n="bestEval">验证最低</div><div class="v s2" id="m-best">—</div><div class="s" id="s-best"></div></div>
+    <div class="tile"><div class="k" data-i18n="gap">训练 / 验证 差距</div><div class="v" id="m-gap">—</div><div class="s" data-i18n="ratio">等比例差距</div></div>
   </section>
 
   <figure>
     <div class="legend">
-      <span><i style="background:var(--series-1)"></i>训练 L1 loss</span>
-      <span><i style="background:var(--series-2)"></i>验证 loss</span>
+      <span><i style="background:var(--series-1)"></i><span data-i18n="trainLoss">训练 L1 loss</span></span>
+      <span><i style="background:var(--series-2)"></i><span data-i18n="evalLoss">验证 loss</span></span>
     </div>
     <svg id="chart" viewBox="0 0 860 380" role="img" aria-label="训练与验证 loss 曲线"></svg>
   </figure>
 
   <div class="cps">
-    <h2>Checkpoints</h2>
-    <div id="cplist"><div class="empty">等待 checkpoint…</div></div>
+    <h2 data-i18n="checkpoints">Checkpoints</h2>
+    <div id="cplist"><div class="empty" data-i18n="waitingCheckpoint">等待 checkpoint…</div></div>
   </div>
 </div>
 <div class="tip" id="tip"></div>
@@ -356,7 +373,71 @@ const $ = id => document.getElementById(id);
 const el = (n, a) => { const e = document.createElementNS(NS, n); for (const k in a) e.setAttribute(k, a[k]); return e; };
 const fmt = v => v == null ? "—" : (v >= 0.1 ? v.toFixed(4) : v.toFixed(5));
 const fmtStep = s => s.toLocaleString("en-US");
-let SNAP = null, GEOM = null;
+const I18N = {
+  zh: {
+    title: "训练监视", connecting: "连接中…", disconnected: "服务已断开",
+    languageControl: "页面语言", missingRunFile: "尚无 wandb run 文件",
+    latestTrain: "训练 L1（最新）", latestEval: "验证 loss（最新）",
+    bestEval: "验证最低", gap: "训练 / 验证 差距", ratio: "等比例差距",
+    trainLoss: "训练 L1 loss", evalLoss: "验证 loss", trainShort: "训练", evalShort: "验证",
+    checkpoints: "Checkpoints", waitingCheckpoint: "等待 checkpoint…",
+    waitingCheckpointSave: "等待 checkpoint（save_freq 步后出现）…",
+    waitingMetrics: "等待第一批指标（run 文件出现后约 100 步）…",
+    waitingRun: "等待 run 出现…", totalSteps: "共", saveEvery: "save 每",
+    evalEvery: "eval 每", trainPoints: "训练点", evalPoints: "验证点",
+    step: "步", best: "最低", bestLinkTitle: "checkpoints/best 当前指向这里",
+    linkBest: "把最佳 checkpoint 链接为 checkpoints/best",
+    linked: "已链接 →", failed: "失败：", requestFailed: "请求失败",
+    noBest: "尚无验证点或 checkpoint",
+  },
+  en: {
+    title: "Training Monitor", connecting: "Connecting…", disconnected: "Server disconnected",
+    languageControl: "Page language", missingRunFile: "No wandb run file yet",
+    latestTrain: "Latest training L1", latestEval: "Latest validation loss",
+    bestEval: "Lowest validation loss", gap: "Validation / training gap", ratio: "Validation-to-training ratio",
+    trainLoss: "Training L1 loss", evalLoss: "Validation loss", trainShort: "Training", evalShort: "Validation",
+    checkpoints: "Checkpoints", waitingCheckpoint: "Waiting for a checkpoint…",
+    waitingCheckpointSave: "Waiting for a checkpoint (after save_freq steps)…",
+    waitingMetrics: "Waiting for metrics (about 100 steps after the run starts)…",
+    waitingRun: "Waiting for the run to start…", totalSteps: "Total", saveEvery: "save every",
+    evalEvery: "eval every", trainPoints: "training points", evalPoints: "validation points",
+    step: "step", best: "best", bestLinkTitle: "checkpoints/best points here",
+    linkBest: "Link best checkpoint as checkpoints/best",
+    linked: "Linked →", failed: "Failed: ", requestFailed: "Request failed",
+    noBest: "No validation point or checkpoint yet",
+  },
+};
+let LANG = "zh", SNAP = null, GEOM = null, CONNECTED = true;
+try { LANG = localStorage.getItem("train-monitor-language") === "en" ? "en" : "zh"; } catch (_) {}
+const t = key => I18N[LANG][key];
+
+function applyLanguage() {
+  document.documentElement.lang = LANG === "zh" ? "zh-CN" : "en";
+  document.title = t("title");
+  document.querySelectorAll("[data-i18n]").forEach(node => { node.textContent = t(node.dataset.i18n); });
+  $("chart").setAttribute("aria-label", LANG === "zh" ? "训练与验证 loss 曲线" : "Training and validation loss chart");
+  $("language-switch").setAttribute("aria-label", t("languageControl"));
+  document.querySelectorAll(".language-switch button").forEach(button => {
+    const selected = button.dataset.lang === LANG;
+    button.classList.toggle("selected", selected);
+    button.setAttribute("aria-pressed", String(selected));
+  });
+  if (SNAP) render(SNAP);
+  else $("statustext").textContent = t("connecting");
+  if (!CONNECTED) {
+    $("status").className = "status";
+    $("statustext").textContent = t("disconnected");
+  }
+}
+
+document.querySelectorAll(".language-switch button").forEach(button => {
+  button.addEventListener("click", () => {
+    if (LANG === button.dataset.lang) return;
+    LANG = button.dataset.lang;
+    try { localStorage.setItem("train-monitor-language", LANG); } catch (_) {}
+    applyLanguage();
+  });
+});
 
 function niceTicks(lo, hi) {
   const out = [];
@@ -373,9 +454,9 @@ function draw(snap) {
   const train = snap.train || [], ev = snap.eval || [];
   const all = train.concat(ev);
   if (!all.length) {
-    const t = el("text", { x: W / 2, y: H / 2, class: "tick", "text-anchor": "middle" });
-    t.textContent = "等待第一批指标（run 文件出现后约 100 步）…";
-    svg.appendChild(t); GEOM = null; return;
+    const placeholder = el("text", { x: W / 2, y: H / 2, class: "tick", "text-anchor": "middle" });
+    placeholder.textContent = t("waitingMetrics");
+    svg.appendChild(placeholder); GEOM = null; return;
   }
   const values = all.map(p => p[1]).filter(v => v > 0);
   let lo = Math.min(...values), hi = Math.max(...values);
@@ -413,7 +494,7 @@ function draw(snap) {
     const last = pts[pts.length - 1];
     svg.appendChild(el("circle", { cx: xPix(last[0]), cy: yPix(last[1]), r: 4, class: "dot " + dcls }));
     const lb = el("text", { x: xPix(last[0]) + 9, y: yPix(last[1]) + 4, class: "endlabel" });
-    lb.textContent = (cls === "l1" ? "训练 " : "验证 ") + fmt(last[1]);
+    lb.textContent = (cls === "l1" ? t("trainShort") : t("evalShort")) + " " + fmt(last[1]);
     svg.appendChild(lb);
   }
 
@@ -421,9 +502,9 @@ function draw(snap) {
   if (best && ev.length) {
     const cx = xPix(best.step), cy = yPix(best.loss);
     svg.appendChild(el("circle", { cx, cy, r: 5, class: "dot d2" }));
-    const t = el("text", { x: cx, y: cy - 12, class: "anno", "text-anchor": "middle" });
-    t.textContent = `best ${fmt(best.loss)} @ ${fmtStep(best.step)}`;
-    svg.appendChild(t);
+    const label = el("text", { x: cx, y: cy - 12, class: "anno", "text-anchor": "middle" });
+    label.textContent = `${t("best")} ${fmt(best.loss)} @ ${fmtStep(best.step)}`;
+    svg.appendChild(label);
   }
 
   const cross = el("line", { y1: M.t, y2: M.t + PH, class: "cross", opacity: 0 });
@@ -439,15 +520,15 @@ function draw(snap) {
     const step = Math.max(0, Math.min(xmax, (vx - M.l) / PW * xmax));
     cross.setAttribute("x1", xPix(step)); cross.setAttribute("x2", xPix(step)); cross.setAttribute("opacity", 1);
     const rows = [];
-    if (train.length) { const p = near(train, step); hd[0].setAttribute("cx", xPix(p[0])); hd[0].setAttribute("cy", yPix(p[1])); hd[0].setAttribute("opacity", 1); rows.push(["d1", "训练 L1", fmt(p[1]), p[0]]); }
-    if (ev.length) { const p = near(ev, step); hd[1].setAttribute("cx", xPix(p[0])); hd[1].setAttribute("cy", yPix(p[1])); hd[1].setAttribute("opacity", 1); rows.push(["d2", "验证", fmt(p[1]), p[0]]); }
+    if (train.length) { const p = near(train, step); hd[0].setAttribute("cx", xPix(p[0])); hd[0].setAttribute("cy", yPix(p[1])); hd[0].setAttribute("opacity", 1); rows.push(["d1", t("trainShort") + " L1", fmt(p[1]), p[0]]); }
+    if (ev.length) { const p = near(ev, step); hd[1].setAttribute("cx", xPix(p[0])); hd[1].setAttribute("cy", yPix(p[1])); hd[1].setAttribute("opacity", 1); rows.push(["d2", t("evalShort"), fmt(p[1]), p[0]]); }
     const tip = $("tip");
     tip.replaceChildren();
-    const h = document.createElement("div"); h.className = "h"; h.textContent = "step " + fmtStep(Math.round(step)); tip.appendChild(h);
+    const h = document.createElement("div"); h.className = "h"; h.textContent = t("step") + " " + fmtStep(Math.round(step)); tip.appendChild(h);
     for (const [cls, name, val, at] of rows) {
       const r = document.createElement("div"); r.className = "r";
       const i = document.createElement("i"); i.style.background = cls === "d1" ? "var(--series-1)" : "var(--series-2)";
-      const n = document.createElement("span"); n.className = "n"; n.textContent = name + " (step " + fmtStep(at) + ")";
+      const n = document.createElement("span"); n.className = "n"; n.textContent = name + " (" + t("step") + " " + fmtStep(at) + ")";
       const v = document.createElement("span"); v.className = "v"; v.textContent = val;
       r.append(i, n, v); tip.appendChild(r);
     }
@@ -465,26 +546,26 @@ function draw(snap) {
 
 function render(snap) {
   SNAP = snap;
-  $("path").textContent = snap.run_dir + (snap.run_file ? "  ·  " + snap.run_file.split("/").slice(-2).join("/") : "  ·  尚无 wandb run 文件");
+  $("path").textContent = snap.run_dir + (snap.run_file ? "  ·  " + snap.run_file.split("/").slice(-2).join("/") : "  ·  " + t("missingRunFile"));
   const live = snap.train.length > 0;
   $("status").className = "status" + (live ? " live" : "");
   const plan = [];
-  if (snap.steps) plan.push(`共 ${fmtStep(snap.steps)} 步`);
-  if (snap.save_freq) plan.push(`save 每 ${fmtStep(snap.save_freq)}`);
-  if (snap.eval_steps) plan.push(`eval 每 ${fmtStep(snap.eval_steps)}`);
+  if (snap.steps) plan.push(`${t("totalSteps")} ${fmtStep(snap.steps)} ${t("step")}`);
+  if (snap.save_freq) plan.push(`${t("saveEvery")} ${fmtStep(snap.save_freq)}`);
+  if (snap.eval_steps) plan.push(`${t("evalEvery")} ${fmtStep(snap.eval_steps)}`);
   $("statustext").textContent = live
-    ? `${snap.train.length} 训练点 / ${snap.eval.length} 验证点` + (plan.length ? "  ·  " + plan.join(" · ") : "")
-    : "等待 run 出现…";
+    ? `${snap.train.length} ${t("trainPoints")} / ${snap.eval.length} ${t("evalPoints")}` + (plan.length ? "  ·  " + plan.join(" · ") : "")
+    : t("waitingRun");
 
   const tr = snap.train.length ? snap.train[snap.train.length - 1] : null;
   const ev = snap.eval.length ? snap.eval[snap.eval.length - 1] : null;
   $("m-train").textContent = tr ? fmt(tr[1]) : "—";
-  $("s-train").textContent = tr ? "step " + fmtStep(tr[0]) : "";
+  $("s-train").textContent = tr ? t("step") + " " + fmtStep(tr[0]) : "";
   $("m-eval").textContent = ev ? fmt(ev[1]) : "—";
-  $("s-eval").textContent = ev ? "step " + fmtStep(ev[0]) : "";
+  $("s-eval").textContent = ev ? t("step") + " " + fmtStep(ev[0]) : "";
   const b = snap.best;
   $("m-best").textContent = b ? fmt(b.loss) : "—";
-  $("s-best").textContent = b ? "step " + fmtStep(b.step) : "";
+  $("s-best").textContent = b ? t("step") + " " + fmtStep(b.step) : "";
   if (tr && ev) {
     const ratio = ev[1] / tr[1];
     $("m-gap").textContent = ratio.toFixed(2) + "×";
@@ -494,7 +575,7 @@ function render(snap) {
   const list = $("cplist");
   list.replaceChildren();
   if (!snap.checkpoints.length) {
-    const d = document.createElement("div"); d.className = "empty"; d.textContent = "等待 checkpoint（save_freq 步后出现）…";
+    const d = document.createElement("div"); d.className = "empty"; d.textContent = t("waitingCheckpointSave");
     list.appendChild(d);
   } else {
     const wrap = document.createElement("div"); wrap.className = "cpwrap";
@@ -503,22 +584,22 @@ function render(snap) {
       const isBest = b && b.nearest_checkpoint === step;
       const isLinked = snap.best_link === String(step).padStart(6, "0");
       chip.className = "cp" + (isBest ? " isbest" : "") + (isLinked ? " linked" : "");
-      chip.textContent = fmtStep(step) + (isBest ? "  ← best" : "");
-      chip.title = isLinked ? "checkpoints/best 当前指向这里" : "";
+      chip.textContent = fmtStep(step) + (isBest ? "  ← " + t("best") : "");
+      chip.title = isLinked ? t("bestLinkTitle") : "";
       wrap.appendChild(chip);
     }
     list.appendChild(wrap);
     const btn = document.createElement("button");
-    btn.textContent = "把 best 链接为 checkpoints/best";
+    btn.textContent = t("linkBest");
     btn.disabled = !b || b.nearest_checkpoint == null;
     btn.onclick = async () => {
       btn.disabled = true;
       try {
         const r = await fetch("/api/link-best", { method: "POST" });
         const j = await r.json();
-        if (!r.ok) throw new Error(j.error || "failed");
-        btn.textContent = "已链接 → " + j.linked;
-      } catch (e) { btn.textContent = "失败：" + e.message; }
+        if (!r.ok) throw new Error(r.status === 409 ? t("noBest") : (j.error || t("requestFailed")));
+        btn.textContent = t("linked") + " " + j.linked;
+      } catch (e) { btn.textContent = t("failed") + e.message; }
       setTimeout(tick, 300);
     };
     list.appendChild(btn);
@@ -529,12 +610,16 @@ function render(snap) {
 async function tick() {
   try {
     const r = await fetch("/api/metrics");
+    if (!r.ok) throw new Error("metrics request failed");
+    CONNECTED = true;
     render(await r.json());
   } catch (e) {
+    CONNECTED = false;
     $("status").className = "status";
-    $("statustext").textContent = "服务已断开";
+    $("statustext").textContent = t("disconnected");
   }
 }
+applyLanguage();
 tick();
 setInterval(tick, 3000);
 </script>

@@ -10,6 +10,7 @@ from collections import Counter
 from pathlib import Path
 
 from ..paths import ARTIFACTS_ROOT
+from .dataset_trim import exported_reviews
 
 
 INCLUDED_STATUSES = {"", "keep"}
@@ -32,6 +33,11 @@ def load_reviews(reviews_path: Path, total: int) -> tuple[dict, dict[int, str]]:
     if not reviews_path.is_file():
         raise ValueError(f"quality-review file not found: {reviews_path}")
     document = json.loads(reviews_path.read_text(encoding="utf-8"))
+    return validate_reviews(document, total)
+
+
+def validate_reviews(document: dict, total: int) -> tuple[dict, dict[int, str]]:
+    """Validate both on-disk reviews and reviews inherited from an export."""
     reviews = document.get("episodes", {})
     if not isinstance(reviews, dict):
         raise ValueError("quality-review 'episodes' must be an object")
@@ -115,7 +121,16 @@ def select_training_episodes(
     dataset_root = dataset_root.expanduser().resolve()
     reviews_path = reviews_path.expanduser().resolve()
     total = dataset_total_episodes(dataset_root)
-    document, statuses = load_reviews(reviews_path, total)
+    if (dataset_root / "TRIM_INCOMPLETE.txt").exists():
+        raise ValueError("裁剪导出尚未完成或已失败，不能使用此数据集训练")
+    inherited = None
+    if not reviews_path.exists() and reviews_path == default_reviews_path(dataset_root).resolve():
+        inherited = exported_reviews(dataset_root)
+    if inherited is not None:
+        document, statuses = validate_reviews(inherited, total)
+        print(f"Quality filter: inherited remapped reviews from {dataset_root / 'meta/trim_provenance.json'}; trims already applied", file=sys.stderr)
+    else:
+        document, statuses = load_reviews(reviews_path, total)
     recorded_root = document.get("dataset_root")
     if recorded_root and Path(recorded_root).expanduser().resolve() != dataset_root:
         raise ValueError(

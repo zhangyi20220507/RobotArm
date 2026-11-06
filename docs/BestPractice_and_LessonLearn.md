@@ -140,6 +140,54 @@ GAME30 混合了不同控制后端；尚未按后端单独评估，不认定它�
 | piper_pick_cup_lf_20260924 | 33 / 12483 | 主从采集 |
 | piper_pick_cup_test_5eps | 5 / 2846 | 独立测试 |
 
+### 1.5 LeRobot 帧、视频与语言 task 的对应关系（2026-10-29）
+
+LeRobot 数据集不能只看 `meta/tasks.parquet` 判断每条轨迹用了什么任务。当前项目中的对应关系是：
+
+| 位置 | 粒度 | 含义 |
+|---|---|---|
+| `data/chunk-*/file-*.parquet` | 每行一帧 | `observation.state`、`action`、`timestamp`、`frame_index`、`episode_index`、全局 `index` 和 `task_index` |
+| `videos/<camera>/chunk-*/file-*.mp4` | 图像序列 | 真正的相机画面；parquet 不重复存放每张图片，通过 episode、帧序号/时间和视频元数据对齐 |
+| `meta/tasks.parquet` | 每种语言任务一行 | `task_index -> task` 文本映射 |
+| `meta/episodes/chunk-*/file-*.parquet` | 每个 episode 一行 | episode 统计和该 episode 出现的 `tasks` |
+| `meta/task_relabel.json` | 数据集级审计记录 | 本项目重标工具写入的旧/新标签记录；它不是训练时读取 task 的权威来源 |
+
+对当前 LeRobot 0.6.x，`tasks.parquet` 还有一个容易被普通 parquet 查看器掩盖的约束：语言文本必须保存为
+名称为 `task` 的 Pandas index，`task_index` 才是普通数据列。仅仅写出同名的 `task` 普通列虽然看起来相同，
+但 `LeRobotDataset` 会把行号误读成 task，最终使 π0 tokenizer 报 `Task cannot be None`。重标后必须用
+`LeRobotDataset(...)[0]["task"]` 验证得到的是非空字符串，不能只用 Arrow 查看列值。
+
+因此，`data/.../file-000.parquet` 是帧级表：在 20 FPS 数据中，每行约对应 50 ms 的一次状态和动作；
+图片本体仍在 MP4 中。某帧的语言条件先读取该行的 `task_index`，再到 `meta/tasks.parquet` 查文本。
+训练代码会自动完成这个关联，不需要在图片文件名中写 task。
+
+这一区别对策略很重要：ACT 当前只使用视觉和机器人状态，不消费自然语言 task；π0 会把 task 文本作为条件，
+训练标签和在线运行的 `--task` 必须语义一致。不要把同一实际行为随意写成多个字符串，否则相同视觉/动作会被分散到
+不同语言条件中；也不要只改 `meta/tasks.parquet` 而不改帧表的 `task_index` 和 episode 元数据。
+
+本次抓杯数据曾混有三个文本标签，但轨迹实际都是抓取直立或侧倒的杯子。已发布统一标签的数据集：
+
+```text
+data/lerobot/piper_pick_cup_direct_223eps_trimmed_single_task_20261029
+214 episodes / 51051 frames / 20 FPS
+task_index 0 = Pick up the cup in different poses
+```
+
+它由以下命令生成；源数据集保留不变，工具会同步重写 tasks、逐帧 `task_index` 和 episode 的 `tasks`，
+并保留 `meta/task_relabel.json` 作为审计信息：
+
+```bash
+robotarm modeling relabel-dataset-task -- \
+  --dataset-root data/lerobot/piper_pick_cup_direct_223eps_trimmed_20261028 \
+  --output-root data/lerobot/piper_pick_cup_direct_223eps_trimmed_single_task_20261029 \
+  --task "Pick up the cup in different poses" \
+  --execute
+```
+
+最佳实践是在 π0 打包和训练前同时核对四件事：`info.json` 的 episode/frame 数、`tasks.parquet` 的文本、
+帧表中 `task_index` 的唯一值、云端启动脚本的任务/数据集路径。旧的混合标签 π0 checkpoint 不会因为数据集重标而改变，
+需要使用这个新数据集重新训练；在线执行时使用同一个 task 文本。
+
 ## 二、训练配方与曲线
 
 ### 2.1 run 对照表

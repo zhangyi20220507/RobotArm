@@ -205,6 +205,12 @@ def run_home(robot, config, args, stopped, *, gripper=None, gripper_force=1.0, g
     base.ensure_arm_status_normal(robot)
     read_joints(robot,config,args.stale_timeout,args.joint_limit_tolerance_deg)
     print(f'HOMING {args.channel}: MOVE_J at {args.speed_percent}%; target=[0,0,0,0,0,0] deg; Ctrl+C E-stops the active arm')
+    # Re-arm the planned-motion trigger immediately before the real target.
+    # Some Piper controllers consume the earlier MOVE_J frame when accepting
+    # the current-position hold and then ignore a later joint target unless a
+    # fresh 0x151 MOVE_J frame precedes it.  This is also what the SDK's
+    # default auto-mode path does for each move_j() call.
+    robot.set_motion_mode(robot.OPTIONS.MOTION_MODE.J)
     robot.move_j([0.0]*6)
     started = time.monotonic()
     last_gripper_tick = started
@@ -262,7 +268,7 @@ def run_home(robot, config, args, stopped, *, gripper=None, gripper_force=1.0, g
                     gripper.move_gripper_m(0.0, gripper_force)
                 detail = 'Gripper closed.' if gripper is not None else 'Gripper unchanged.'
                 print(f'{args.channel}: homing complete; enabled and holding. {detail}')
-                return
+                return joints
         else:
             settled_since = None
         time.sleep(.02)

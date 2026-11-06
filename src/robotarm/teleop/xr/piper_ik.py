@@ -233,3 +233,23 @@ def joint_limit_violations(joints: np.ndarray, tolerance: float) -> list[str]:
                 f"{PIPER_NOMINAL_JOINT_MAX[index]:.4f} rad"
             )
     return violations
+
+
+def command_joint_limit_violations(joints: np.ndarray) -> list[str]:
+    """Describe feedback that cannot be used as an XR streaming command.
+
+    Startup accepts a small feedback-only tolerance so an arm can still be
+    enabled and homed.  XR streaming uses the tighter kinematics limits; make
+    that distinction visible instead of letting the first IK solve pull an
+    out-of-range wrist toward a bound.
+    """
+    violations = []
+    for index, value in enumerate(np.asarray(joints, dtype=float)):
+        minimum = PIPER_JOINT_MIN[index]
+        maximum = PIPER_JOINT_MAX[index]
+        if value < minimum - 1.0e-6 or value > maximum + 1.0e-6:
+            violations.append(
+                f"J{index + 1}={math.degrees(value):.2f} deg outside XR command range "
+                f"[{math.degrees(minimum):.2f}, {math.degrees(maximum):.2f}] deg"
+            )
+    return violations

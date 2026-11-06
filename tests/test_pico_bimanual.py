@@ -10,6 +10,8 @@ from robotarm.teleop.xr.bimanual_runtime import (
     ArmSide,
     LongPress,
     _estop_all,
+    _enable,
+    _home_both_sequentially,
     home_grip_released,
     make_parser,
     simultaneous_home_pressed,
@@ -23,6 +25,7 @@ from robotarm.teleop.xr.arm_ops import update_force_limited_gripper
 
 class FakeXr:
     def get_time_stamp_ns(self): return 123
+    def get_headset_pose(self): return [0, 0, 0, 0, 0, 0, 1]
     def get_left_controller_pose(self): return [1, 2, 3, 0, 0, 0, 1]
     def get_right_controller_pose(self): return [4, 5, 6, 0, 0, 0, 1]
     def get_left_grip(self): return .25
@@ -47,6 +50,12 @@ class PicoBimanualTests(unittest.TestCase):
         self.assertEqual(args.stale_timeout, 0.2)
         self.assertEqual(args.homing_stale_timeout, 1.0)
         self.assertEqual(args.gripper_force_hold_threshold, 0.8)
+        self.assertEqual(args.command_modifier_threshold, 0.8)
+        self.assertEqual(args.scale, 2.0)
+        self.assertEqual(args.tracking_frame, "head")
+        self.assertEqual(args.engage_settle_seconds, 0.25)
+        self.assertEqual(args.engage_deadband_m, 0.002)
+        self.assertFalse(args.verbose_status)
 
     def test_same_can_channel_is_rejected(self):
         args = make_parser().parse_args(["--left-channel", "can0", "--right-channel", "can0"])
@@ -55,6 +64,7 @@ class PicoBimanualTests(unittest.TestCase):
 
     def test_direct_snapshot_contains_both_controllers(self):
         state = snapshot_xr(FakeXr(), False)
+        self.assertEqual(state["headset_pose"][6], 1)
         self.assertEqual(state["left_controller_pose"][:3], [1, 2, 3])
         self.assertEqual(state["right_controller_pose"][:3], [4, 5, 6])
         self.assertAlmostEqual(state["left_grip"], .25)
@@ -129,9 +139,78 @@ class PicoBimanualTests(unittest.TestCase):
         self.assertFalse(home_grip_released(state, "right", 0.7))
 
     def test_simultaneous_home_requires_both_home_buttons(self):
-        self.assertTrue(simultaneous_home_pressed({"X_button": True, "A_button": True}))
-        self.assertFalse(simultaneous_home_pressed({"X_button": True, "A_button": False}))
-        self.assertFalse(simultaneous_home_pressed({"X_button": False, "A_button": True}))
+        self.assertTrue(simultaneous_home_pressed({
+            "left_grip": 0.8, "right_grip": 0.9,
+            "left_trigger": 0.0, "right_trigger": 0.0,
+            "X_button": True, "A_button": True,
+        }))
+        self.assertTrue(simultaneous_home_pressed({
+            "left_grip": 0.0, "right_grip": 0.0,
+            "left_trigger": 0.8, "right_trigger": 0.9,
+            "X_button": True, "A_button": True,
+        }))
+        self.assertFalse(simultaneous_home_pressed({
+            "left_grip": 0.0, "right_grip": 0.0,
+            "left_trigger": 0.79, "right_trigger": 0.9,
+            "X_button": True, "A_button": True,
+        }))
+        self.assertFalse(simultaneous_home_pressed({
+            "left_grip": 0.0, "right_grip": 0.0,
+            "left_trigger": 0.9, "right_trigger": 0.9,
+            "X_button": True, "A_button": False,
+        }))
+
+    def test_both_arm_home_is_sequential_left_then_right(self):
+        left, right, args, xrt = Mock(name="left"), Mock(name="right"), Mock(), Mock()
+        calls = []
+
+        def record_home(side, other, *_):
+            calls.append((side, other))
+
+        with patch(
+            "robotarm.teleop.xr.bimanual_runtime._home", side_effect=record_home
+        ), patch("builtins.print"):
+            _home_both_sequentially(left, right, args, xrt, lambda: False)
+        self.assertEqual(calls, [(left, right), (right, left)])
+
+    def test_resume_with_grip_held_does_not_require_regrip(self):
+        from robotarm.teleop.xr.control import Clutch
+
+        clutch = Clutch(
+            0.9, 0.7, engaged=True, blocked=True, mode="grip", fault_latched=True
+        )
+        side = ArmSide(
+            "left", "left", "can0", Mock(), Mock(), Mock(), 0.0,
+            np.zeros(6), clutch, ready=True,
+        )
+        with patch(
+            "robotarm.teleop.xr.bimanual_runtime.wait_for_joint_angles",
+            return_value=np.zeros(6),
+        ), patch("builtins.print"):
+            _enable(side, SimpleNamespace(engagement_mode="grip"))
+        self.assertFalse(clutch.blocked)
+        self.assertFalse(clutch.fault_latched)
+        self.assertTrue(clutch.update(1.0, True))
+
+    def test_resume_blocks_out_of_range_wrist_and_allows_homing(self):
+        from robotarm.teleop.xr.control import Clutch
+
+        current = np.zeros(6)
+        current[4] = np.deg2rad(70.0)
+        side = ArmSide(
+            "right", "right", "can1", Mock(), Mock(), Mock(), 0.0,
+            current.copy(), Clutch(0.9, 0.7, mode="grip"),
+            ready=True, enabled=True, gripper=Mock(),
+        )
+        with patch(
+            "robotarm.teleop.xr.bimanual_runtime.wait_for_joint_angles",
+            return_value=current,
+        ), patch("builtins.print") as output:
+            _enable(side, SimpleNamespace())
+        self.assertTrue(side.clutch.fault_latched)
+        self.assertTrue(side.ready)
+        self.assertIn("J5=70.00 deg", output.call_args.args[0])
+        self.assertIn("RIGHT Grip+A", output.call_args.args[0])
 
     def test_trigger_opens_and_released_trigger_closes_gripper(self):
         gripper = Mock()
@@ -217,6 +296,15 @@ class PicoBimanualTests(unittest.TestCase):
             "--gripper-force", "1.0", "--gripper-force-hold-threshold", "1.1"
         ])
         with self.assertRaisesRegex(ValueError, "gripper-force-hold-threshold"):
+            validate_args(args)
+        args = make_parser().parse_args(["--command-modifier-threshold", "0"])
+        with self.assertRaisesRegex(ValueError, "command-modifier-threshold"):
+            validate_args(args)
+        args = make_parser().parse_args(["--engage-settle-seconds", "1.1"])
+        with self.assertRaisesRegex(ValueError, "engage-settle-seconds"):
+            validate_args(args)
+        args = make_parser().parse_args(["--engage-deadband-m", "0.021"])
+        with self.assertRaisesRegex(ValueError, "engage-deadband-m"):
             validate_args(args)
 
 

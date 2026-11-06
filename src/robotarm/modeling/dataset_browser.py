@@ -18,15 +18,100 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from ..paths import ARTIFACTS_ROOT
-from .dataset_trim import export_dataset, export_plan, frame_bounds, trim_from_seconds
+from .dataset_trim import export_dataset, export_plan, exported_reviews, frame_bounds, trim_from_seconds
+from .quality_filter import default_reviews_path
 
 
 HTML = Path(__file__).with_name("dataset_browser.html").read_text(encoding="utf-8")
 _UNSET = object()
+EPISODE_LABEL_SCHEMA = (
+    {
+        "id": "cup_orientation",
+        "labels": {"zh-CN": "杯子姿态", "en": "Cup orientation"},
+        "options": (
+            {"value": "upright", "labels": {"zh-CN": "杯子直立", "en": "Cup upright"}},
+            {"value": "sideways", "labels": {"zh-CN": "杯子侧倒", "en": "Cup sideways"}},
+            {"value": "uncertain", "labels": {"zh-CN": "其他 / 不确定", "en": "Other / uncertain"}},
+        ),
+    },
+)
+_LABEL_VALUES = {
+    field["id"]: {option["value"] for option in field["options"]}
+    for field in EPISODE_LABEL_SCHEMA
+}
 
 
 def _read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def validate_episode_labels(labels: object) -> dict[str, str]:
+    """Validate the extensible per-episode label object used by reviews."""
+    if labels is None:
+        return {}
+    if not isinstance(labels, dict):
+        raise ValueError("episode labels must be an object")
+    normalized = {}
+    for field, value in labels.items():
+        if field not in _LABEL_VALUES or value not in _LABEL_VALUES[field]:
+            raise ValueError(f"invalid episode label: {field}={value}")
+        normalized[field] = value
+    return normalized
+
+
+def normalize_label_filter(value: object) -> dict[str, str] | None:
+    """Validate an optional exact-label (or unlabeled) export filter."""
+    if value in (None, ""):
+        return None
+    if not isinstance(value, dict) or set(value) != {"field", "value"}:
+        raise ValueError("label filter requires field and value")
+    field, option = value["field"], value["value"]
+    if field not in _LABEL_VALUES or (
+        option != "__unlabeled__" and option not in _LABEL_VALUES[field]
+    ):
+        raise ValueError(f"invalid label filter: {field}={option}")
+    return {"field": field, "value": option}
+
+
+def review_matches_label(review: dict, label_filter: dict | None) -> bool:
+    if label_filter is None:
+        return True
+    actual = review.get("labels", {}).get(label_filter["field"])
+    expected = label_filter["value"]
+    return actual is None if expected == "__unlabeled__" else actual == expected
+
+
+def _episode_metrics(state, action) -> dict:
+    """Return advisory motion checks without assigning an episode validity score."""
+    import numpy as np
+
+    action_step = np.diff(action, axis=0)
+    tracking = action - state
+    joint_step_deg = np.degrees(np.abs(action_step[:, :6])) if len(action_step) else np.zeros((0, 6))
+    grip_step_mm = np.abs(action_step[:, 6]) * 1000 if len(action_step) else np.zeros(0)
+    tracking_deg = np.degrees(np.abs(tracking[:, :6]))
+    tracking_grip_mm = np.abs(tracking[:, 6]) * 1000
+    max_joint_step = float(joint_step_deg.max(initial=0))
+    max_grip_step = float(grip_step_mm.max(initial=0))
+    p95_tracking = float(np.percentile(tracking_deg, 95)) if tracking_deg.size else 0.0
+    p95_grip_tracking = float(np.percentile(tracking_grip_mm, 95)) if tracking_grip_mm.size else 0.0
+    warnings = []
+    for condition, message in (
+        (max_joint_step > 5.0, "动作存在大于 5°/帧的关节跳变"),
+        # Match the 0.01 mm shown in the UI; float32 can represent 10.00 mm as 10.000001 mm.
+        (round(max_grip_step, 2) > 10.0, "夹爪动作存在大于 10 mm/帧的跳变"),
+        (p95_tracking > 5.0, "关节 state/action 跟随误差偏大"),
+        (p95_grip_tracking > 10.0, "夹爪 state/action 跟随误差偏大"),
+    ):
+        if condition:
+            warnings.append(message)
+    return {
+        "max_joint_step_deg": max_joint_step,
+        "max_gripper_step_mm": max_grip_step,
+        "p95_tracking_deg": p95_tracking,
+        "p95_gripper_tracking_mm": p95_grip_tracking,
+        "warnings": warnings,
+    }
 
 
 class DatasetStore:
@@ -57,8 +142,10 @@ class DatasetStore:
 
     def reviews(self) -> dict:
         if not self.reviews_path.exists():
-            return {}
-        data = _read_json(self.reviews_path)
+            data = (exported_reviews(self.root)
+                    if self.reviews_path == default_reviews_path(self.root).resolve() else None) or {}
+        else:
+            data = _read_json(self.reviews_path)
         if data.get("dataset_root") and Path(data["dataset_root"]).expanduser().resolve() != self.root:
             raise ValueError("quality-review file belongs to another dataset")
         reviews = data.get("episodes", {})
@@ -67,10 +154,14 @@ class DatasetStore:
         for index, review in reviews.items():
             if not str(index).isdigit() or not 0 <= int(index) < len(self.episodes) or not isinstance(review, dict):
                 raise ValueError("invalid review episode")
+            validate_episode_labels(review.get("labels"))
             frame_bounds(review.get("trim"), int(self.episodes[int(index)]["length"]), float(self.info["fps"]))
         return reviews
 
-    def save_review(self, episode: int, status: str, note: str, trim=_UNSET) -> dict:
+    def save_review(
+        self, episode: int, status: str, note: str, trim=_UNSET,
+        labels=_UNSET,
+    ) -> dict:
         if not 0 <= episode < len(self.episodes):
             raise ValueError("invalid episode index")
         if status not in {"", "keep", "review", "reject"}:
@@ -78,6 +169,12 @@ class DatasetStore:
         with self._lock:
             reviews = self.reviews()
             review = dict(reviews.get(str(episode), {}))
+            if labels is not _UNSET:
+                saved_labels = validate_episode_labels(labels)
+                if saved_labels:
+                    review["labels"] = saved_labels
+                else:
+                    review.pop("labels", None)
             if trim is not _UNSET:
                 if trim is None:
                     review.pop("trim", None)
@@ -91,7 +188,7 @@ class DatasetStore:
                     else:
                         review["trim"] = saved
             review.update(status=status, note=note.strip())
-            if status or note.strip() or review.get("trim"):
+            if status or note.strip() or review.get("trim") or review.get("labels"):
                 reviews[str(episode)] = review
             else:
                 reviews.pop(str(episode), None)
@@ -110,7 +207,7 @@ class DatasetStore:
         with self._export_lock:
             return copy.deepcopy(self._export)
 
-    def start_export(self, name: str) -> dict:
+    def start_export(self, name: str, label_filter: object = None) -> dict:
         # UI may only create a new sibling dataset, never arbitrary filesystem paths.
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,119}", name):
             raise ValueError("新目录名只允许字母、数字、下划线、点和短横线，不能包含路径")
@@ -118,7 +215,14 @@ class DatasetStore:
         if output.exists() or output.is_symlink() or output.resolve() == self.root:
             raise ValueError("输出目录已经存在，请换一个新名称")
         reviews = copy.deepcopy(self.reviews())
-        plan = export_plan(self.info, self.episodes, reviews)
+        selected_label = normalize_label_filter(label_filter)
+        selected_rows = [
+            row for row in self.episodes
+            if review_matches_label(
+                reviews.get(str(int(row["episode_index"])), {}), selected_label
+            )
+        ]
+        plan = export_plan(self.info, selected_rows, reviews)
         with self._export_lock:
             if self._export["status"] == "running":
                 raise ValueError("已有导出任务正在运行")
@@ -126,7 +230,8 @@ class DatasetStore:
                             "total_frames": sum(item["frames"] for item in plan),
                             "total_episodes": len(plan), "episodes_done": 0,
                             "current_episode": None, "episode_position": None,
-                            "episodes": len(plan), "phase": "加载导出依赖"}
+                            "episodes": len(plan), "phase": "加载导出依赖",
+                            "label_filter": copy.deepcopy(selected_label)}
             initial = copy.deepcopy(self._export)
 
         def update(values):
@@ -161,6 +266,7 @@ class DatasetStore:
                 for row in self.episodes
             ],
             "reviews": self.reviews(),
+            "label_schema": copy.deepcopy(EPISODE_LABEL_SCHEMA),
             "reviews_path": str(self.reviews_path),
             "export_parent": str(self.root.parent),
             "suggested_export_name": self.root.name[:80] + "_trimmed_" + datetime.now().strftime("%Y%m%d_%H%M%S"),
@@ -200,42 +306,7 @@ class DatasetStore:
         state = np.asarray([item["observation.state"] for item in data], dtype=float)
         action = np.asarray([item["action"] for item in data], dtype=float)
         fps = float(self.info["fps"])
-        action_step = np.diff(action, axis=0)
-        tracking = action - state
-        joint_step_deg = np.degrees(np.abs(action_step[:, :6])) if len(action_step) else np.zeros((0, 6))
-        grip_step_mm = np.abs(action_step[:, 6]) * 1000 if len(action_step) else np.zeros(0)
-        tracking_deg = np.degrees(np.abs(tracking[:, :6]))
-        tracking_grip_mm = np.abs(tracking[:, 6]) * 1000
-        timestamp_delta = np.diff(np.asarray(timestamps))
-        max_joint_step = float(joint_step_deg.max(initial=0))
-        max_grip_step = float(grip_step_mm.max(initial=0))
-        p95_tracking = float(np.percentile(tracking_deg, 95)) if tracking_deg.size else 0.0
-        p95_grip_tracking = float(np.percentile(tracking_grip_mm, 95)) if tracking_grip_mm.size else 0.0
-        jitter_ms = float(np.max(np.abs(timestamp_delta - 1.0 / fps)) * 1000) if timestamp_delta.size else 0.0
-        idle_ratio = float(np.mean((joint_step_deg.max(axis=1) < 0.03) & (grip_step_mm < 0.05))) if len(action_step) else 1.0
-        warnings = []
-        score = 100
-        for condition, deduction, message in (
-            (max_joint_step > 5.0, 20, "动作存在大于 5°/帧的关节跳变"),
-            (max_grip_step > 10.0, 15, "夹爪动作存在大于 10 mm/帧的跳变"),
-            (p95_tracking > 5.0, 20, "关节 state/action 跟随误差偏大"),
-            (p95_grip_tracking > 10.0, 10, "夹爪 state/action 跟随误差偏大"),
-            (jitter_ms > 5.0, 15, "时间戳间隔抖动超过 5 ms"),
-            (idle_ratio > 0.45, 10, "静止帧比例较高，请检查无效等待"),
-        ):
-            if condition:
-                score -= deduction
-                warnings.append(message)
-        metrics = {
-            "score": max(0, score),
-            "max_joint_step_deg": max_joint_step,
-            "max_gripper_step_mm": max_grip_step,
-            "p95_tracking_deg": p95_tracking,
-            "p95_gripper_tracking_mm": p95_grip_tracking,
-            "timestamp_jitter_ms": jitter_ms,
-            "idle_ratio": idle_ratio,
-            "warnings": warnings,
-        }
+        metrics = _episode_metrics(state, action)
         duration = int(row["length"]) / float(self.info["fps"])
         return {
             "index": index,
@@ -329,10 +400,11 @@ def make_handler(store: DatasetStore):
                 if not isinstance(body, dict):
                     raise ValueError("request must be an object")
                 if path == "/api/export":
-                    result = store.start_export(body["name"])
+                    result = store.start_export(body["name"], body.get("label_filter"))
                 else:
                     result = store.save_review(int(body["episode"]), str(body.get("status", "")),
-                                               str(body.get("note", "")), body.get("trim", _UNSET))
+                                               str(body.get("note", "")), body.get("trim", _UNSET),
+                                               body.get("labels", _UNSET))
                 self.json_response(result)
             except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
                 self.json_response({"error": str(exc)}, 400)

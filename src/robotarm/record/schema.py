@@ -35,6 +35,16 @@ LEADER_FOLLOWER_SAMPLE_FIELDS = (
     "follower_feedback_age",
 )
 
+# HG-DAgger只把人工接管区间作为监督数据；模型动作和主臂原始状态作为
+# 诊断字段保留在原始NPZ中，raw→LeRobot转换仍只导出action。
+HG_DAGGER_SAMPLE_FIELDS = (
+    "leader_state",
+    "novice_action",
+    "expert_requested_action",
+    "following_error",
+    "leader_feedback_age",
+)
+
 # float32 存储的字段；其余浮点字段按 float64，帧号按 int64。
 FLOAT32_FIELDS = frozenset(
     {
@@ -45,6 +55,8 @@ FLOAT32_FIELDS = frozenset(
         "leader_state",
         "follower_state",
         "following_error",
+        "novice_action",
+        "expert_requested_action",
     }
 )
 

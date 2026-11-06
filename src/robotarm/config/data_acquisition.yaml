@@ -66,7 +66,7 @@ collect-leader-follower:
   feedback-timeout: 3.0
   leader-init-timeout: 30.0 # 已处于零重力模式时，等待 155/156/157 的时间
   stale-timeout: 0.2       # 从臂反馈超时立即停止；零重力主臂无新事件时保持目标
-  home-timeout: 60.0      # h 顺序回零时每台机械臂和夹爪的超时（秒）
+  home-timeout: 60.0      # h 回零时每台机械臂和夹爪各自的超时（秒）
   home-gripper-speed-mm-s: 10.0 # h 回零夹爪最大闭合速度
   # 软件跟随安全限制
   control-rate: 50.0
