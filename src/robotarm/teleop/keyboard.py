@@ -1,10 +1,45 @@
 """Cross-platform immediate keyboard input for control scripts."""
 from __future__ import annotations
 from collections import deque
+from contextlib import contextmanager
 import os
 import sys
 import threading
 import time
+
+
+@contextmanager
+def preserve_terminal_settings(*, ensure_shell_input=False):
+    """Restore the entry TTY state after *all* application cleanup finishes.
+
+    Use a duplicate fd so replacing/closing sys.stdin during cleanup cannot
+    leave the shell without echo. Restoration must not wait for output drain.
+    """
+    if os.name != "posix" or not sys.stdin.isatty():
+        yield
+        return
+    import termios
+
+    fd = os.dup(sys.stdin.fileno())
+    try:
+        previous = termios.tcgetattr(fd)
+        if ensure_shell_input:
+            # A previous interrupted run may already have left cbreak/no-echo
+            # behind. The CLI launcher returns to a shell, so do not faithfully
+            # restore that broken input state again.
+            previous[3] |= termios.ECHO | termios.ICANON | termios.ISIG
+        try:
+            yield
+        finally:
+            try:
+                termios.tcsetattr(fd, termios.TCSANOW, previous)
+            except (OSError, termios.error):
+                # The terminal may itself have disconnected. Preserve the
+                # application's original exception/exit status in that case.
+                pass
+    finally:
+        os.close(fd)
+
 
 def _normalise(key: str) -> str:
     if key == "\x03":
@@ -69,6 +104,34 @@ def read_key_if_available() -> str | None:
 class TerminalKeyEventReader:
     """Continuously timestamp key events without blocking a control loop."""
 
+    ALT_SEQUENCE_TIMEOUT = 0.05
+
+    @classmethod
+    def _decode_bytes(
+        cls, data: bytes, observed_at: float, pending_alt_at: float | None,
+    ) -> tuple[list[tuple[str, float]], float | None]:
+        if (
+            pending_alt_at is not None
+            and observed_at - pending_alt_at > cls.ALT_SEQUENCE_TIMEOUT
+        ):
+            pending_alt_at = None
+        events = []
+        for byte in data:
+            key = chr(byte)
+            if pending_alt_at is not None:
+                if observed_at - pending_alt_at <= cls.ALT_SEQUENCE_TIMEOUT:
+                    events.append((f"alt+{key.lower()}", observed_at))
+                    pending_alt_at = None
+                    continue
+                pending_alt_at = None
+            if key == "\x1b":
+                pending_alt_at = observed_at
+                continue
+            if key not in ("\x03", "\r", "\n"):
+                key = key.lower()
+            events.append((key, observed_at))
+        return events, pending_alt_at
+
     def __init__(self, max_events: int = 256) -> None:
         self._events = deque(maxlen=max_events)
         self._lock = threading.Lock()
@@ -100,27 +163,25 @@ class TerminalKeyEventReader:
     def _read_loop(self) -> None:
         import select
 
-        pending_alt = False
+        pending_alt_at = None
         try:
             while not self._stop.is_set():
                 ready, _, _ = select.select([self._fd], [], [], 0.05)
+                now = time.monotonic()
+                if (
+                    pending_alt_at is not None
+                    and now - pending_alt_at > self.ALT_SEQUENCE_TIMEOUT
+                ):
+                    # A standalone Escape or an incomplete terminal sequence
+                    # must not turn an unrelated future key into Alt+key.
+                    pending_alt_at = None
                 if not ready:
                     continue
                 data = os.read(self._fd, 32)
                 observed_at = time.monotonic()
-                events = []
-                for byte in data:
-                    key = chr(byte)
-                    if pending_alt:
-                        events.append((f"alt+{key.lower()}", observed_at))
-                        pending_alt = False
-                        continue
-                    if key == "\x1b":
-                        pending_alt = True
-                        continue
-                    if key not in ("\x03", "\r", "\n"):
-                        key = key.lower()
-                    events.append((key, observed_at))
+                events, pending_alt_at = self._decode_bytes(
+                    data, observed_at, pending_alt_at
+                )
                 with self._lock:
                     self._events.extend(events)
         except Exception as exc:  # surfaced in the control thread by poll()
@@ -144,6 +205,6 @@ class TerminalKeyEventReader:
         if self._fd is not None and self._previous is not None:
             import termios
 
-            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._previous)
+            termios.tcsetattr(self._fd, termios.TCSANOW, self._previous)
         self._fd = None
         self._previous = None

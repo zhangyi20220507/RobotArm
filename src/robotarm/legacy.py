@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from .teleop.keyboard import preserve_terminal_settings
+
 
 def _normalize_args(extra_args: Sequence[str] | None) -> list[str]:
     if not extra_args:
@@ -13,13 +15,24 @@ def _normalize_args(extra_args: Sequence[str] | None) -> list[str]:
 
 
 def run_process(command: Sequence[str], cwd: Path | None = None) -> int:
-    try:
-        result = subprocess.run([str(item) for item in command], cwd=str(cwd) if cwd else None, check=False)
-    except KeyboardInterrupt:
-        # The terminal also delivers Ctrl+C to the child; it handles its own
-        # motion cleanup. Do not print a second traceback from this wrapper.
-        return 130
-    return int(result.returncode)
+    # Own restoration outside the entire child lifetime: child atexit handlers
+    # and SDK/encoder shutdown must finish before handing the TTY to the shell.
+    with preserve_terminal_settings(ensure_shell_input=True):
+        process = subprocess.Popen(
+            [str(item) for item in command], cwd=str(cwd) if cwd else None,
+        )
+        interrupted = False
+        while True:
+            try:
+                code = process.wait()
+                break
+            except KeyboardInterrupt:
+                # Ctrl+C reaches both processes through the terminal group.
+                # Keep waiting for the child's homing/cleanup; returning here
+                # creates a shell prompt while the child still owns the TTY.
+                # Further Ctrl+C still reaches the child for its emergency stop.
+                interrupted = True
+        return 130 if interrupted else int(code)
 
 
 def run_python_script(script: Path, extra_args: Sequence[str] | None = None, cwd: Path | None = None) -> int:

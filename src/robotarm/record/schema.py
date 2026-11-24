@@ -35,14 +35,18 @@ LEADER_FOLLOWER_SAMPLE_FIELDS = (
     "follower_feedback_age",
 )
 
-# HG-DAgger只把人工接管区间作为监督数据；模型动作和主臂原始状态作为
-# 诊断字段保留在原始NPZ中，raw→LeRobot转换仍只导出action。
+# HG-DAgger原始数据保存完整trial；逐帧来源字段让监督转换只选择专家区间，
+# 同时保留novice/armed/expert完整轨迹供后续HIL-SERL使用。
 HG_DAGGER_SAMPLE_FIELDS = (
     "leader_state",
     "novice_action",
     "expert_requested_action",
     "following_error",
     "leader_feedback_age",
+    "control_source",
+    "expert_mask",
+    "intervention_id",
+    "command_sent",
 )
 
 # float32 存储的字段；其余浮点字段按 float64，帧号按 int64。
@@ -57,6 +61,7 @@ FLOAT32_FIELDS = frozenset(
         "following_error",
         "novice_action",
         "expert_requested_action",
+        "hil_base_action",
     }
 )
 
@@ -67,6 +72,10 @@ def sample_dtype(field: str):
 
     if field == "camera_frame_number":
         return np.int64
+    if field == "intervention_id":
+        return np.int64
+    if field in {"control_source", "expert_mask", "command_sent"}:
+        return np.int8
     if field in FLOAT32_FIELDS:
         return np.float32
     return np.float64

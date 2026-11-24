@@ -143,11 +143,23 @@ class BrowserTrimTests(unittest.TestCase):
 
     def test_meta_exposes_versionable_label_schema(self):
         schema = self.store.meta_payload()["label_schema"]
-        self.assertEqual(schema[0]["id"], "cup_orientation")
+        self.assertEqual([field["id"] for field in schema], ["task_outcome"])
         self.assertEqual(
             {option["value"] for option in schema[0]["options"]},
-            {"upright", "sideways", "uncertain"},
+            {"success", "failure"},
         )
+
+    def test_meta_defaults_to_keep_success_until_manually_saved(self):
+        reviews = self.store.meta_payload()["reviews"]
+        self.assertEqual(reviews["0"], {
+            "status": "keep",
+            "labels": {"task_outcome": "success"},
+            "review_origin": "default",
+        })
+        self.store.save_review(0, "keep", "", labels={"task_outcome": "success"})
+        saved = self.store.meta_payload()["reviews"]
+        self.assertEqual(saved["0"]["review_origin"], "manual")
+        self.assertEqual(saved["1"]["review_origin"], "default")
 
     def test_bad_range_does_not_change_saved_file(self):
         self.store.save_review(0, "keep", "", {"start_s": 5, "end_s": 14})

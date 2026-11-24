@@ -47,7 +47,7 @@ from ...record.recorder import RawEpisodeRecorder
 from ...paths import PIPER_RAW_ROOT
 from ...config import defaults
 from . import device as common
-from .inputs import cartesian_inputs, joint_inputs
+from .inputs import cartesian_inputs, dominant_joint_input, joint_inputs
 from .targets import (
     build_joint_targets,
     cartesian_pose,
@@ -548,6 +548,7 @@ def main(argv: list[str] | None = None) -> int:
         b_pressed_at: float | None = None
         b_long_fired = False
         recorder_broken = False
+        active_joint_index: int | None = None
 
         print(
             f"[gamepad] 机械臂当前{'已使能' if arm_enabled else '未使能'}；"
@@ -754,8 +755,15 @@ def main(argv: list[str] | None = None) -> int:
                     raise RuntimeError("机械臂状态异常，已暂停控制。")
 
                 if control_mode == "joint":
-                    control_inputs = joint_inputs(pad, args.deadzone)
-                    if any(control_inputs):
+                    control_inputs, selected_joint = dominant_joint_input(
+                        joint_inputs(pad, args.deadzone)
+                    )
+                    if selected_joint is not None:
+                        # Re-anchor all joints before a new single-axis jog.
+                        # Thereafter build_joint_targets holds the other five
+                        # at these positions instead of chasing feedback noise.
+                        if selected_joint != active_joint_index:
+                            targets = joints[:]
                         targets, active = build_joint_targets(
                             targets, joints, control_inputs,
                             math.radians(current_step_deg) * rate_scale,
@@ -770,9 +778,12 @@ def main(argv: list[str] | None = None) -> int:
                             f"{active_text:<17}       ",
                             end="", flush=True,
                         )
+                        active_joint_index = selected_joint
                     else:
                         targets = joints[:]
+                        active_joint_index = None
                 else:
+                    active_joint_index = None
                     control_inputs = cartesian_inputs(pad, args.deadzone)
                     if any(control_inputs[:3]):
                         control_inputs[3:] = [0.0, 0.0, 0.0]
@@ -830,6 +841,7 @@ def main(argv: list[str] | None = None) -> int:
                         targets = joints[:]
                         pose_target = cartesian_pose(robot, joints, tcp_offset)
             else:
+                active_joint_index = None
                 targets = joints[:]
                 pose_target = cartesian_pose(robot, joints, tcp_offset)
 

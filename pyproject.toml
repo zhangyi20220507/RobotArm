@@ -9,9 +9,21 @@ description = "Module-based orchestration for the RobotArm workspace"
 requires-python = ">=3.10"
 
 [project.optional-dependencies]
+smolvla-training = [
+    "lerobot[training,smolvla,peft]==0.6.1",
+    "PyYAML>=6,<7",
+    "pyarrow>=21,<30",
+    "wandb>=0.24,<0.28",
+]
 pi-lora = [
     "lerobot[training,pi,peft]==0.6.1",
     "PyYAML>=6,<7",
+    "wandb>=0.24,<0.28",
+]
+cloud-training = [
+    "lerobot[training,pi,smolvla,peft]==0.6.1",
+    "PyYAML>=6,<7",
+    "pyarrow>=21,<30",
     "wandb>=0.24,<0.28",
 ]
 hardware = [
@@ -25,6 +37,11 @@ modeling = [
     "lerobot[dataset,diffusion,smolvla,viz]==0.6.1",
     "pyarrow>=21,<30",
     # LeRobot 0.6.1 still calls wandb.Run.get_url(), removed in wandb 0.28.
+    "wandb>=0.24,<0.28",
+]
+hil-serl = [
+    "lerobot[hilserl]==0.6.1",
+    "PyYAML>=6,<7",
     "wandb>=0.24,<0.28",
 ]
 simulation = [

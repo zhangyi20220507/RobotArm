@@ -6,7 +6,11 @@ import math
 import unittest
 from unittest.mock import patch
 
-from robotarm.teleop.gamepad.targets import cartesian_pose, solve_cartesian_target
+from robotarm.teleop.gamepad.targets import (
+    build_joint_targets,
+    cartesian_pose,
+    solve_cartesian_target,
+)
 from robotarm.core.kinematics.dls_ik import IKError, solve_ik_dls
 
 
@@ -118,6 +122,36 @@ class CartesianTargetTests(unittest.TestCase):
         self.assertAlmostEqual(pose[0], 0.4425)
         self.assertAlmostEqual(pose[1], -0.02)
         self.assertAlmostEqual(pose[2], 0.25)
+
+
+class JointTargetTests(unittest.TestCase):
+    def test_single_joint_jog_holds_unselected_joint_targets(self):
+        previous = [0.10, -0.20, 0.30, -0.40, 0.50, -0.60]
+        # Simulate encoder noise/load drift on the five unselected joints.
+        feedback = [0.11, -0.18, 0.29, -0.42, 0.51, -0.58]
+        targets, active = build_joint_targets(
+            previous,
+            feedback,
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            step=0.01,
+            max_lead=0.10,
+            bounds=[(-1.0, 1.0)] * 6,
+        )
+        self.assertEqual(active, (0,))
+        self.assertAlmostEqual(targets[0], 0.12)
+        self.assertEqual(targets[1:], previous[1:])
+
+    def test_inactive_hold_is_still_clamped_to_feedback_lead(self):
+        targets, active = build_joint_targets(
+            [0.0, 0.5, 0.0, 0.0, 0.0, 0.0],
+            [0.0] * 6,
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            step=0.01,
+            max_lead=0.10,
+            bounds=[(-1.0, 1.0)] * 6,
+        )
+        self.assertEqual(active, (0,))
+        self.assertAlmostEqual(targets[1], 0.10)
 
 
 if __name__ == "__main__":

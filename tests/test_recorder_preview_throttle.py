@@ -31,3 +31,18 @@ class PreviewThrottleTests(unittest.TestCase):
         recorder.active = False
         self.assertFalse(recorder.capture(1., [], [], [], []))
         recorder.cameras.show.assert_called_once()
+
+    def test_preview_refreshes_on_every_control_call(self):
+        recorder = RawEpisodeRecorder.__new__(RawEpisodeRecorder)
+        recorder.cameras = Mock()
+        recorder.cameras.latest.return_value = {"global": (object(), 1.0, 0.0, 1)}
+        recorder.active = False
+        recorder.fps = 20
+
+        recorder.capture(1.0, [], [], [], [])
+        recorder.capture(1.01, [], [], [], [])
+        recorder.capture(1.099, [], [], [], [])
+        recorder.capture(1.1, [], [], [], [])
+
+        self.assertEqual(recorder.cameras.latest.call_count, 4)
+        self.assertEqual(recorder.cameras.show.call_count, 4)

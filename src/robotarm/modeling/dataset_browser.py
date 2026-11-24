@@ -1,4 +1,4 @@
-"""Review episodes, save individual trim ranges, and export a new LeRobot v3 dataset."""
+"""Review raw or LeRobot episodes; export reviewed frame ranges to LeRobot v3."""
 
 from __future__ import annotations
 
@@ -26,18 +26,26 @@ HTML = Path(__file__).with_name("dataset_browser.html").read_text(encoding="utf-
 _UNSET = object()
 EPISODE_LABEL_SCHEMA = (
     {
-        "id": "cup_orientation",
-        "labels": {"zh-CN": "杯子姿态", "en": "Cup orientation"},
+        "id": "task_outcome",
+        "labels": {"zh-CN": "任务结果（HIL）", "en": "Task outcome (HIL)"},
         "options": (
-            {"value": "upright", "labels": {"zh-CN": "杯子直立", "en": "Cup upright"}},
-            {"value": "sideways", "labels": {"zh-CN": "杯子侧倒", "en": "Cup sideways"}},
-            {"value": "uncertain", "labels": {"zh-CN": "其他 / 不确定", "en": "Other / uncertain"}},
+            {"value": "success", "labels": {"zh-CN": "成功", "en": "Success"}},
+            {"value": "failure", "labels": {"zh-CN": "失败", "en": "Failure"}},
         ),
     },
 )
 _LABEL_VALUES = {
     field["id"]: {option["value"] for option in field["options"]}
     for field in EPISODE_LABEL_SCHEMA
+}
+# Older review files may contain this removed UI field. Continue accepting it
+# so opening or updating a historical review never destroys existing metadata.
+_LABEL_VALUES["cup_orientation"] = {"upright", "sideways", "uncertain"}
+
+DEFAULT_EPISODE_REVIEW = {
+    "status": "keep",
+    "labels": {"task_outcome": "success"},
+    "review_origin": "default",
 }
 
 
@@ -146,6 +154,7 @@ class DatasetStore:
                     if self.reviews_path == default_reviews_path(self.root).resolve() else None) or {}
         else:
             data = _read_json(self.reviews_path)
+        self.validate_review_document(data)
         if data.get("dataset_root") and Path(data["dataset_root"]).expanduser().resolve() != self.root:
             raise ValueError("quality-review file belongs to another dataset")
         reviews = data.get("episodes", {})
@@ -155,8 +164,32 @@ class DatasetStore:
             if not str(index).isdigit() or not 0 <= int(index) < len(self.episodes) or not isinstance(review, dict):
                 raise ValueError("invalid review episode")
             validate_episode_labels(review.get("labels"))
+            if review.get("review_origin") not in (None, "default", "manual"):
+                raise ValueError("invalid review origin")
             frame_bounds(review.get("trim"), int(self.episodes[int(index)]["length"]), float(self.info["fps"]))
         return reviews
+
+    def effective_reviews(self, reviews: dict | None = None) -> dict:
+        """Return UI/export reviews with explicit, non-manual defaults filled in."""
+        stored = self.reviews() if reviews is None else reviews
+        effective = {}
+        for index in range(len(self.episodes)):
+            key = str(index)
+            if key not in stored:
+                effective[key] = copy.deepcopy(DEFAULT_EPISODE_REVIEW)
+                continue
+            review = copy.deepcopy(stored[key])
+            # Explicit records created before provenance tracking came from a
+            # human workflow, so treat them as manual rather than default.
+            review.setdefault("review_origin", "manual")
+            effective[key] = review
+        return effective
+
+    def validate_review_document(self, document: dict) -> None:
+        """Source-specific binding checks; raw datasets also verify content IDs."""
+
+    def review_metadata(self) -> dict:
+        return {"dataset_root": str(self.root)}
 
     def save_review(
         self, episode: int, status: str, note: str, trim=_UNSET,
@@ -188,6 +221,7 @@ class DatasetStore:
                     else:
                         review["trim"] = saved
             review.update(status=status, note=note.strip())
+            review["review_origin"] = "manual"
             if status or note.strip() or review.get("trim") or review.get("labels"):
                 reviews[str(episode)] = review
             else:
@@ -197,24 +231,32 @@ class DatasetStore:
                 "dataset_root": str(self.root),
                 "episodes": reviews,
             })
+            payload.update(self.review_metadata())
             self.reviews_path.parent.mkdir(parents=True, exist_ok=True)
             temporary = self.reviews_path.with_suffix(self.reviews_path.suffix + ".tmp")
             temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             os.replace(temporary, self.reviews_path)
-            return reviews
+            return self.effective_reviews(reviews)
 
     def export_status(self) -> dict:
         with self._export_lock:
             return copy.deepcopy(self._export)
 
+    @property
+    def export_parent(self) -> Path:
+        return self.root.parent
+
+    def export_selected(self, output, plan, reviews, progress):
+        return export_dataset(self.root, output, self.info, plan, reviews, progress)
+
     def start_export(self, name: str, label_filter: object = None) -> dict:
         # UI may only create a new sibling dataset, never arbitrary filesystem paths.
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,119}", name):
             raise ValueError("新目录名只允许字母、数字、下划线、点和短横线，不能包含路径")
-        output = self.root.parent / name
+        output = self.export_parent / name
         if output.exists() or output.is_symlink() or output.resolve() == self.root:
             raise ValueError("输出目录已经存在，请换一个新名称")
-        reviews = copy.deepcopy(self.reviews())
+        reviews = self.effective_reviews()
         selected_label = normalize_label_filter(label_filter)
         selected_rows = [
             row for row in self.episodes
@@ -240,7 +282,7 @@ class DatasetStore:
 
         def run():
             try:
-                result = export_dataset(self.root, output, self.info, plan, reviews, update)
+                result = self.export_selected(output, plan, reviews, update)
                 update({"status": "complete", **result, "phase": "导出完成",
                         "episodes_done": len(plan), "frames_done": result["frames"],
                         "current_episode": None, "episode_position": None})
@@ -265,10 +307,10 @@ class DatasetStore:
                 }
                 for row in self.episodes
             ],
-            "reviews": self.reviews(),
+            "reviews": self.effective_reviews(),
             "label_schema": copy.deepcopy(EPISODE_LABEL_SCHEMA),
             "reviews_path": str(self.reviews_path),
-            "export_parent": str(self.root.parent),
+            "export_parent": str(self.export_parent),
             "suggested_export_name": self.root.name[:80] + "_trimmed_" + datetime.now().strftime("%Y%m%d_%H%M%S"),
         }
 
@@ -450,7 +492,10 @@ def make_handler(store: DatasetStore):
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="robotarm modeling dataset-browser --", description=__doc__)
-    parser.add_argument("--dataset-root", type=Path, required=True)
+    parser.add_argument("--dataset-root", type=Path, nargs="+", required=True,
+                        help="one LeRobot dataset or multiple RAW sessions for a shared review page")
+    parser.add_argument("--export-root", type=Path, default=None,
+                        help="LeRobot output parent for raw browsing (default: data/lerobot)")
     parser.add_argument("--reviews", type=Path, default=None, help="quality-review JSON output")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8766)
@@ -460,13 +505,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    root = args.dataset_root.expanduser().resolve()
-    reviews = args.reviews or ARTIFACTS_ROOT / "reports" / "dataset_quality" / f"{root.name}.json"
-    store = DatasetStore(root, reviews)
+    roots = [path.expanduser().resolve() for path in args.dataset_root]
+    root = roots[0]
+    if len(roots) > 1:
+        if args.reviews is not None:
+            raise ValueError("multiple RAW sessions keep separate review files; omit --reviews")
+        from .raw_dataset_browser import RawCollectionStore
+        store = RawCollectionStore(roots, args.export_root)
+    elif (root / "session.json").is_file():
+        from .raw_dataset_browser import RawDatasetStore
+        store = RawDatasetStore(root, args.reviews, args.export_root)
+    else:
+        reviews = args.reviews or ARTIFACTS_ROOT / "reports" / "dataset_quality" / f"{root.name}.json"
+        store = DatasetStore(root, reviews)
     server = ThreadingHTTPServer((args.host, args.port), make_handler(store))
     url = f"http://{args.host}:{args.port}"
     print(f"[dataset-browser] Dataset: {root}")
-    print(f"[dataset-browser] Reviews: {store.reviews_path}")
+    if len(roots) > 1:
+        for source in store.stores:
+            print(f"[dataset-browser] Reviews: {source.reviews_path}")
+    else:
+        print(f"[dataset-browser] Reviews: {store.reviews_path}")
     print(f"[dataset-browser] Open: {url}")
     print("[dataset-browser] Press Ctrl+C to stop.")
     if not args.no_open:

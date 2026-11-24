@@ -242,20 +242,27 @@ class RoleCameras:
     def show(self, frames: dict[str, tuple[Any, float, float, int]], active: bool) -> None:
         if not self.viewer_ok:
             return
-        views = []
+        # hstack already creates the writable display buffer.  Drawing labels
+        # after stacking avoids copying every camera image once and then
+        # copying the same pixels a second time during hstack.
+        combined = self.np.hstack([sample[0] for sample in frames.values()])
+        x_offset = 0
         for role, (image, _, _, _) in frames.items():
-            view = image.copy()
             label = f"{role}  {'REC' if active else 'PREVIEW'}"
             color = (0, 0, 255) if active else (0, 255, 0)
             self.cv2.putText(
-                view, label, (12, 28), self.cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2
+                combined, label, (x_offset + 12, 28),
+                self.cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2,
             )
-            views.append(view)
-        combined = self.np.hstack(views)
+            x_offset += image.shape[1]
         try:
             self.cv2.imshow(self.window, combined)
-            read_key = getattr(self.cv2, "waitKeyEx", self.cv2.waitKey)
-            key = read_key(1)
+            poll_key = getattr(self.cv2, "pollKey", None)
+            if callable(poll_key):
+                key = poll_key()
+            else:
+                read_key = getattr(self.cv2, "waitKeyEx", self.cv2.waitKey)
+                key = read_key(1)
             if isinstance(key, int) and key >= 0:
                 if key in (ord("f"), ord("F"), 0xffc8, 16777274, 0x7a0000):
                     self.set_fullscreen(not getattr(self, "_fullscreen", False))

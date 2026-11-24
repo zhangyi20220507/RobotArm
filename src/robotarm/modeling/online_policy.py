@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import logging
@@ -29,7 +30,11 @@ from ..paths import (
 from ..record.recorder import RawEpisodeRecorder
 from ..record.schema import HG_DAGGER_SAMPLE_FIELDS
 from ..teleop import keyboard as keyboard_api
-from .hg_dagger import LeaderExpert
+from .hg_dagger import (
+    LeaderExpert,
+    LeaderHomingFailure,
+    TakeoverMotionGate,
+)
 from .policy_recording import PolicyRecordingManager
 
 
@@ -320,6 +325,28 @@ def action_was_clamped(raw, safe, tolerance=1e-6):
     return bool(np.any(np.abs(np.asarray(raw) - np.asarray(safe)) > tolerance))
 
 
+def act_backpressure_required(shaped, safe, current):
+    """Wait for joint/opening limits, but allow a force-limited grasp to hold.
+
+    A closing gripper may never reach its requested width once an object is
+    grasped. Its unchanged step/lead/force limits still constrain commands;
+    width convergence must not freeze ACT's subsequent lifting actions.
+    This is a direction rule, not a claim that contact was detected.
+    """
+    import numpy as np
+
+    shaped, safe, current = (
+        np.asarray(value, dtype=np.float64) for value in (shaped, safe, current)
+    )
+    if any(value.shape != (7,) or not np.isfinite(value).all()
+           for value in (shaped, safe, current)):
+        raise RuntimeError("ACT backpressure received an invalid 7D action/state")
+    joint_limited = action_was_clamped(shaped[:6], safe[:6])
+    gripper_limited = action_was_clamped(shaped[6:], safe[6:])
+    closing = shaped[6] < current[6] and safe[6] <= current[6]
+    return joint_limited or (gripper_limited and not closing)
+
+
 def limit_joint_target_acceleration(
     desired, previous_target, previous_velocity, max_acceleration, dt,
     max_velocity,
@@ -452,7 +479,7 @@ def latch_act_subgoal(current_subgoal, safe_target, should_latch):
 def update_act_backpressure_target(
     current_subgoal, candidate_subgoal, tracking_clamped, raw_action_ok,
 ):
-    """Latch only while the final safety limiter is actively applying pressure.
+    """Latch while the joint/opening limiter is applying backpressure.
 
     Releasing on ``not tracking_clamped`` deliberately does not require the
     robot to settle at an exact point.  Piper JS can retain a small steady
@@ -808,7 +835,7 @@ class AsyncPlanner:
 
 
 class KeyboardIntentTracker:
-    """Convert keyboard events into X, Y, R, V and emergency-stop intents."""
+    """Convert keyboard events into policy and recording intents."""
 
     def __init__(self, hold_seconds, repeat_gap=0.75):
         self.hold_seconds = hold_seconds
@@ -817,6 +844,7 @@ class KeyboardIntentTracker:
         self.last_r = None
         self.last_v = None
         self.last_i = None
+        self.last_d = None
         self.y_started = None
         self.last_y = None
         self.y_event_count = 0
@@ -880,16 +908,28 @@ class KeyboardIntentTracker:
         for key, observed_at in events:
             if key != "i":
                 continue
-            if self.last_i is None or observed_at - self.last_i > self.repeat_gap:
+            if self.last_i is None or observed_at - self.last_i > 0.25:
                 toggle = True
             self.last_i = observed_at
         return toggle
+
+    def trial_discard(self, events):
+        """Debounce the HG-DAgger D discard action."""
+        discard = False
+        for key, observed_at in events:
+            if key != "d":
+                continue
+            if self.last_d is None or observed_at - self.last_d > self.repeat_gap:
+                discard = True
+            self.last_d = observed_at
+        return discard
 
     def after_home(self, now):
         """Require a fresh X press; suppress R key repeats after homing."""
         self.last_x = None
         self.last_r = now
         self.last_i = None
+        self.last_d = None
         self.y_started = None
         self.last_y = None
         self.y_event_count = 0
@@ -899,11 +939,13 @@ class KeyboardIntentTracker:
 def home_arm_to_zero(
     robot, robot_config, gripper, gripper_width, gripper_force,
     feedback_timeout, speed_percent, timeout, emergency_stop_requested=None,
-    progress_callback=None,
+    progress_callback=None, companion=None,
 ):
     """Move all six joints to zero, then close the gripper with verified feedback."""
     def check_emergency_stop():
         if emergency_stop_requested is not None and emergency_stop_requested():
+            if companion is not None:
+                companion.emergency_stop()
             raise InterruptedError("electronic emergency stop requested during homing")
 
     check_emergency_stop()
@@ -933,101 +975,215 @@ def home_arm_to_zero(
     robot.move_j(joints)
     gripper.move_gripper_m(gripper_width, gripper_force)
     check_emergency_stop()
-    robot.move_j(target)
+    leader_stop = threading.Event()
+    leader_home_target = [*target, gripper_width]
+    def leader_stop_requested():
+        return leader_stop.is_set()
 
-    started = time.monotonic()
-    deadline = started + timeout
-    tolerance = math.radians(3.0)
-    first_error = None
-    no_motion_deadline = None
-    print(
-        f"Homing: MOVE_J to zero at {speed_percent}% speed; "
-        "gripper holds its width during travel, then closes at home.",
-        flush=True,
-    )
-    while time.monotonic() < deadline:
-        check_emergency_stop()
-        joints = read_valid_joints(
-            robot, robot_config, min(feedback_timeout, 0.2)
+    def run_leader_home():
+        companion.start_homing(
+            leader_home_target, speed_percent,
+            timeout=timeout, stop_requested=leader_stop_requested,
         )
-        status = robot.get_arm_status()
-        max_error = max(abs(value) for value in joints)
-        if progress_callback is not None:
-            progress_callback(
-                [*joints, gripper_width],
-                [*target, gripper_width],
-                "homing",
+
+    # Start the leader's verified firmware home on its own CAN channel, then
+    # immediately send the follower's zero target. Both motions can overlap.
+    # Claim leader ownership BEFORE scheduling the worker: it may not run
+    # before the follower's first progress callback fires.
+    if companion is not None:
+        companion.homing_active = True
+    with ThreadPoolExecutor(max_workers=1) as home_executor:
+        leader_home = (
+            home_executor.submit(run_leader_home)
+            if companion is not None else None
+        )
+        try:
+            # move_j(joints) above consumes the planned-J trigger. Re-arm it.
+            robot.set_motion_mode(robot.OPTIONS.MOTION_MODE.J)
+            robot.move_j(target)
+
+            started = time.monotonic()
+            deadline = started + timeout
+            tolerance = math.radians(3.0)
+            first_error = None
+            next_home_status_at = started
+            follower_gripper_closed = False
+            no_motion_deadline = None
+            print(
+                (
+                    "Homing follower: "
+                    if companion is not None
+                    else "Homing: "
+                )
+                + f"MOVE_J to zero at {speed_percent}% speed; "
+                "gripper holds its width during travel, then closes at home.",
+                flush=True,
             )
-        if status is not None:
-            code = base.value_as_int(status.msg.arm_status)
-            err = getattr(status.msg, "err_status", None)
-            limit_hits = [
-                index + 1 for index in range(6)
-                if getattr(err, f"joint_{index + 1}_angle_limit", False)
-            ]
-            if code != 0 or limit_hits:
-                raise RuntimeError(
-                    "Piper rejected the homing motion: "
-                    f"arm_status={code}"
-                    + (
-                        f", angle-limit flags on joints {limit_hits}"
-                        if limit_hits else ""
+            while time.monotonic() < deadline:
+                check_emergency_stop()
+                joints = read_valid_joints(
+                    robot, robot_config, min(feedback_timeout, 0.2)
+                )
+                status = robot.get_arm_status()
+                max_error = max(abs(value) for value in joints)
+                if progress_callback is not None:
+                    progress_callback(
+                        [*joints, gripper_width],
+                        [*target, gripper_width],
+                        "homing",
+                    )
+                if status is not None:
+                    code = base.value_as_int(status.msg.arm_status)
+                    err = getattr(status.msg, "err_status", None)
+                    limit_hits = [
+                        index + 1 for index in range(6)
+                        if getattr(err, f"joint_{index + 1}_angle_limit", False)
+                    ]
+                    if code != 0 or limit_hits:
+                        raise RuntimeError(
+                            "Piper rejected the homing motion: "
+                            f"arm_status={code}"
+                            + (
+                                f", angle-limit flags on joints {limit_hits}"
+                                if limit_hits else ""
+                            )
+                        )
+                if first_error is None:
+                    first_error = max_error
+                    no_motion_deadline = time.monotonic() + 3.0
+                motion_done = (
+                    status is not None
+                    and base.value_as_int(status.msg.motion_status) == 0
+                )
+                if leader_home is not None and leader_home.done():
+                    leader_home.result()
+                companion_done = (
+                    companion is None or (
+                        leader_home.done() and companion.homing_ready()
                     )
                 )
-        if first_error is None:
-            first_error = max_error
-            no_motion_deadline = time.monotonic() + 3.0
-        motion_done = (
-            status is not None
-            and base.value_as_int(status.msg.motion_status) == 0
-        )
-        print(
-            f"\rHOMING joint_error={math.degrees(max_error):6.2f} deg",
-            end="", flush=True,
-        )
-        if (
-            motion_done
-            and time.monotonic() - started >= 0.5
-            and max_error <= tolerance
-        ):
-            robot.move_j(joints)
-            print("\nArm is at zero; closing gripper.", flush=True)
-            move_gripper_and_wait(
-                gripper, 0.0, gripper_force, 0.003,
-                ACT_RESET_GRIPPER_TIMEOUT_S, feedback_timeout,
-                emergency_stop_requested,
-                (
+                companion_status = ""
+                leader_error = (
                     None
-                    if progress_callback is None
-                    else lambda measured, commanded: progress_callback(
-                        [*joints, measured],
-                        [*joints, commanded],
-                        "home_gripper_close",
+                    if companion is None
+                    else getattr(companion, "homing_error_degrees", None)
+                )
+                if isinstance(leader_error, (int, float)) and math.isfinite(leader_error):
+                    companion_status = (
+                        f" leader_error={leader_error:6.2f} deg"
                     )
-                ),
+                if time.monotonic() >= next_home_status_at:
+                    print(
+                        f"\rHOMING follower_error={math.degrees(max_error):6.2f} deg"
+                        + companion_status,
+                        end="", flush=True,
+                    )
+                    next_home_status_at = time.monotonic() + 1.0
+                follower_ready = (
+                    motion_done
+                    and time.monotonic() - started >= 0.5
+                    and max_error <= tolerance
+                )
+                if follower_ready and not follower_gripper_closed:
+                    robot.move_j(joints)
+                    print("\nFollower is at zero; closing its gripper now.", flush=True)
+                    closed_width = move_gripper_and_wait(
+                        gripper, 0.0, gripper_force, 0.003,
+                        ACT_RESET_GRIPPER_TIMEOUT_S, feedback_timeout,
+                        emergency_stop_requested,
+                        (
+                            None
+                            if progress_callback is None
+                            else lambda measured, commanded: progress_callback(
+                                [*joints, measured],
+                                [*joints, commanded],
+                                "home_gripper_close",
+                            )
+                        ),
+                    )
+                    gripper_width = closed_width
+                    follower_gripper_closed = True
+                if follower_ready and follower_gripper_closed and companion_done:
+                    if companion is not None:
+                        companion.finish_homing([*joints, gripper_width])
+                    print(
+                        "Homing complete; both arms are at zero and the "
+                        "follower gripper is closed."
+                        if companion is not None
+                        else "Homing complete; arm and gripper are at zero.",
+                        flush=True,
+                    )
+                    return joints
+                if (
+                    time.monotonic() >= no_motion_deadline
+                    and first_error > tolerance
+                    and max_error > first_error - math.radians(0.5)
+                ):
+                    raise RuntimeError(
+                        "homing command produced no joint motion within 3s "
+                        "(joint_error stuck at "
+                        f"{math.degrees(max_error):.2f} deg); the controller likely "
+                        "dropped the J-mode MOVE_J target"
+                    )
+                if leader_home is not None and not leader_home.done():
+                    leader_stop.wait(0.05)
+                else:
+                    time.sleep(0.05)
+            raise TimeoutError(
+                f"homing did not complete within {timeout:.1f} seconds "
+                f"(joint_error={math.degrees(max_error):.2f} deg)"
             )
-            print("Homing complete; arm and gripper are at zero.", flush=True)
-            return joints
-        if (
-            time.monotonic() >= no_motion_deadline
-            and max_error > first_error - math.radians(0.5)
-        ):
-            raise RuntimeError(
-                "homing command produced no joint motion within 3s "
-                "(joint_error stuck at "
-                f"{math.degrees(max_error):.2f} deg); the controller likely "
-                "dropped the J-mode MOVE_J target"
-            )
-        time.sleep(0.05)
-    raise TimeoutError(
-        f"homing did not complete within {timeout:.1f} seconds "
-        f"(joint_error={math.degrees(max_error):.2f} deg)"
+
+        finally:
+            leader_stop.set()
+
+
+def hold_follower_after_leader_home_failure(
+    robot, robot_config, feedback_timeout,
+):
+    """Cancel the follower's home target without electronically stopping it."""
+    joints = read_valid_joints(
+        robot, robot_config, min(float(feedback_timeout), 0.5)
     )
+    robot.set_motion_mode(robot.OPTIONS.MOTION_MODE.J)
+    robot.move_j(joints)
+    return joints
+
+
+def isolate_leader_home_failure(
+    robot, robot_config, feedback_timeout, companion,
+):
+    """Stop only the failed leader; keep the follower holding if possible."""
+    follower_hold_error = None
+    leader_stop_error = None
+    try:
+        hold_follower_after_leader_home_failure(
+            robot, robot_config, feedback_timeout
+        )
+    except Exception as exc:
+        follower_hold_error = exc
+        robot.electronic_emergency_stop()
+    try:
+        companion.emergency_stop()
+    except Exception as exc:
+        leader_stop_error = exc
+    return follower_hold_error, leader_stop_error
+
+
+def engage_expert_with_follower_hold(robot, gripper, expert, state, joint_bounds,
+                                    gripper_force, gripper_max):
+    """Cancel the follower's prior target before a blocking leader-role change."""
+    measured = [float(value) for value in state]
+    if len(measured) != 7 or not all(math.isfinite(value) for value in measured):
+        raise ValueError("takeover requires a finite 7D follower state")
+    robot.move_js(measured[:6])
+    gripper.move_gripper_m(min(max(measured[6], 0.0), gripper_max), gripper_force)
+    return expert.engage(measured, joint_bounds)
 
 
 def reset_act_to_home(
     robot, robot_config, gripper, args, expected_js_mode,
-    emergency_stop_requested, progress_callback=None,
+    emergency_stop_requested, progress_callback=None, companion=None,
 ):
     """Release any object at the current pose, home, and restore ACT's start grip."""
     if emergency_stop_requested():
@@ -1055,6 +1211,7 @@ def reset_act_to_home(
         args.feedback_timeout, args.home_speed_percent, args.home_timeout,
         emergency_stop_requested,
         progress_callback,
+        companion,
     )
     closed_width = max(0.0, base.wait_gripper_width(gripper, args.feedback_timeout))
     prepare_js_control(
@@ -1200,6 +1357,15 @@ def parse_args(argv: list[str] | None = None):
             "I again saves the expert recovery and returns control to the policy"
         ),
     )
+    parser.add_argument(
+        "--hg-label-outcome", dest="hg_label_outcome", action="store_true",
+        help=("label each ACT+human HG trial with 1=success or 0=failure; "
+              "require a manual R/Y reset before the next trial; does not run RL"),
+    )
+    parser.add_argument(
+        "--hil-manual-outcome", dest="hg_label_outcome", action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--hg-leader-interface", default="socketcan")
     parser.add_argument("--hg-leader-channel", default="can_leader1")
     parser.add_argument(
@@ -1208,7 +1374,7 @@ def parse_args(argv: list[str] | None = None):
     )
     parser.add_argument(
         "--hg-dataset-root", type=Path, default=PIPER_RAW_ROOT,
-        help="piper_raw HG-DAgger session root; created on first intervention",
+        help="piper_raw HG-DAgger root; next episode encoders are prewarmed here",
     )
     parser.add_argument(
         "--hg-task", default=None,
@@ -1216,7 +1382,32 @@ def parse_args(argv: list[str] | None = None):
     )
     parser.add_argument("--hg-setup-id", default="online_policy_hg_dagger_v1")
     parser.add_argument("--hg-setup-note", default="")
+    parser.add_argument("--hil-run", type=Path, help="prepared ACT-residual SAC run directory")
+    parser.add_argument("--hil-min-updates", type=int, default=100)
+    parser.add_argument("--hil-deterministic", action="store_true", default=True)
+    parser.add_argument("--hil-explore", dest="hil_deterministic", action="store_false",
+                        help="explicitly enable stochastic residual exploration")
+    parser.add_argument("--hil-max-action-age-ms", type=float, default=100.0,
+                        help="HIL observation-to-command deadline including inference; camera acquisition age is checked separately")
     parser.add_argument("--hg-record-fps", type=int, default=None)
+    parser.add_argument(
+        "--hg-start-joint-motion-deg",
+        type=float,
+        default=0.75,
+        help="leader-relative joint motion required to start expert control",
+    )
+    parser.add_argument(
+        "--hg-start-gripper-motion-mm",
+        type=float,
+        default=1.5,
+        help="leader-relative gripper motion required to start expert control",
+    )
+    parser.add_argument(
+        "--hg-start-motion-frames",
+        type=int,
+        default=2,
+        help="consecutive moved samples required to start expert control",
+    )
     parser.add_argument(
         "--hg-joint-signs", type=int, nargs=6,
         default=[1, 1, 1, 1, 1, 1],
@@ -1413,7 +1604,7 @@ def parse_args(argv: list[str] | None = None):
     )
     parser.add_argument(
         "--home-speed-percent", type=base.percentage, default=cfg["home-speed-percent"],
-        help="MOVE_J speed percentage for ACT startup and keyboard-Y homing",
+        help="MOVE_J speed percentage for ACT startup and R/Y homing",
     )
     parser.add_argument(
         "--home-timeout", type=float, default=cfg["home-timeout"],
@@ -1589,6 +1780,13 @@ def load_dataset_metadata(checkpoint: Path):
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Covers HIL, HG and plain ACT, including failures/interrupts in recorder,
+    # camera and arm cleanup after the key reader has already been closed.
+    with keyboard_api.preserve_terminal_settings():
+        return _main(argv)
+
+
+def _main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
     explicitly_set = {
@@ -1619,8 +1817,26 @@ def main(argv: list[str] | None = None) -> int:
     )
     if not 1 <= hg_record_fps <= 60:
         raise RuntimeError("hg-record-fps must be 1..60")
+    if (
+        not math.isfinite(args.hg_start_joint_motion_deg)
+        or args.hg_start_joint_motion_deg <= 0
+    ):
+        raise RuntimeError("hg-start-joint-motion-deg must be positive")
+    if (
+        not math.isfinite(args.hg_start_gripper_motion_mm)
+        or args.hg_start_gripper_motion_mm <= 0
+    ):
+        raise RuntimeError("hg-start-gripper-motion-mm must be positive")
+    if not 1 <= args.hg_start_motion_frames <= 20:
+        raise RuntimeError("hg-start-motion-frames must be 1..20")
     if args.hg_dagger and not args.execute:
         raise RuntimeError("--hg-dagger requires --execute")
+    if args.hg_label_outcome and not args.hg_dagger:
+        raise RuntimeError("--hg-label-outcome requires --hg-dagger")
+    if args.hil_run and args.execute and not (args.hg_dagger and args.hg_label_outcome):
+        raise RuntimeError("HIL execution requires expert takeover and explicit outcome labels")
+    if not math.isfinite(args.hil_max_action_age_ms) or not 0 < args.hil_max_action_age_ms <= 500:
+        raise RuntimeError("hil-max-action-age-ms must be within (0, 500]")
     if args.hg_dagger and str(args.hg_leader_channel) == str(args.channel):
         raise RuntimeError("HG-DAgger leader and follower CAN channels must differ")
     if args.hg_leader_init_timeout <= 0:
@@ -1711,6 +1927,8 @@ def main(argv: list[str] | None = None) -> int:
             args.report = runtime_artifact_paths(checkpoint, digest)[0]
         from . import pi05_shadow
         return pi05_shadow.run(args, config, checkpoint, digest, task)
+    if args.hg_label_outcome and policy_type != "act":
+        raise RuntimeError("--hg-label-outcome currently requires an ACT checkpoint")
     if policy_type == "pi0":
         torch.set_num_threads(4)
         if args.device != "cuda" or not torch.cuda.is_bf16_supported():
@@ -2030,6 +2248,33 @@ def main(argv: list[str] | None = None) -> int:
         policy_cfg=config, pretrained_path=str(checkpoint),
         preprocessor_overrides={"device_processor": {"device": args.device}},
     )
+    hil_runtime = None
+    hil_can_guard = None
+    if args.hil_run:
+        if policy_type != "act":
+            raise RuntimeError("HIL residual SAC requires an ACT prior")
+        from .hil_serl.config import Config as HILConfig
+        if HILConfig.load(args.hil_run / "config.json").format_version.endswith("v1"):
+            raise RuntimeError("legacy HIL residual execution disabled; use hil-serl actor --mode baseline or prepare a v2 run")
+        from .hil_serl.runtime import HILRuntime
+        hil_runtime = HILRuntime(
+            args.hil_run, checkpoint, policy, preprocessor, postprocessor,
+            device=args.device, deterministic=args.hil_deterministic,
+            minimum_updates=args.hil_min_updates,
+        )
+        if args.execute and args.hg_task != hil_runtime.cfg.task:
+            raise RuntimeError("HIL task differs from the prepared replay task")
+        if abs(args.gripper_max_mm / 1000 - hil_runtime.cfg.gripper_max_m) > 1e-8:
+            raise RuntimeError("HIL gripper range differs from prepared replay")
+        expected_serials = {role: str(camera_serials[role]) for role in hil_runtime.cfg.camera_roles}
+        if hil_runtime.cfg.camera_serials and expected_serials != hil_runtime.cfg.camera_serials:
+            raise RuntimeError("HIL camera serials differ from prepared replay")
+        if args.execute and set(hil_runtime.cfg.camera_serials) != set(hil_runtime.cfg.camera_roles):
+            raise RuntimeError("HIL camera identity missing; re-export replay with camera metadata before execution")
+        if abs(args.rate - hil_runtime.cfg.rate_hz) > 1e-6:
+            raise RuntimeError("HIL control rate differs from the prepared replay FPS")
+        if args.execute and abs(hg_record_fps - args.rate) > 1e-6:
+            raise RuntimeError("HIL RAW recording FPS must equal the control rate")
 
     robot = None
     cameras = None
@@ -2037,8 +2282,20 @@ def main(argv: list[str] | None = None) -> int:
     hg_expert = None
     hg_recorder = None
     hg_intervening = False
+    hg_recording = False
     hg_last_sample = None
     hg_started_at = None
+    hg_takeover_action = None
+    hg_expert_raw = None
+    hg_intervention_id = -1
+    hg_next_intervention_id = 0
+    pending_outcome_episode = None
+    trial_reset_required = False
+    hg_motion_gate = TakeoverMotionGate(
+        math.radians(args.hg_start_joint_motion_deg),
+        args.hg_start_gripper_motion_mm / 1000.0,
+        args.hg_start_motion_frames,
+    )
     last_novice_action = None
     report = args.report.resolve()
     report.parent.mkdir(parents=True, exist_ok=True)
@@ -2067,6 +2324,12 @@ def main(argv: list[str] | None = None) -> int:
     expected_js_mode = 1
     try:
         keyboard.start()
+        if hil_runtime is not None and args.interface == "socketcan":
+            from .hil_serl.safety import CANIdentityGuard
+            guarded_channels = [str(args.channel)]
+            if args.execute and args.hg_leader_interface == "socketcan":
+                guarded_channels.append(str(args.hg_leader_channel))
+            hil_can_guard = CANIdentityGuard(guarded_channels)
         robot, robot_config = base.connect_robot(args)
         base.ensure_arm_status_normal(robot, args.feedback_timeout)
         joint_bounds = deployment_joint_bounds(robot_config)
@@ -2107,18 +2370,66 @@ def main(argv: list[str] | None = None) -> int:
         )
         def homing_emergency_stop_requested():
             cameras.show(cameras.latest(), recorder.active)
-            return (
-                any(key == "alt+s" for key, _ in keyboard.poll())
-                or any(key in (ord("s"), ord("S")) for key in cameras.poll_keys())
+            terminal_events = keyboard.poll()
+            preview_keys = cameras.poll_keys()
+            terminal_stop = any(key == "alt+s" for key, _ in terminal_events)
+            preview_stop = any(
+                key in (ord("s"), ord("S")) for key in preview_keys
+            )
+            if terminal_stop:
+                print(
+                    "\n[safety] Emergency stop requested by terminal Alt+S.",
+                    flush=True,
+                )
+            if preview_stop:
+                print(
+                    "\n[safety] Emergency stop requested by camera-window S.",
+                    flush=True,
+                )
+            return terminal_stop or preview_stop
+
+        if args.hg_dagger:
+            initial_leader_gripper_width = min(
+                max(
+                    base.wait_gripper_width(gripper, args.feedback_timeout),
+                    0.0,
+                ),
+                args.gripper_max_mm / 1000.0,
+            )
+            print(
+                f"[HG-DAgger] connecting expert leader {args.hg_leader_channel} "
+                "before paired homing...",
+                flush=True,
+            )
+            hg_expert = LeaderExpert(
+                interface=args.hg_leader_interface,
+                channel=str(args.hg_leader_channel),
+                firmware=args.firmware,
+                feedback_timeout=args.feedback_timeout,
+                init_timeout=args.hg_leader_init_timeout,
+                signs=args.hg_joint_signs,
+                offsets_deg=args.hg_joint_offsets_deg,
+                gripper_max=args.gripper_max_mm / 1000.0,
+                gripper_force=args.gripper_force,
+                initial_gripper_width=initial_leader_gripper_width,
             )
 
         if args.execute and policy_type == "act":
             # The ACT deployment starts from the demonstrated zero pose.  Do
             # this before warming the policy so its first live observation is
             # taken at home, and keep model control disarmed until X is pressed.
-            home_gripper_width = min(
-                max(base.wait_gripper_width(gripper, args.feedback_timeout), 0.0),
-                args.gripper_max_mm / 1000.0,
+            home_gripper_width = (
+                initial_leader_gripper_width
+                if args.hg_dagger
+                else min(
+                    max(
+                        base.wait_gripper_width(
+                            gripper, args.feedback_timeout
+                        ),
+                        0.0,
+                    ),
+                    args.gripper_max_mm / 1000.0,
+                )
             )
             print("ACT startup: enabling the arm and moving to home.", flush=True)
             homing_active = True
@@ -2127,6 +2438,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.gripper_force, args.feedback_timeout,
                 args.home_speed_percent, args.home_timeout,
                 homing_emergency_stop_requested,
+                companion=hg_expert,
             )
             homing_active = False
         # CUDA and the policy allocate/compile lazily on the first call. Warm up
@@ -2154,7 +2466,10 @@ def main(argv: list[str] | None = None) -> int:
                 if policy_type == "smolvla" and callable(reset):
                     # Force a real chunk generation on every warm-up call.
                     reset()
-                policy.select_action(preprocessor(warm_batch))
+                if hil_runtime is not None:
+                    hil_runtime.predict(warm_batch)
+                else:
+                    policy.select_action(preprocessor(warm_batch))
         if callable(reset):
             reset()
         if policy_type != "pi0":
@@ -2180,7 +2495,14 @@ def main(argv: list[str] | None = None) -> int:
                 robot.electronic_emergency_stop()
                 print("\nAlt+S before X: electronic emergency stop sent.")
                 return 130
-            print("ACT ready at home; press X to start model control.", flush=True)
+            if args.hg_dagger:
+                print(
+                    "ACT follower and HG-DAgger leader are ready at home; "
+                    "preparing the data recorder. Do not press X yet.",
+                    flush=True,
+                )
+            else:
+                print("ACT ready at home; press X to start model control.", flush=True)
         active_actions = deque()
         active_plan = None
         planner_requested = False
@@ -2229,21 +2551,20 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 active_actions.extend(active_plan["actions"])
         if args.hg_dagger:
-            print(
-                f"[HG-DAgger] connecting expert leader {args.hg_leader_channel}...",
-                flush=True,
-            )
-            hg_expert = LeaderExpert(
-                interface=args.hg_leader_interface,
-                channel=str(args.hg_leader_channel),
-                firmware=args.firmware,
-                feedback_timeout=args.feedback_timeout,
-                init_timeout=args.hg_leader_init_timeout,
-                signs=args.hg_joint_signs,
-                offsets_deg=args.hg_joint_offsets_deg,
-                gripper_max=args.gripper_max_mm / 1000.0,
-                gripper_force=args.gripper_force,
-            )
+            assert hg_expert is not None
+            leader_follow_state = [
+                *read_valid_joints(robot, robot_config, args.feedback_timeout),
+                base.wait_gripper_width(gripper, args.feedback_timeout),
+            ]
+            if policy_type != "act":
+                hg_expert.align_to_follower(
+                    leader_follow_state,
+                    speed_percent=args.home_speed_percent,
+                    timeout=args.home_timeout,
+                    stop_requested=homing_emergency_stop_requested,
+                )
+            else:
+                hg_expert.resume_policy_control(leader_follow_state)
             hg_recorder = RawEpisodeRecorder(
                 hg_dataset_root,
                 hg_task,
@@ -2255,13 +2576,15 @@ def main(argv: list[str] | None = None) -> int:
                 camera_serials,
                 {
                     "model": "Piper",
-                    "control_mode": "human_gated_dagger_move_js",
+                    "control_mode": "hil_residual_sac_move_js" if hil_runtime is not None else "human_gated_dagger_move_js",
+                    "hil_run": str(hil_runtime.run) if hil_runtime is not None else None,
+                    "hil_config_signature": hil_runtime.cfg.signature if hil_runtime is not None else None,
                     "firmware": args.firmware,
                     "control_rate_hz": args.rate,
                     "leader": {
                         "interface": args.hg_leader_interface,
                         "channel": str(args.hg_leader_channel),
-                        "role": "zero_force_drag_expert",
+                        "role": "same_policy_action_then_zero_force_expert",
                     },
                     "follower": {
                         "interface": args.interface,
@@ -2271,27 +2594,54 @@ def main(argv: list[str] | None = None) -> int:
                     "checkpoint": str(checkpoint),
                     "checkpoint_sha256": digest,
                     "policy_type": policy_type,
-                    "action_source": "safety_limited_expert_action_only",
+                    "action_source": "safety_limited_executed_action_full_trial",
                     "observation_source": "follower_feedback",
-                    "gate": "manual_keyboard_i",
+                    "gate": "manual_keyboard_i_then_relative_motion",
                     "clutch": "follower_minus_mapped_leader_at_takeover",
+                    "training_export": "expert_mask_only",
+                    "control_source_codes": {
+                        "novice": 0,
+                        "armed": 1,
+                        "expert": 2,
+                    },
+                    "motion_start": {
+                        "joint_threshold_deg": args.hg_start_joint_motion_deg,
+                        "gripper_threshold_mm": args.hg_start_gripper_motion_mm,
+                        "consecutive_samples": args.hg_start_motion_frames,
+                    },
                     "joint_signs": list(args.hg_joint_signs),
                     "joint_offsets_deg": list(args.hg_joint_offsets_deg),
                 },
                 preview=False,
                 encoder_queue_size=args.recording_encoder_queue_size,
-                extra_sample_fields=HG_DAGGER_SAMPLE_FIELDS,
+                extra_sample_fields=HG_DAGGER_SAMPLE_FIELDS + (("hil_base_action",) if hil_runtime is not None else ()),
                 cameras=cameras,
+                session_prefix="hil_serl" if hil_runtime is not None else "hg_dagger",
             )
+            # Pay the ffmpeg process-start cost before an X trial.  The episode
+            # timeline remains stopped until the user starts the full trial.
+            hg_recorder.prepare_episode()
             print(
-                "[HG-DAgger] ready: press I during an active X trial to take "
-                "over; press I again to save the recovery and return to the policy.",
+                "[HG-DAgger] dual-arm policy control ready; press X to start. The "
+                "same safety-limited ACT action controls both arms. Press I "
+                "during an active X trial to hold the follower "
+                "and switch the leader to zero-force takeover; deliberate leader "
+                "motion marks expert frames. Press I again to return to ACT and "
+                "leader shadow following.",
                 flush=True,
             )
+            if args.hg_label_outcome:
+                print(
+                    "[HG-DAgger] outcome labeling is enabled for future RL replay; "
+                    "this run still executes ACT, not an RL policy or learner.",
+                    flush=True,
+                )
         if args.execute:
             controls = "Keyboard: tap V to start/save recording; tap X to start/stop; "
             if args.hg_dagger:
-                controls += "tap I to take over/return; "
+                controls += "tap I to take over/return; tap D to discard the active trial; "
+            if args.hg_label_outcome:
+                controls += "after X stop tap 1=success or 0=failure, manually reset object, then R/Y home; "
             controls += (
                 "tap R to reset ACT to home; hold "
                 f"Y for {args.keyboard_hold_seconds:.1f}s to home and remain "
@@ -2302,6 +2652,8 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 "Camera window: V record/save; X start/stop; "
                 + ("I expert take over/return; " if args.hg_dagger else "")
+                + ("D discard active HG trial; " if args.hg_dagger else "")
+                + ("1 success; 0 failure; " if args.hg_label_outcome else "")
                 + "R reset ACT; hold Y home; S emergency stop; F fullscreen; Esc windowed.",
                 flush=True,
             )
@@ -2324,7 +2676,11 @@ def main(argv: list[str] | None = None) -> int:
             active_plan["completed_at"] if async_planned else None
         )
         def record_blocking_motion(state_values, action_values, event):
-            """Keep V-key recordings aligned while R/Y homing blocks the loop."""
+            """Keep leader shadowing and V recordings alive during R/Y homing."""
+            # Paired homing owns the leader for the entire homing and closing
+            # phases. Only the pre-home gripper release needs shadow commands.
+            if hg_expert is not None and event == "reset_gripper_open":
+                hg_expert.command_policy_action(list(action_values))
             if not recorder.active:
                 return
             now = time.monotonic()
@@ -2340,17 +2696,43 @@ def main(argv: list[str] | None = None) -> int:
                 event,
             )
 
-        def finish_hg_intervention(*, complete: bool) -> None:
-            nonlocal hg_intervening, hg_last_sample, hg_started_at
-            if hg_recorder is not None and hg_recorder.active:
-                if complete:
-                    hg_recorder.save_episode()
-                else:
-                    hg_recorder.mark_incomplete()
+        def finish_hg_intervention() -> None:
+            nonlocal hg_intervening, hg_recording, hg_last_sample
+            nonlocal hg_started_at, hg_takeover_action, hg_expert_raw
+            nonlocal hg_intervention_id
             hg_intervening = False
+            hg_recording = False
             hg_last_sample = None
             hg_started_at = None
+            hg_takeover_action = None
+            hg_expert_raw = None
+            hg_intervention_id = -1
+            hg_motion_gate.reset()
 
+        def finish_hg_trial(*, complete: bool, prepare_next: bool = False):
+            saved = None
+            if hg_recorder is not None and hg_recorder.active:
+                if complete:
+                    saved = hg_recorder.save_episode()
+                    if saved is not None and not saved.name.startswith("episode_"):
+                        saved = None
+                else:
+                    hg_recorder.mark_incomplete()
+            if hil_runtime is not None:
+                hil_runtime.finish_trial(saved if complete else None)
+            if prepare_next and hg_recorder is not None:
+                hg_recorder.prepare_episode()
+            return saved
+
+        next_status_at = 0.0
+        last_status_mode = None
+        next_warning_at = 0.0
+        next_hil_retry_warning_at = 0.0
+        hil_observation_deadline = None
+        if hil_runtime is not None:
+            from .hil_serl.safety import ObservationDeadline
+            hil_observation_deadline = ObservationDeadline(args.hil_max_action_age_ms)
+        pending_toggle_event = None
         with report.open("w", encoding="utf-8") as log:
             while args.execute or time.monotonic() < shadow_deadline:
                 tick = time.monotonic()
@@ -2368,7 +2750,29 @@ def main(argv: list[str] | None = None) -> int:
                         events.append(("v", tick))
                     elif key in (ord("i"), ord("I")):
                         events.append(("i", tick))
+                    elif key in (ord("d"), ord("D")):
+                        events.append(("d", tick))
+                    elif key == ord("1"):
+                        events.append(("1", tick))
+                    elif key == ord("0"):
+                        events.append(("0", tick))
+                if args.hg_label_outcome and pending_outcome_episode is not None:
+                    outcome_keys = [key for key, _ in events if key in {"1", "0"}]
+                    if outcome_keys:
+                        from .manual_hil_outcome import save_manual_outcome
+                        outcome = "success" if outcome_keys[0] == "1" else "failure"
+                        index = save_manual_outcome(
+                            hg_recorder.root, pending_outcome_episode, outcome
+                        )
+                        if hil_runtime is not None:
+                            hil_runtime.label(pending_outcome_episode, outcome)
+                        print(
+                            f"\n[HIL] episode {index} marked {outcome}; "
+                            "reset the object and home the arm before X.", flush=True,
+                        )
+                        pending_outcome_episode = None
                 intervention_toggle = key_tracker.intervention_toggle(events)
+                discard_requested = key_tracker.trial_discard(events)
                 (
                     x_toggle,
                     home_requested,
@@ -2398,10 +2802,13 @@ def main(argv: list[str] | None = None) -> int:
                     and tick - trial_started_at >= args.duration
                 )
                 if trial_timed_out:
-                    finish_hg_intervention(complete=False)
+                    finish_hg_intervention()
+                    finish_hg_trial(complete=False)
                     motion_enabled = False
                     start_pending = False
                     trial_started_at = None
+                    if args.hg_label_outcome:
+                        trial_reset_required = True
                     active_actions.clear()
                     active_plan = None
                     planner_requested = False
@@ -2421,15 +2828,58 @@ def main(argv: list[str] | None = None) -> int:
                         "to start a new trial.",
                         flush=True,
                     )
-                toggle_event = "trial_timeout" if trial_timed_out else None
+                toggle_event = "trial_timeout" if trial_timed_out else pending_toggle_event
+                pending_toggle_event = None
+                if discard_requested:
+                    if not args.hg_dagger:
+                        print("\nD ignored: start with --hg-dagger to enable trial discard.")
+                    elif hg_recorder is None or not hg_recorder.active:
+                        print(
+                            "\n[HG-DAgger] D ignored: no active trial to discard.",
+                            flush=True,
+                        )
+                    else:
+                        motion_enabled = False
+                        assert hg_expert is not None
+                        hg_expert.hold_controlled()
+                        finish_hg_intervention()
+                        hg_recorder.discard_episode()
+                        if hil_runtime is not None:
+                            hil_runtime.discard()
+                        hg_recorder.prepare_episode()
+                        start_pending = False
+                        trial_started_at = None
+                        trial_reset_required = True
+                        active_actions.clear()
+                        active_plan = None
+                        planner_requested = False
+                        command_target = None
+                        previous_joint_velocity = None
+                        held_act_action = None
+                        latched_act_subgoal = None
+                        act_subgoal_previous_joint_error = None
+                        act_subgoal_previous_gripper_error = None
+                        act_hold_steps = 0
+                        act_raw_gap_hard_steps = 0
+                        if planner is None and callable(reset):
+                            reset()
+                        toggle_event = "trial_discard"
+                        print(
+                            f"\n[HG-DAgger] Trial {trial_id} discarded; model control "
+                            "is paused. Press R or hold Y to home before the next X.",
+                            flush=True,
+                        )
                 if stop_requested:
                     if not args.execute:
                         print("\nAlt+S ignored: electronic stop is disabled without --execute.")
                         continue
                     motion_enabled = False
-                    finish_hg_intervention(complete=False)
+                    finish_hg_intervention()
+                    finish_hg_trial(complete=False)
                     emergency_stopped = True
                     robot.electronic_emergency_stop()
+                    if hg_expert is not None:
+                        hg_expert.emergency_stop()
                     if planner is not None:
                         planner.close()
                         planner = None
@@ -2447,7 +2897,10 @@ def main(argv: list[str] | None = None) -> int:
                             continue
                     is_act_reset = reset_requested and policy_type == "act"
                     home_label = "R reset" if is_act_reset else "Y hold"
-                    finish_hg_intervention(complete=False)
+                    if hg_expert is not None:
+                        hg_expert.hold_controlled()
+                    finish_hg_intervention()
+                    finish_hg_trial(complete=False)
                     motion_enabled = False
                     start_pending = False
                     trial_started_at = None
@@ -2469,6 +2922,7 @@ def main(argv: list[str] | None = None) -> int:
                             robot, robot_config, gripper, args, expected_js_mode,
                             homing_emergency_stop_requested,
                             record_blocking_motion,
+                            hg_expert,
                         )
                         arm_prepared = True
                     else:
@@ -2487,6 +2941,7 @@ def main(argv: list[str] | None = None) -> int:
                             args.home_speed_percent, args.home_timeout,
                             homing_emergency_stop_requested,
                             record_blocking_motion,
+                            hg_expert,
                         )
                     if policy_type == "act" and not is_act_reset:
                         held_gripper_width = max(
@@ -2514,17 +2969,49 @@ def main(argv: list[str] | None = None) -> int:
                     homing_active = False
                     key_tracker.after_home(time.monotonic())
                     print("Homing complete; model control remains paused. Press X for a new trial.")
+                    trial_reset_required = False
                     continue
                 if args.execute and x_toggle:
+                    if not motion_enabled and (
+                        pending_outcome_episode is not None or trial_reset_required
+                    ):
+                        if pending_outcome_episode is not None:
+                            message = (
+                                "label the completed trial with 1/0 and home with "
+                                "R/Y before X"
+                            )
+                        else:
+                            message = "home with R/Y before X after discarding the trial"
+                        print(f"\n[HG-DAgger] {message}.", flush=True)
+                        continue
                     motion_enabled = not motion_enabled
                     toggle_event = "start" if motion_enabled else "stop"
                     if motion_enabled:
+                        if hil_runtime is not None:
+                            hil_runtime.start_trial()
+                            # Policy synchronization happens while paused. The
+                            # trial and recording clocks start after it ends.
+                            tick = time.monotonic()
+                        if hg_recorder is not None:
+                            hg_recorder.start_episode(started_at=tick)
+                        hg_next_intervention_id = 0
                         trial_id += 1
                         trial_started_at = tick
                         previous_joint_velocity = None
                         print(f"\nTrial {trial_id} started.", flush=True)
                     else:
-                        finish_hg_intervention(complete=False)
+                        if hg_expert is not None:
+                            hg_expert.hold_controlled()
+                        finish_hg_intervention()
+                        saved_hg_episode = finish_hg_trial(complete=True, prepare_next=True)
+                        if args.hg_label_outcome and saved_hg_episode is not None:
+                            pending_outcome_episode = saved_hg_episode
+                            trial_reset_required = True
+                            print(
+                                "\n[HIL] trial saved. Press 1 for success or 0 for failure; "
+                                "reset the object and home the arm before the next X.",
+                                flush=True,
+                            )
                         trial_started_at = None
                         active_actions.clear()
                         active_plan = None
@@ -2556,6 +3043,11 @@ def main(argv: list[str] | None = None) -> int:
                     print("\nX ignored in shadow mode; no motion is authorized.")
 
                 joint_message = base.wait_for_feedback(robot, min(args.feedback_timeout, 0.2))
+                if hil_runtime is not None:
+                    from .hil_serl.safety import require_fresh_feedback
+                    if hil_can_guard is not None:
+                        hil_can_guard.check()
+                    require_fresh_feedback(joint_message, "follower joints", min(args.feedback_timeout, 0.5))
                 joints = [float(value) for value in joint_message.msg]
                 validate_joint_feedback(joints, robot_config)
                 gripper_width = base.wait_gripper_width(gripper, min(args.feedback_timeout, 0.2))
@@ -2580,11 +3072,19 @@ def main(argv: list[str] | None = None) -> int:
                     elif not motion_enabled:
                         print("\n[HG-DAgger] I ignored while model control is paused; press X first.")
                     elif hg_intervening:
+                        print(
+                            "\n[HG-DAgger] I received: leaving expert control; "
+                            "restoring leader enable and ACT control...",
+                            flush=True,
+                        )
+                        completed_recovery = hg_recording
                         if trial_started_at is not None and hg_started_at is not None:
                             # The duration budget measures novice/model control;
                             # never cut off an expert in the middle of recovery.
                             trial_started_at += tick - hg_started_at
-                        finish_hg_intervention(complete=True)
+                        assert hg_expert is not None
+                        hg_expert.resume_policy_control(state.tolist())
+                        finish_hg_intervention()
                         active_actions.clear()
                         active_plan = None
                         planner_requested = False
@@ -2598,19 +3098,42 @@ def main(argv: list[str] | None = None) -> int:
                         if planner is None and callable(reset):
                             reset()
                         toggle_event = "hg_return_to_policy"
-                        print(
-                            "\n[HG-DAgger] expert recovery saved; control returned "
-                            "to a freshly reset policy.",
-                            flush=True,
-                        )
+                        if completed_recovery:
+                            print(
+                                "\n[HG-DAgger] expert recovery marked in the "
+                                "full trial; control returned to a freshly "
+                                "reset policy.",
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                "\n[HG-DAgger] armed takeover cancelled before "
+                                "leader motion; the full trial continues.",
+                                flush=True,
+                            )
+                        # Leaving zero-force mode blocks during role/enable
+                        # changes. Read new feedback and camera frames next
+                        # tick before planning or commanding either arm.
+                        command_target = None
+                        act_subgoal_previous_joint_error = None
+                        act_subgoal_previous_gripper_error = None
+                        pending_toggle_event = "hg_return_to_policy"
+                        continue
                     else:
                         assert hg_expert is not None and hg_recorder is not None
-                        hg_last_sample = hg_expert.engage(
-                            state.tolist(), joint_bounds
+                        hg_last_sample = engage_expert_with_follower_hold(
+                            robot, gripper, hg_expert, state, joint_bounds,
+                            args.gripper_force, args.gripper_max_mm / 1000.0,
                         )
-                        hg_recorder.start_episode()
                         hg_intervening = True
+                        hg_recording = False
                         hg_started_at = tick
+                        hg_takeover_action = np.asarray(
+                            hg_last_sample.requested_action, dtype=np.float64
+                        )
+                        hg_motion_gate.arm(hg_last_sample.requested_action)
+                        hg_intervention_id = hg_next_intervention_id
+                        hg_next_intervention_id += 1
                         active_actions.clear()
                         active_plan = None
                         planner_requested = False
@@ -2625,10 +3148,17 @@ def main(argv: list[str] | None = None) -> int:
                             reset()
                         toggle_event = "hg_takeover"
                         print(
-                            "\n[HG-DAgger] EXPERT CONTROL active; only expert "
-                            "actions are being recorded. Press I to save/return.",
+                            "\n[HG-DAgger] takeover armed; follower is holding. "
+                            "Leader is now in zero-force mode; expert motion and "
+                            "labeling start after deliberate leader movement. "
+                            "Press I to cancel/return to ACT and leader shadowing.",
                             flush=True,
                         )
+                        # engage() blocks while changing gripper drive / arm
+                        # role. Do not infer or command from the pre-transition
+                        # camera batch. Both I directions resume on fresh data.
+                        pending_toggle_event = "hg_takeover"
+                        continue
                 planner_underflow = False
                 plan_observation_age_ms = None
                 chunk_inference_ms = None
@@ -2645,13 +3175,22 @@ def main(argv: list[str] | None = None) -> int:
                 act_subgoal_gripper_error = None
                 act_subgoal_joint_progress = None
                 act_subgoal_gripper_progress = None
+                hil_action = None
+                hil_inference_ms = 0.0
+                if hil_runtime is not None and (motion_enabled or not args.execute):
+                    hil_started = time.monotonic()
+                    hil_action = hil_runtime.predict(
+                        batch, autonomous=not hg_intervening,
+                        held_action=held_act_action if not hg_intervening else None,
+                    )
+                    hil_inference_ms = (time.monotonic() - hil_started) * 1000.0
                 if hg_intervening:
                     queue_depth_before = len(active_actions) if planner is not None else action_queue_depth(policy)
                     queue_depth_after = queue_depth_before
                     action_index_in_chunk = None
                     chunk_refresh = False
                     chunk_age_ms = None
-                    inference_ms = 0.0
+                    inference_ms = hil_inference_ms
                     inference_limit_ms = args.max_inference_ms
                     raw = state.copy()
                 elif planner is not None:
@@ -2732,6 +3271,9 @@ def main(argv: list[str] | None = None) -> int:
                         prediction = None
                         inference_ms = 0.0
                         raw = state.copy()
+                    elif hil_runtime is not None:
+                        inference_ms = hil_inference_ms
+                        raw = hil_action
                     elif (
                         policy_type == "act"
                         and held_act_action is not None
@@ -2757,6 +3299,7 @@ def main(argv: list[str] | None = None) -> int:
                     chunk_age_ms = None
                     inference_limit_ms = args.max_inference_ms
                 hg_sample = None
+                hg_expert_raw = None
                 if hg_intervening:
                     assert hg_expert is not None
                     novice_raw = (
@@ -2766,7 +3309,23 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     hg_sample = hg_last_sample or hg_expert.sample(joint_bounds)
                     hg_last_sample = None
-                    raw = np.asarray(hg_sample.requested_action, dtype=np.float64)
+                    hg_expert_raw = np.asarray(
+                        hg_sample.requested_action, dtype=np.float64
+                    )
+                    if not hg_recording and hg_motion_gate.update(
+                        hg_sample.requested_action
+                    ):
+                        hg_recording = True
+                        print(
+                            "\n[HG-DAgger] leader motion detected; EXPERT "
+                            "CONTROL and expert labeling active. Press I to return.",
+                            flush=True,
+                        )
+                    if hg_recording:
+                        raw = hg_expert_raw.copy()
+                    else:
+                        assert hg_takeover_action is not None
+                        raw = np.asarray(hg_takeover_action).copy()
                 else:
                     novice_raw = np.asarray(raw).copy()
                     last_novice_action = novice_raw.copy()
@@ -2815,6 +3374,10 @@ def main(argv: list[str] | None = None) -> int:
                 # This flag intentionally excludes normal acceleration shaping;
                 # it represents only the final hard safety clamp.
                 tracking_clamped = action_was_clamped(shaped_action, target)
+                backpressure_clamped = (
+                    act_backpressure_required(shaped_action, target, state)
+                    if policy_type == "act" else tracking_clamped
+                )
                 if policy_type in {"act", "pi0"} and not hg_intervening:
                     if policy_type == "act":
                         # Only malformed/non-finite actions and physical bounds
@@ -2925,12 +3488,12 @@ def main(argv: list[str] | None = None) -> int:
                         ) = update_act_backpressure_target(
                             latched_act_subgoal,
                             candidate_subgoal,
-                            tracking_clamped,
+                            backpressure_clamped,
                             act_raw_action_ok,
                         )
                         if act_subgoal_created:
-                            # Freeze ACT's action consumption until this local
-                            # target no longer needs the final hard limiter.
+                            # Freeze ACT until joint/opening backpressure ends;
+                            # closing width alone must not freeze a grasp.
                             (
                                 act_subgoal_joint_error,
                                 act_subgoal_max_joint_error,
@@ -3006,8 +3569,18 @@ def main(argv: list[str] | None = None) -> int:
                     joints, target[:6], joint_bounds
                 )
                 mode_feedback = read_mode_feedback(robot)
+                hil_action_age_ms = None
+                if hil_runtime is not None:
+                    # Acquisition freshness (50 ms by default) and full
+                    # observation-to-command age have different budgets.
+                    if hil_action is not None:
+                        hil_action_age_ms = max((time.monotonic() - frames[role][1]) * 1000 for role in camera_roles)
+                    if hil_can_guard is not None:
+                        hil_can_guard.check()
+                    require_fresh_feedback(joint_message, "follower joints", min(args.feedback_timeout, 0.5))
+                    require_fresh_feedback(gripper.get_gripper_status(), "follower gripper", min(args.feedback_timeout, 0.5))
                 mode_ready = not arm_prepared or mode_feedback == expected_js_mode
-                healthy = (
+                control_checks_healthy = (
                     camera_age_ms <= args.max_camera_age_ms
                     and inference_ms <= inference_limit_ms
                     and execution_ready
@@ -3033,6 +3606,10 @@ def main(argv: list[str] | None = None) -> int:
                         <= args.max_smolvla_plan_age_ms
                     )
                 )
+                healthy = control_checks_healthy and (
+                    hil_action_age_ms is None
+                    or hil_action_age_ms <= args.hil_max_action_age_ms
+                )
                 performance_warnings, inference_failures = inference_timing_messages(
                     inference_ms,
                     args.warn_inference_ms,
@@ -3044,6 +3621,11 @@ def main(argv: list[str] | None = None) -> int:
                     watchdog_failures.append(
                         f"camera age {camera_age_ms:.1f}ms > "
                         f"{args.max_camera_age_ms:.1f}ms"
+                    )
+                if hil_action_age_ms is not None and hil_action_age_ms > args.hil_max_action_age_ms:
+                    watchdog_failures.append(
+                        f"HIL observation-to-command age {hil_action_age_ms:.1f}ms > "
+                        f"{args.hil_max_action_age_ms:.1f}ms"
                     )
                 watchdog_failures.extend(inference_failures)
                 if not execution_ready:
@@ -3079,6 +3661,59 @@ def main(argv: list[str] | None = None) -> int:
                         f"plan observation age {plan_observation_age_ms:.1f}ms > "
                         f"{args.max_smolvla_plan_age_ms:.1f}ms"
                     )
+                retry_hil_observation = (
+                    hil_observation_deadline is not None
+                    and hil_observation_deadline.retry(
+                        hil_action_age_ms,
+                        other_checks_healthy=(
+                            args.execute and motion_enabled and not start_pending
+                            and control_checks_healthy and len(watchdog_failures) == 1
+                        ),
+                    )
+                )
+                if retry_hil_observation:
+                    # Only the observation deadline failed. Discard the entire
+                    # prediction, including any subgoal created from it. Keep
+                    # the last bounded command while fetching fresh data; never
+                    # replay this late action. The third consecutive miss stops
+                    # the trial via the normal, deliberately latched watchdog.
+                    hil_runtime.discard_observation()
+                    previous_joint_velocity = None
+                    held_act_action = None
+                    latched_act_subgoal = None
+                    act_subgoal_previous_joint_error = None
+                    act_subgoal_previous_gripper_error = None
+                    act_hold_steps = 0
+                    log.write(json.dumps({
+                        "event": "hil_observation_frame_skipped",
+                        "trial_id": trial_id,
+                        "hg_intervening": bool(hg_intervening),
+                        "hg_recording": bool(hg_recording),
+                        "inference_ms": hil_inference_ms,
+                        "camera_age_ms": camera_age_ms,
+                        "hil_action_age_ms": hil_action_age_ms,
+                        "hil_consecutive_deadline_misses": hil_observation_deadline.misses,
+                        "command_sent": False,
+                    }) + "\n")
+                    log.flush()
+                    if time.monotonic() >= next_hil_retry_warning_at:
+                        next_hil_retry_warning_at = time.monotonic() + 1.0
+                        print(
+                            f"\n[HIL] slow observation "
+                            f"({hil_action_age_ms:.1f}ms); frame skipped, "
+                            "last targets retained; retrying with fresh data "
+                            f"({hil_observation_deadline.misses}/"
+                            f"{hil_observation_deadline.maximum_consecutive_misses}).",
+                            flush=True,
+                        )
+                    continue
+                if (hil_observation_deadline is not None
+                        and hil_observation_deadline.misses
+                        >= hil_observation_deadline.maximum_consecutive_misses):
+                    watchdog_failures.append(
+                        f"HIL observation deadline missed for "
+                        f"{hil_observation_deadline.misses} consecutive frames"
+                    )
                 # A watchdog trip always disarms the toggle. Recovery requires
                 # another deliberate X press; motion must never restart itself.
                 if (
@@ -3086,7 +3721,10 @@ def main(argv: list[str] | None = None) -> int:
                     and not start_pending
                 ):
                     motion_enabled = False
-                    finish_hg_intervention(complete=False)
+                    if hg_expert is not None:
+                        hg_expert.hold_controlled()
+                    finish_hg_intervention()
+                    finish_hg_trial(complete=False)
                     trial_started_at = None
                     toggle_event = "watchdog_stop"
                     held_act_action = None
@@ -3102,7 +3740,9 @@ def main(argv: list[str] | None = None) -> int:
                         f"command: {detail}",
                         flush=True,
                     )
-                elif args.execute and motion_enabled and performance_warnings:
+                elif (args.execute and motion_enabled and performance_warnings
+                      and tick >= next_warning_at):
+                    next_warning_at = tick + 1.0
                     print(
                         "\nWARNING: " + "; ".join(performance_warnings)
                         + "; continuing execution.",
@@ -3130,6 +3770,8 @@ def main(argv: list[str] | None = None) -> int:
                 command_joint_velocity = None
                 command_joint_acceleration = None
                 if may_command:
+                    if hg_expert is not None and not hg_intervening:
+                        hg_expert.command_policy_action(target.tolist())
                     robot.move_js(target[:6].tolist())
                     gripper.move_gripper_m(float(target[6]), args.gripper_force)
                     command_joint_velocity = (
@@ -3150,32 +3792,52 @@ def main(argv: list[str] | None = None) -> int:
                     command_target = state.copy()
                     previous_joint_velocity = None
 
-                if (
-                    hg_intervening
-                    and may_command
-                    and hg_recorder is not None
-                    and hg_sample is not None
-                ):
+                if hg_recorder is not None and hg_recorder.active:
+                    control_source = 2 if hg_recording else (1 if hg_intervening else 0)
+                    executed_action = target if may_command else state
+                    leader_state = (
+                        hg_sample.leader_state
+                        if hg_sample is not None
+                        else [math.nan] * 7
+                    )
+                    expert_requested = (
+                        hg_expert_raw.tolist()
+                        if hg_expert_raw is not None
+                        else [math.nan] * 7
+                    )
+                    leader_age = (
+                        hg_sample.feedback_age
+                        if hg_sample is not None
+                        else math.nan
+                    )
                     hg_recorder.capture(
                         tick,
                         state.tolist(),
-                        target.tolist(),
+                        np.asarray(executed_action).tolist(),
                         list(robot.fk(joints)),
-                        [
-                            float(requested - actual)
-                            for requested, actual in zip(raw[:6], state[:6])
-                        ],
+                        (
+                            np.asarray(executed_action) - np.asarray(state)
+                        )[:6].tolist(),
                         {
-                            "leader_state": hg_sample.leader_state,
+                            "leader_state": leader_state,
                             "novice_action": np.asarray(novice_raw).tolist(),
-                            "expert_requested_action": np.asarray(raw).tolist(),
+                            "expert_requested_action": expert_requested,
                             "following_error": (
-                                np.asarray(target) - np.asarray(state)
+                                np.asarray(executed_action) - np.asarray(state)
                             ).tolist(),
-                            "leader_feedback_age": hg_sample.feedback_age,
+                            "leader_feedback_age": leader_age,
+                            "control_source": control_source,
+                            "expert_mask": int(hg_recording),
+                            "intervention_id": hg_intervention_id,
+                            "command_sent": int(may_command),
+                            **({"hil_base_action": hil_runtime.base_action.tolist()}
+                               if hil_runtime is not None else {}),
                         },
                         show_preview=False,
+                        frames=frames,
                     )
+                    if hil_runtime is not None:
+                        hil_runtime.capture(executed_action, expert=hg_recording, command_sent=may_command)
 
                 recorder.capture(
                     tick,
@@ -3199,6 +3861,15 @@ def main(argv: list[str] | None = None) -> int:
                 row = {
                     "time": time.time(), "checkpoint_sha256": digest,
                     "policy_type": policy_type,
+                    "hil_learner_step": hil_runtime.version if hil_runtime is not None else None,
+                    "hil_action_age_ms": hil_action_age_ms,
+                    "hil_consecutive_deadline_misses": (
+                        hil_observation_deadline.misses
+                        if hil_observation_deadline is not None else None
+                    ),
+                    "hil_max_action_age_ms": args.hil_max_action_age_ms if hil_runtime is not None else None,
+                    "hil_base_action": (hil_runtime.base_action.tolist()
+                                        if hil_runtime is not None and hil_runtime.base_action is not None else None),
                     **({"pi0_clock_aligned": True,
                         "base_checkpoint": str(pi0_base)} if policy_type == "pi0" else {}),
                     "mode": "execute" if args.execute else "shadow",
@@ -3274,8 +3945,13 @@ def main(argv: list[str] | None = None) -> int:
                     "recording_active": recorder.active,
                     "hg_dagger_enabled": bool(args.hg_dagger),
                     "hg_intervening": bool(hg_intervening),
+                    "hg_recording": bool(hg_recording),
+                    "hg_motion_streak": hg_motion_gate.streak,
                     "hg_expert_action_recorded": bool(
-                        hg_intervening and may_command
+                        hg_recording
+                        and hg_recorder is not None
+                        and hg_recorder.active
+                        and may_command
                     ),
                     "hg_dataset_root": (
                         None
@@ -3317,6 +3993,7 @@ def main(argv: list[str] | None = None) -> int:
                         "act_tracking_action": np.asarray(tracking_raw).tolist(),
                         "act_control_action": np.asarray(control_raw).tolist(),
                         "act_tracking_clamped": tracking_clamped,
+                        "act_backpressure_clamped": backpressure_clamped,
                         "act_gripper_boundary_corrected": bool(raw[6] != tracking_raw[6]),
                     } if policy_type in {"act", "pi0"} else {}),
                     "act_action_held": act_action_held,
@@ -3374,6 +4051,11 @@ def main(argv: list[str] | None = None) -> int:
                     "arm_prepared": arm_prepared,
                     "mode_feedback": mode_feedback,
                     "state": state.tolist(), "raw_action": raw.tolist(), "safe_action": target.tolist(),
+                    "hg_expert_requested_action": (
+                        None
+                        if hg_expert_raw is None
+                        else np.asarray(hg_expert_raw).tolist()
+                    ),
                     "novice_action_before_or_during_intervention": (
                         np.asarray(novice_raw).tolist()
                         if hg_intervening else None
@@ -3381,8 +4063,10 @@ def main(argv: list[str] | None = None) -> int:
                 }
                 log.write(json.dumps(row) + "\n")
                 log.flush()
-                if hg_intervening and may_command:
+                if hg_recording and may_command:
                     mode = "EXPERT"
+                elif hg_intervening and may_command:
+                    mode = "ARMED"
                 elif not healthy:
                     mode = "WATCHDOG"
                 elif may_command:
@@ -3390,16 +4074,19 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     mode = "READY" if args.execute else "SHADOW"
                 chunk_label = " refresh" if chunk_refresh else ""
-                print(
-                    f"\r{mode}{chunk_label} infer={inference_ms:5.1f}ms "
-                    f"loop={control_loop_ms:5.1f}ms "
-                    f"camera={camera_age_ms:5.1f}ms"
-                    + (
-                        f" plan_age={plan_observation_age_ms:5.1f}ms"
-                        if plan_observation_age_ms is not None else ""
-                    ),
-                    end="", flush=True,
-                )
+                if mode != last_status_mode or tick >= next_status_at:
+                    print(
+                        f"\r{mode}{chunk_label} infer={inference_ms:5.1f}ms "
+                        f"loop={control_loop_ms:5.1f}ms "
+                        f"camera={camera_age_ms:5.1f}ms"
+                        + (
+                            f" plan_age={plan_observation_age_ms:5.1f}ms"
+                            if plan_observation_age_ms is not None else ""
+                        ),
+                        end="", flush=True,
+                    )
+                    last_status_mode = mode
+                    next_status_at = tick + 1.0
                 remaining = period - (time.monotonic() - tick)
                 if remaining > 0:
                     time.sleep(remaining)
@@ -3411,11 +4098,15 @@ def main(argv: list[str] | None = None) -> int:
             if homing_active:
                 emergency_stopped = True
                 robot.electronic_emergency_stop()
+                if hg_expert is not None:
+                    hg_expert.emergency_stop()
                 print("\nCtrl+C during homing: electronic emergency stop sent.")
                 return 130
             print("\nCtrl+C received: pausing model control, homing, then exiting.")
             homing_active = True
             try:
+                if hg_expert is not None:
+                    hg_expert.hold_controlled()
                 held_gripper_width = min(
                     max(
                         base.wait_gripper_width(
@@ -3431,19 +4122,56 @@ def main(argv: list[str] | None = None) -> int:
                     args.home_speed_percent, args.home_timeout,
                     homing_emergency_stop_requested,
                     record_blocking_motion,
+                    hg_expert,
                 )
                 homing_active = False
-                arm_prepared = False
-                print("Ctrl+C: homing complete; program exits.")
+                closed_width = base.wait_gripper_width(gripper, args.feedback_timeout)
+                prepare_js_control(
+                    robot, robot_config, gripper, closed_width,
+                    args.gripper_force, args.feedback_timeout, expected_js_mode,
+                    ACT_STREAM_SPEED_PERCENT if policy_type == "act" else None,
+                )
+                if hg_expert is not None:
+                    hg_expert.hold_controlled()
+                arm_prepared = True
+                print("Ctrl+C: homing complete; both arms remain enabled and holding; program exits.")
                 return 0
             except KeyboardInterrupt:
                 emergency_stopped = True
                 robot.electronic_emergency_stop()
+                if hg_expert is not None:
+                    hg_expert.emergency_stop()
                 print("\nSecond Ctrl+C during homing: electronic emergency stop sent.")
                 return 130
+            except LeaderHomingFailure as exc:
+                follower_error, leader_error = isolate_leader_home_failure(
+                    robot, robot_config, args.feedback_timeout, hg_expert
+                )
+                homing_active = False
+                if follower_error is None:
+                    print(
+                        "\nCtrl+C homing stopped: leader E-stopped; follower "
+                        "is holding its measured position."
+                    )
+                else:
+                    emergency_stopped = True
+                    print(
+                        "\nCtrl+C homing stopped: leader E-stopped; follower "
+                        "hold failed, so follower was also E-stopped: "
+                        f"{type(follower_error).__name__}: {follower_error}"
+                    )
+                if leader_error is not None:
+                    print(
+                        "WARNING: leader E-stop command failed: "
+                        f"{type(leader_error).__name__}: {leader_error}"
+                    )
+                print(f"Leader homing failure: {exc}")
+                return 1
             except Exception as exc:
                 emergency_stopped = True
                 robot.electronic_emergency_stop()
+                if hg_expert is not None:
+                    hg_expert.emergency_stop()
                 print(
                     "\nCtrl+C homing failed; electronic emergency stop sent: "
                     f"{type(exc).__name__}: {exc}"
@@ -3451,14 +4179,48 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
         print("\nCtrl+C: shadow inference exits without commanding the arm.")
         return 0
+    except LeaderHomingFailure as exc:
+        if robot is not None and args.execute and hg_expert is not None:
+            motion_enabled = False
+            follower_error, leader_error = isolate_leader_home_failure(
+                robot, robot_config, args.feedback_timeout, hg_expert
+            )
+            homing_active = False
+            if follower_error is None:
+                print(
+                    "\nLeader homing failed: only the leader was E-stopped; "
+                    "the follower is holding its measured position.",
+                    flush=True,
+                )
+            else:
+                emergency_stopped = True
+                print(
+                    "\nLeader homing failed and the follower could not hold; "
+                    "both arms were E-stopped: "
+                    f"{type(follower_error).__name__}: {follower_error}",
+                    flush=True,
+                )
+            if leader_error is not None:
+                print(
+                    "WARNING: leader E-stop command failed: "
+                    f"{type(leader_error).__name__}: {leader_error}",
+                    flush=True,
+                )
+            print(f"Leader homing failure: {exc}", flush=True)
+            return 1
+        raise
     except Exception:
-        if robot is not None and homing_active:
+        if robot is not None and (homing_active or (args.hil_run and args.execute)):
             emergency_stopped = True
             robot.electronic_emergency_stop()
-            print("\nHoming failed: electronic emergency stop sent.")
+            if hg_expert is not None:
+                hg_expert.emergency_stop()
+            print("\nControl failed: electronic emergency stop sent.")
         raise
     finally:
         keyboard.close()
+        if hil_runtime is not None:
+            hil_runtime.close()
         if planner is not None:
             planner.close()
         if robot is not None and arm_prepared and not emergency_stopped:

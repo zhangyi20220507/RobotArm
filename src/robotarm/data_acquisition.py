@@ -16,6 +16,11 @@ def enable_piper_control(extra_args: Sequence[str] | None = None) -> int:
     return run_python_module("robotarm.hardware.enable_control", extra_args)
 
 
+def reset_both_pipers(extra_args: Sequence[str] | None = None) -> int:
+    """Reset software emergency-stop state on both configured Piper arms."""
+    return run_python_module("robotarm.hardware.reset_both", extra_args)
+
+
 def collect_piper_episode(extra_args: Sequence[str] | None = None) -> int:
     """Run the Piper gamepad data-collection runtime."""
     return run_python_module("robotarm.teleop.gamepad.runtime", extra_args)
@@ -70,6 +75,10 @@ WORKFLOWS = {
     ),
     "read-status": WorkflowSpec("Read Piper status from the controller.", read_piper_status),
     "enable-control": WorkflowSpec("Enable or disable Piper control.", enable_piper_control),
+    "reset-both-arms": WorkflowSpec(
+        "Reset software emergency-stop state on two Piper CAN controllers.",
+        reset_both_pipers,
+    ),
     "collect-piper": WorkflowSpec("Collect a Piper teleoperation episode.", collect_piper_episode),
     "collect-leader-follower": WorkflowSpec(
         "Collect episodes with two Piper arms in software leader-follower mode.",

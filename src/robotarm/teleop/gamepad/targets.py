@@ -134,11 +134,23 @@ def build_joint_targets(
     max_lead: float,
     bounds: list[tuple[float, float]],
 ) -> tuple[list[float], tuple[int, ...]]:
-    """Accumulate active joint targets, bounded against fresh feedback."""
-    targets = current_joints[:]
+    """Accumulate active targets while holding every inactive joint.
+
+    The caller re-anchors ``previous_targets`` to feedback when a jog begins
+    or changes joint.  While that jog remains active, copying the previous
+    command here prevents unselected joints from following encoder noise or
+    load-induced drift on every MOVE_JS update.
+    """
+    targets = previous_targets[:]
     active: list[int] = []
     for index, value in enumerate(inputs):
         if value == 0.0:
+            low, high = bounds[index]
+            held = min(
+                max(previous_targets[index], current_joints[index] - max_lead),
+                current_joints[index] + max_lead,
+            )
+            targets[index] = min(max(held, low), high)
             continue
         active.append(index)
         direction = 1.0 if value > 0 else -1.0

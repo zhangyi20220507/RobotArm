@@ -8,17 +8,22 @@ from unittest.mock import Mock, patch
 
 from robotarm.teleop.leader_follower.runtime import (
     alignment_complete,
+    ControlLoopTiming,
     command_joint_bounds,
     clip_command_to_bounds,
     clip_feedback_zero_offsets,
+    classify_gripper_following_gap,
     enter_follower_j,
     ensure_receive_running,
     exit_leader_drag_mode,
     feedback_age,
     joint_feedback_age,
+    joint_feedback_limit_violations,
+    leader_feedback_limit_state,
     limit_joint_target,
     make_parser,
     MotionDiagnostics,
+    PreviewCadence,
     normalize_hold_roundoff,
     prepare_leader_target,
     main,
@@ -28,11 +33,57 @@ from robotarm.teleop.leader_follower.runtime import (
     update_leader_joint_message,
     validate_args,
     validate_target_bounds,
+    wait_leader_gripper_command,
 )
 from robotarm.core.robot.safety import safe_joint_bounds
 
 
 class LeaderFollowerTests(unittest.TestCase):
+    def test_preview_cadence_limits_refresh_to_ten_hz(self):
+        cadence = PreviewCadence(rate_hz=10.0)
+        ticks = [i / 50.0 for i in range(50)]
+        refreshes = [tick for tick in ticks if cadence.due(tick)]
+        self.assertEqual(len(refreshes), 10)
+        self.assertTrue(all(b - a >= 0.1 - 1e-9 for a, b in zip(refreshes, refreshes[1:])))
+
+    def test_wait_for_gripper_ignores_command_from_before_mode_transition(self):
+        stale = SimpleNamespace(
+            timestamp=99.0,
+            msg=SimpleNamespace(value=0.01, status_code=1),
+        )
+        fresh = SimpleNamespace(
+            timestamp=101.0,
+            msg=SimpleNamespace(value=0.04, status_code=1),
+        )
+        gripper = SimpleNamespace(
+            get_gripper_ctrl_states=Mock(side_effect=[stale, fresh])
+        )
+        with patch(
+            "robotarm.teleop.leader_follower.runtime.time.time",
+            return_value=101.1,
+        ), patch("robotarm.teleop.leader_follower.runtime.time.sleep"):
+            value, age = wait_leader_gripper_command(
+                gripper, 1.0, not_before=100.0
+            )
+        self.assertEqual(value, 0.04)
+        self.assertAlmostEqual(age, 0.1)
+
+    def test_gripper_closing_gap_is_object_contact_not_failure(self):
+        self.assertEqual(
+            classify_gripper_following_gap(0.0, 0.035, 0.020),
+            "closing_contact",
+        )
+
+    def test_gripper_opening_gap_remains_a_control_failure(self):
+        self.assertEqual(
+            classify_gripper_following_gap(0.060, 0.030, 0.020),
+            "opening_error",
+        )
+        self.assertEqual(
+            classify_gripper_following_gap(0.040, 0.030, 0.020),
+            "tracking",
+        )
+
     def test_defaults_are_dry_run_and_use_distinct_can_channels(self):
         args = make_parser().parse_args([])
         validate_args(args)
@@ -41,6 +92,8 @@ class LeaderFollowerTests(unittest.TestCase):
         self.assertFalse(args.check_only)
         self.assertEqual(args.leader_init_timeout, 30.0)
         self.assertEqual(args.joint_limit_margin_deg, 0.5)
+        self.assertEqual(args.control_rate, 50.0)
+        self.assertEqual(args.max_step_joint_deg, 4.0)
 
     def test_check_only_reports_deltas_and_ages_without_controlling_either_arm(self):
         leader, follower = Mock(), Mock()
@@ -132,7 +185,8 @@ class LeaderFollowerTests(unittest.TestCase):
         self.assertTrue(alignment_complete(target, target, target))
 
     def run_alignment_runtime(self, keys, stale_during_alignment=False, residual_deg=0.0,
-                              snapshot=0.01, follower_stuck=False, recording=False):
+                              snapshot=0.01, follower_stuck=False, recording=False,
+                              runtime_args=()):
         actual = [0.0] * 6
         leader, follower, gripper = Mock(), Mock(), Mock()
         leader._parser = None
@@ -160,7 +214,7 @@ class LeaderFollowerTests(unittest.TestCase):
             return ([snapshot] * 6 if updates <= 2 else [snapshot + 0.03] * 6), 0.0
 
         def follower_input(*args):
-            age = 1.0 if stale_during_alignment and follower.move_j.called else 0.0
+            age = 1.0 if stale_during_alignment and follower.move_js.called else 0.0
             return list(actual), age
 
         prefix = "robotarm.teleop.leader_follower.runtime."
@@ -197,7 +251,7 @@ class LeaderFollowerTests(unittest.TestCase):
                 stack.enter_context(patch(prefix + name, replacement))
             output = stack.enter_context(patch("builtins.print"))
             mode_args = ["--setup-id", "offline-test", "--task", "test"] if recording else ["--control-only"]
-            result = main(["--execute", "--allow-enabled-start", *mode_args])
+            result = main(["--execute", "--allow-enabled-start", *mode_args, *runtime_args])
         if recording:
             recorder.start_episode.assert_called_once()
             self.assertTrue(recorder.capture.called)
@@ -231,23 +285,53 @@ class LeaderFollowerTests(unittest.TestCase):
     def test_live_alignment_freezes_target_and_waits_for_f(self):
         result, follower, output = self.run_alignment_runtime(["l", "a"] + [None] * 120 + ["q"])
         self.assertEqual(result, 0)
-        commands = [call.args[0] for call in follower.move_j.call_args_list]
+        commands = [call.args[0] for call in follower.move_js.call_args_list]
         self.assertTrue(commands)
-        self.assertGreaterEqual(
-            follower.set_motion_mode.call_count,
-            follower.move_j.call_count,
-        )
-        self.assertTrue(all(
-            call.args == (follower.OPTIONS.MOTION_MODE.J,)
-            for call in follower.set_motion_mode.call_args_list
-        ))
+        follower.move_j.assert_not_called()
         self.assertTrue(all(max(command) <= 0.01 + 1e-9 for command in commands))
         self.assertAlmostEqual(commands[-1][0], 0.01)
         for previous, current in zip(commands, commands[1:]):
-            self.assertLessEqual(max(abs(a-b) for a, b in zip(previous, current)), math.radians(5)/50 + 1e-9)
+            self.assertLessEqual(max(abs(a-b) for a, b in zip(previous, current)), math.radians(30)/50 + 1e-9)
         self.assertTrue(any("alignment complete" in str(call) for call in output.call_args_list))
-        self.assertTrue(all(call.args == (10,) for call in follower.set_speed_percent.call_args_list))
+        self.assertTrue(all(call.args == (30,) for call in follower.set_speed_percent.call_args_list))
         follower.init_effector.return_value.move_gripper_m.assert_not_called()
+
+    def test_alignment_speed_is_configurable_and_faster_than_legacy_ramp(self):
+        keys = ["l", "a"] + [None] * 150 + ["q"]
+        _, fast, output = self.run_alignment_runtime(keys, snapshot=0.5)
+        _, slow, _ = self.run_alignment_runtime(
+            keys, snapshot=0.5,
+            runtime_args=("--alignment-speed", "10", "--alignment-rate-deg-s", "5"),
+        )
+        # A 28.6-degree snapshot takes ~48 target steps at 30 deg/s and 50 Hz,
+        # versus ~287 at 5 deg/s. Only the new ramp finishes in this window.
+        self.assertTrue(any("alignment complete" in str(call) for call in output.call_args_list))
+        self.assertAlmostEqual(fast.move_js.call_args_list[-1].args[0][0], 0.5)
+        self.assertLess(slow.move_js.call_args_list[-1].args[0][0], 0.5)
+        self.assertTrue(all(call.args == (10,) for call in slow.set_speed_percent.call_args_list))
+
+    def test_alignment_rate_still_obeys_maximum_per_cycle_step(self):
+        _, follower, _ = self.run_alignment_runtime(
+            ["l", "a"] + [None] * 10 + ["q"], snapshot=0.5,
+            runtime_args=("--alignment-rate-deg-s", "30", "--max-step-joint-deg", "0.1"),
+        )
+        commands = [call.args[0] for call in follower.move_js.call_args_list]
+        for previous, current in zip([[0.0] * 6] + commands, commands):
+            self.assertLessEqual(
+                max(abs(a-b) for a, b in zip(previous, current)),
+                math.radians(0.1) + 1e-9,
+            )
+
+    def test_alignment_settings_reject_nonfinite_or_excessive_values(self):
+        for option, values in (
+            ("--alignment-speed", (31,)),
+            ("--alignment-rate-deg-s", (31, "nan", "inf")),
+        ):
+            for value in values:
+                with self.subTest(option=option, value=value):
+                    args = make_parser().parse_args([option, str(value)])
+                    with self.assertRaises(ValueError):
+                        validate_args(args)
 
     def test_alignment_accepts_stable_small_physical_residual(self):
         result, follower, output = self.run_alignment_runtime(
@@ -255,7 +339,7 @@ class LeaderFollowerTests(unittest.TestCase):
         )
         self.assertEqual(result, 0)
         self.assertTrue(any("alignment complete" in str(call) for call in output.call_args_list))
-        follower.move_js.assert_not_called()
+        self.assertTrue(follower.move_js.called)
 
     def test_alignment_rejects_residual_above_tolerance(self):
         result, _, output = self.run_alignment_runtime(
@@ -271,6 +355,19 @@ class LeaderFollowerTests(unittest.TestCase):
             max_step=0.01, max_following_error=limit,
         )
         self.assertLessEqual(max(result), limit + 1e-9)
+
+    def test_control_timing_reports_effective_rate_and_overruns(self):
+        timing = ControlLoopTiming(0.01, window=10)
+        for tick, work in ((1.0, 0.004), (1.01, 0.005), (1.02, 0.006), (1.05, 0.02)):
+            timing.begin(tick)
+            timing.finish(work)
+        timing.observe("move_js", 0.002)
+        timing.observe("record", 0.008)
+        summary = timing.summary()
+        self.assertIn("target=100.0Hz", summary)
+        self.assertIn("overruns(>1.5x)=1/3", summary)
+        self.assertIn("move_js p95/max=2.0/2.0ms", summary)
+        self.assertIn("record p95/max=8.0/8.0ms", summary)
 
     def test_alignment_mode_uses_planned_j_without_js(self):
         robot, gripper = Mock(), Mock()
@@ -302,7 +399,10 @@ class LeaderFollowerTests(unittest.TestCase):
         calls = follower.mock_calls
         speed_index = next(i for i, call in enumerate(calls)
                            if call[0] == "set_speed_percent" and call.args == (100,))
-        js_index = next(i for i, call in enumerate(calls) if call[0] == "enter_js")
+        js_index = next(
+            i for i, call in enumerate(calls)
+            if i > speed_index and call[0] == "enter_js"
+        )
         self.assertLess(speed_index, js_index)
         self.assertFalse(any(call[0] == "set_speed_percent" for call in calls[js_index+1:]))
 
@@ -413,6 +513,13 @@ class LeaderFollowerTests(unittest.TestCase):
         self.assertIn("录制中", status_line(True, False, True, True, False))
         self.assertIn("已保存，可按 h 回零", status_line(True, False, True, False, True))
         self.assertIn("剩余 1.25°", status_line(False, True, True, False, False, 1.25))
+        progress = status_line(
+            True, False, True, True, False,
+            saved_episodes=12, recorded_frames=86,
+        )
+        self.assertIn("已保存 12 条", progress)
+        self.assertIn("正在采第 13 条", progress)
+        self.assertIn("86 帧", progress)
 
     def test_recording_and_control_clamp_j5_without_widening_safe_bounds(self):
         bounds = [(-2.0, 2.0)] * 6
@@ -443,6 +550,36 @@ class LeaderFollowerTests(unittest.TestCase):
                 validate_joint_feedback([invalid] * 6, config)
             with self.assertRaises(RuntimeError):
                 prepare_leader_target([invalid] * 6, [(-1.0, 1.0)] * 6, False)
+
+    def test_leader_feedback_excursion_warns_while_follower_excursion_stops(self):
+        from robotarm.teleop.leader_follower.runtime import validate_joint_feedback
+        config = {
+            "joint_limits": {
+                f"joint{i}": (math.radians(-120), math.radians(120))
+                for i in range(1, 7)
+            }
+        }
+        joints = [0.0] * 5 + [math.radians(-125.42)]
+
+        violations = validate_joint_feedback(
+            joints, config, role="leader", enforce_limits=False
+        )
+        self.assertEqual(leader_feedback_limit_state(violations), ((6, "low"),))
+        self.assertEqual(joint_feedback_limit_violations(joints, config), violations)
+
+        with self.assertRaisesRegex(RuntimeError, r"follower J6.*停止控制"):
+            validate_joint_feedback(joints, config, role="follower")
+
+    def test_nonfinite_leader_feedback_still_stops_when_limits_are_advisory(self):
+        from robotarm.teleop.leader_follower.runtime import validate_joint_feedback
+        config = {"joint_limits": {f"joint{i}": (-1.0, 1.0) for i in range(1, 7)}}
+        with self.assertRaisesRegex(RuntimeError, "leader 关节反馈格式异常"):
+            validate_joint_feedback(
+                [0.0] * 5 + [math.nan],
+                config,
+                role="leader",
+                enforce_limits=False,
+            )
 
     def test_nonfinite_target_is_rejected_even_in_control_only(self):
         for invalid in (math.nan, math.inf, -math.inf):
@@ -685,7 +822,7 @@ class LeaderFollowerTests(unittest.TestCase):
         self.assertTrue(math.isinf(age))
 
     def test_unsafe_limits_are_rejected(self):
-        args = make_parser().parse_args(["--max-step-joint-deg", "4"])
+        args = make_parser().parse_args(["--max-step-joint-deg", "5.1"])
         with self.assertRaisesRegex(ValueError, "must not exceed"):
             validate_args(args)
         args = make_parser().parse_args(["--joint-limit-margin-deg", "0.1"])
@@ -714,10 +851,19 @@ class LeaderFollowerTests(unittest.TestCase):
             )
         )
         joints = [0.1, 0.2, -0.3, 0.0, 0.2, 0.0]
+        def gripper_feedback_after_role_restore():
+            # Ordinary gripper feedback is unavailable until the enabled
+            # controller has accepted the second Follower-role request.
+            self.assertEqual(robot.set_follower_mode.call_count, 2)
+            self.assertGreaterEqual(robot.enable.call_count, 2)
+            return SimpleNamespace(msg=SimpleNamespace(
+                foc_status=SimpleNamespace(driver_enable_status=True)
+            ))
+        gripper.get_gripper_status.side_effect = gripper_feedback_after_role_restore
         with patch("robotarm.teleop.leader_follower.runtime.time.sleep"):
             exit_leader_drag_mode(robot, joints, gripper, 0.04, 1.0)
-        robot.set_follower_mode.assert_called_once_with()
-        robot.enable.assert_called()
+        self.assertEqual(robot.set_follower_mode.call_count, 2)
+        self.assertGreaterEqual(robot.enable.call_count, 2)
         robot.set_motion_mode.assert_any_call("j")
         robot.set_motion_mode.assert_any_call("js")
         robot.move_js.assert_called_once_with(joints)

@@ -19,7 +19,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ..record.convert import discover_episodes, read_json, write_json
+from ..record.convert import (
+    discover_episodes,
+    read_json,
+    split_expert_selections,
+    uses_expert_mask,
+    write_json,
+)
+from ..record.file_copy import clone_or_copy
+from ..record.raw_reviews import load_raw_reviews, select_reviewed_episodes
 from .dataset_trim import exported_reviews
 from .quality_filter import default_reviews_path, validate_reviews
 
@@ -139,10 +147,19 @@ def _validate_compatibility(
             for key in ("serial", "stream"):
                 if session["cameras"][role].get(key) != base_session["cameras"][role].get(key):
                     raise RuntimeError(f"{path}: incompatible camera {role} {key}")
-        frames = sum(int(item.metadata["frames"]) for item in episodes)
-        episodes_total += len(episodes)
+        reviews = load_raw_reviews(path, episodes)
+        selections = select_reviewed_episodes(episodes, reviews)
+        if uses_expert_mask(session):
+            selections = split_expert_selections(selections)
+        if not selections:
+            raise RuntimeError(f"{path}: no reviewed expert training ranges to append")
+        frames = sum(
+            int(item["end_frame"]) - int(item["start_frame"])
+            for item in selections
+        )
+        episodes_total += len(selections)
         frames_total += frames
-        details.append((path, session, len(episodes)))
+        details.append((path, session, len(selections)))
         for reason in skipped:
             print(f"Skipping {path.name}/{reason}")
     return episodes_total, frames_total, details
@@ -260,7 +277,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     print(f"Copying base dataset to staging area: {stage}")
-    shutil.copytree(base, stage)
+    shutil.copytree(base, stage, copy_function=clone_or_copy)
     extension = _prepare_stage(stage, base, target, base_session, conversion, session_source)
     write_json(stage / "meta" / "base_quality_reviews.json", inherited)
     extension["base_reviews_snapshot"] = "meta/base_quality_reviews.json"

@@ -1,5 +1,7 @@
 """Raw merge tests with tiny real NPZ/video fixtures; no robot/LeRobot dependency."""
 import json
+import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,7 +11,10 @@ import cv2
 import numpy as np
 
 from robotarm.record.convert import discover_episodes, read_json, write_json
-from robotarm.record.merge import build_plan, execute_plan, main, sha256
+from robotarm.record.merge import (APPEND_MARKER, build_append_plan, build_plan,
+                                   execute_append_plan, execute_plan, main, sha256)
+from robotarm.record.raw_reviews import (default_raw_reviews_path, load_raw_reviews,
+                                         review_document)
 
 
 class RawMergeTests(unittest.TestCase):
@@ -143,7 +148,7 @@ class RawMergeTests(unittest.TestCase):
 
     def test_failed_copy_keeps_marker_and_no_published_session(self):
         plan, episodes = build_plan([self.a], self.output)
-        with patch('robotarm.record.merge.shutil.copy2', side_effect=OSError('copy failed')):
+        with patch('robotarm.record.merge.clone_or_copy', side_effect=OSError('copy failed')):
             with self.assertRaisesRegex(OSError, 'copy failed'):
                 execute_plan(plan, episodes)
         self.assertTrue((self.output / 'MERGE_INCOMPLETE.txt').is_file())
@@ -159,6 +164,113 @@ class RawMergeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'Source changed'):
             execute_plan(plan, episodes)
         self.assertFalse(self.output.exists())
+
+    def canonical_master(self):
+        plan, episodes = build_plan([self.a], self.output)
+        execute_plan(plan, episodes)
+        return self.output
+
+    def test_transactional_append_keeps_existing_payload_and_survives_deleted_origins(self):
+        master = self.canonical_master()
+        _, existing, _ = discover_episodes(master, False)
+        write_json(default_raw_reviews_path(master), review_document(
+            master, existing, {'0': {'status': 'keep', 'note': 'old review'}},
+        ))
+        _, new_source_episodes, _ = discover_episodes(self.b, False)
+        write_json(default_raw_reviews_path(self.b), review_document(
+            self.b, new_source_episodes,
+            {'0': {'status': 'review', 'note': 'new source review'}},
+        ))
+        old_payload = master / 'episodes/episode_000000/frames.npz'
+        old_inode, old_digest = old_payload.stat().st_ino, sha256(old_payload)
+        plan, additions = build_append_plan([self.b], master)
+        self.assertEqual(plan['base_episode_count'], 2)
+        self.assertEqual(plan['new_episode_count'], 1)
+        execute_append_plan(plan, additions)
+        self.assertEqual(old_payload.stat().st_ino, old_inode)
+        self.assertEqual(sha256(old_payload), old_digest)
+        _, episodes, skipped = discover_episodes(master, False)
+        self.assertEqual((len(episodes), skipped), (3, []))
+        reviews = load_raw_reviews(master, episodes)
+        self.assertEqual(reviews['0']['note'], 'old review')
+        self.assertEqual(reviews['2']['note'], 'new source review')
+        self.assertFalse((master / APPEND_MARKER).exists())
+
+        # The rolling master remains self-contained after all leaf sources are removed.
+        shutil.rmtree(self.a)
+        shutil.rmtree(self.b)
+        new_source = self.source('new_after_delete', [7])
+        plan, additions = build_append_plan([new_source], master)
+        execute_append_plan(plan, additions)
+        _, episodes, _ = discover_episodes(master, False)
+        self.assertEqual(len(episodes), 4)
+        reviews = load_raw_reviews(master, episodes)
+        self.assertEqual(reviews['0']['note'], 'old review')
+        self.assertEqual(reviews['2']['note'], 'new source review')
+
+    def test_append_preview_writes_nothing(self):
+        master = self.canonical_master()
+        before = {str(path.relative_to(master)): sha256(path)
+                  for path in master.rglob('*') if path.is_file()}
+        self.assertEqual(main([str(self.b), '--append-to', str(master)]), 0)
+        after = {str(path.relative_to(master)): sha256(path)
+                 for path in master.rglob('*') if path.is_file()}
+        self.assertEqual(after, before)
+
+    def test_append_commit_failure_rolls_back_existing_master(self):
+        master = self.canonical_master()
+        before = {str(path.relative_to(master)): sha256(path)
+                  for path in master.rglob('*') if path.is_file()}
+        plan, additions = build_append_plan([self.b], master)
+        real_replace = os.replace
+
+        def fail_manifest_publish(source, destination):
+            if str(source).endswith('/metadata/merge_manifest.json'):
+                raise OSError('publish failed')
+            return real_replace(source, destination)
+
+        with patch('robotarm.record.merge.os.replace', side_effect=fail_manifest_publish):
+            with self.assertRaisesRegex(OSError, 'publish failed'):
+                execute_append_plan(plan, additions)
+        after = {str(path.relative_to(master)): sha256(path)
+                 for path in master.rglob('*') if path.is_file()}
+        self.assertEqual(after, before)
+        self.assertFalse((master / APPEND_MARKER).exists())
+        self.assertFalse(any(path.name.startswith('.raw_append_') for path in master.iterdir()))
+        _, episodes, _ = discover_episodes(master, False)
+        self.assertEqual(len(episodes), 2)
+
+    def test_interrupted_append_has_explicit_dry_run_and_recovery(self):
+        master = self.canonical_master()
+        before = {str(path.relative_to(master)): sha256(path)
+                  for path in master.rglob('*') if path.is_file()}
+        plan, additions = build_append_plan([self.b], master)
+        real_replace = os.replace
+
+        def fail_session_publish(source, destination):
+            if str(source).endswith('/metadata/session.json'):
+                raise OSError('simulated power loss during publish')
+            return real_replace(source, destination)
+
+        with patch('robotarm.record.merge.os.replace', side_effect=fail_session_publish), \
+                patch('robotarm.record.merge.rollback_append',
+                      side_effect=RuntimeError('process terminated before rollback')):
+            with self.assertRaisesRegex(RuntimeError, 'process terminated'):
+                execute_append_plan(plan, additions)
+        self.assertTrue((master / APPEND_MARKER).is_file())
+        with self.assertRaisesRegex(ValueError, 'append is incomplete'):
+            discover_episodes(master, False)
+        self.assertEqual(main(['--append-to', str(master), '--recover-append']), 0)
+        self.assertTrue((master / APPEND_MARKER).is_file())
+        self.assertEqual(main([
+            '--append-to', str(master), '--recover-append', '--execute',
+        ]), 0)
+        self.assertFalse((master / APPEND_MARKER).exists())
+        after = {str(path.relative_to(master)): sha256(path)
+                 for path in master.rglob('*') if path.is_file()}
+        self.assertEqual(after, before)
+        _, episodes, _ = discover_episodes(master, False)
+        self.assertEqual(len(episodes), 2)
 
 
 if __name__ == '__main__':

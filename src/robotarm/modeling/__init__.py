@@ -74,10 +74,13 @@ def _run_trajectory_studio(extra_args: Sequence[str] | None = None) -> int:
 
 
 WORKFLOWS = {
+    "hil-serl": WorkflowSpec("Piper ACT-residual SAC: prepare, learner, guarded actor and CPU smoke test.", _run_module("robotarm.modeling.hil_serl.cli")),
     "pi0-training-report": WorkflowSpec("Compare Pi0 training logs and sampled offline predictions.", _run_module("robotarm.modeling.reports.pi0_training")),
     "pi0-denoising-report": WorkflowSpec("Compare paired Pi0 5/10-step denoising offline and write HTML.", _run_module("robotarm.modeling.reports.pi0_denoising")),
     "act-training-report": WorkflowSpec("Combine ACT resume history and matched latent reports into HTML.", _run_module("robotarm.modeling.reports.act_training")),
     "train-pi0-lora": WorkflowSpec("Preview or launch isolated Pi0 LoRA training on a local Piper dataset.", _run_module("robotarm.modeling.pi0_lora")),
+    "train-smolvla": WorkflowSpec("Preview or launch pretrained SmolVLA expert/LoRA training.", _run_module("robotarm.modeling.smolvla_lora")),
+    "train-smolvla-lora": WorkflowSpec("Compatibility alias for the configurable SmolVLA cloud trainer.", _run_module("robotarm.modeling.smolvla_lora")),
     "check-pi0-lora": WorkflowSpec("Reload a Pi0 LoRA adapter and predict one offline dataset frame.", _run_module("robotarm.modeling.pi0_lora_check")),
     "act-latent-report": WorkflowSpec("Compare ACT posterior/zero latent L1 on train/validation and write HTML.", _run_module("robotarm.modeling.act_latent_report")),
     "train": WorkflowSpec("Train a policy with the Lerobot pipeline.", _run_bash("train.bash")),
@@ -97,10 +100,14 @@ WORKFLOWS = {
     ),
     "validate-runtime": WorkflowSpec("Validate runtime telemetry and create approval.", _run_validate_runtime),
     "trajectory-studio": WorkflowSpec("Launch the open-loop validation studio.", _run_trajectory_studio),
-    "dataset-browser": WorkflowSpec("Browse, review and trim episodes into a new local LeRobot dataset.", _run_dataset_browser),
+    "dataset-browser": WorkflowSpec("Review raw or LeRobot episodes and export selected frames to LeRobot once.", _run_dataset_browser),
     "extend-dataset": WorkflowSpec(
         "Safely append raw Piper episodes or publish a new combined dataset.",
         _run_module("robotarm.modeling.dataset_extend"),
+    ),
+    "prepare-hil-serl": WorkflowSpec(
+        "Build a reward/done/intervention-aware HIL-SERL replay dataset from Piper raw trials.",
+        _run_module("robotarm.record.convert_hil_serl"),
     ),
     "relabel-dataset-task": WorkflowSpec(
         "Publish a dataset with one unified language task.",

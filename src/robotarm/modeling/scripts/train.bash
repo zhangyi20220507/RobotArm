@@ -157,10 +157,20 @@ fi
 wandb_mode=${WANDB_MODE:-online}
 echo "Wandb: enabled (mode=${wandb_mode})"
 
+# LeRobot loads the policy type from the checkpoint when --policy.path is
+# supplied and explicitly rejects passing --policy.type alongside it.
+policy_type_args=("--policy.type=${policy_type}")
+for argument in "${lerobot_args[@]}"; do
+  if [[ ${argument} == --policy.path || ${argument} == --policy.path=* ]]; then
+    policy_type_args=()
+    break
+  fi
+done
+
 exec lerobot-train \
   --dataset.repo_id="${repo_id}" \
   --dataset.root="${dataset_root}" \
-  --policy.type="${policy_type}" \
+  "${policy_type_args[@]}" \
   --policy.repo_id="${policy_repo_id}" \
   --policy.push_to_hub=false \
   --output_dir="${output_dir}" \

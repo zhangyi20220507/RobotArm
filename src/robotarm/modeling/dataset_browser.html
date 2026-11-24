@@ -8,8 +8,8 @@
     :root{color-scheme:dark;--bg:#091019;--panel:#111b28;--panel2:#0d1622;--line:#24364b;--text:#e8f0f8;--muted:#899bb0;--blue:#55b8ff;--green:#55d69d;--amber:#ffc65c;--red:#ff7180}
     *{box-sizing:border-box}body{margin:0;height:100vh;overflow:hidden;background:var(--bg);color:var(--text);font:12px system-ui,sans-serif;display:grid;grid-template-columns:218px minmax(0,1fr)}button,input,select,textarea{font:inherit}button{cursor:pointer}
     aside{min-height:0;border-right:1px solid var(--line);display:grid;grid-template-rows:auto auto auto minmax(0,1fr);background:#0a121d}.brand{padding:10px 10px 7px;border-bottom:1px solid var(--line)}h1{font-size:16px;margin:0 0 2px}.muted{color:var(--muted)}
-    .counts{display:grid;grid-template-columns:repeat(4,1fr);gap:3px;padding:5px}.count{padding:4px 1px;text-align:center;background:var(--panel);border-radius:5px}.count b{display:block;font-size:14px}.filters{display:grid;grid-template-columns:1fr;gap:4px;padding:0 5px 5px}.filters select,select,textarea{min-width:0;width:100%;background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:5px;padding:5px}
-    #episodes{min-height:0;overflow:auto;padding:0 4px 6px}.ep{display:grid;grid-template-columns:1fr auto;width:100%;text-align:left;padding:5px 7px;margin:1px 0;border:1px solid transparent;border-radius:6px;background:transparent;color:var(--text);line-height:1.2}.ep:hover{background:#152235}.ep.active{border-color:var(--blue);background:#14283c}.ep small{color:var(--muted)}.badge{align-self:center;padding:1px 4px;border-radius:7px;font-size:9px}.keep{background:#174936;color:#77e8b6}.reject{background:#51232b;color:#ff9ba5}.review{background:#4c3917;color:#ffd27a}.unreviewed{color:var(--muted)}
+    .counts{display:grid;grid-template-columns:repeat(5,1fr);gap:3px;padding:5px}.count{padding:4px 1px;text-align:center;background:var(--panel);border-radius:5px}.count b{display:block;font-size:14px}.filters{display:grid;grid-template-columns:1fr;gap:4px;padding:0 5px 5px}.filters select,select,textarea{min-width:0;width:100%;background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:5px;padding:5px}
+    #episodes{min-height:0;overflow:auto;padding:0 4px 6px}.ep{display:grid;grid-template-columns:1fr auto;width:100%;text-align:left;padding:5px 7px;margin:1px 0;border:1px solid transparent;border-radius:6px;background:transparent;color:var(--text);line-height:1.2}.ep:hover{background:#152235}.ep.active{border-color:var(--blue);background:#14283c}.ep small{color:var(--muted)}.badge{align-self:center;padding:1px 4px;border-radius:7px;font-size:9px}.keep{background:#174936;color:#77e8b6}.reject{background:#51232b;color:#ff9ba5}.review{background:#4c3917;color:#ffd27a}.unreviewed{color:var(--muted)}.default-review{background:#26364b;color:#a9bfd6}
     main{min-width:0;height:100vh;padding:10px 12px;display:grid;grid-template-rows:minmax(280px,44vh) auto minmax(240px,1fr);gap:8px;overflow:auto}.control{background:#172538;color:var(--text);border:1px solid var(--line);border-radius:7px;padding:7px 11px}.control:hover{border-color:var(--blue)}
     .upper{display:grid;grid-template-columns:minmax(420px,1.35fr) minmax(285px,.72fr) minmax(285px,.78fr);gap:8px;min-height:0}.card{min-height:0;background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:8px}.card h2{font-size:12px;margin:0 0 5px}.video-card{display:grid;grid-template-rows:auto minmax(0,1fr) 34px}.videos{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:5px;min-height:0}.video-wrap{min-height:0;display:grid;grid-template-rows:16px minmax(0,1fr)}video{width:100%;height:100%;object-fit:contain;background:#020406;border-radius:6px}
     .transport{display:grid;grid-template-columns:auto auto auto auto minmax(80px,1fr) 52px 56px;gap:4px;align-items:end}.transport button{height:28px;padding:2px 7px}.transport input{width:100%}.clock{text-align:right;font-variant-numeric:tabular-nums}.side{display:contents}.metrics{display:grid;grid-template-columns:1fr 1fr;gap:4px}.metric{background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:5px}.metric b{display:block;font-size:14px}#warnings{font-size:10px;color:var(--amber);margin-top:4px;max-height:32px;overflow:auto}
@@ -203,8 +203,8 @@
 </head>
 <body>
   <aside>
-    <div class="brand"><h1 data-i18n="Dataset Browser">数据集审核</h1><div id="dataset" class="muted"><span data-i18n="加载中…">加载中…</span></div></div>
-    <div class="counts"><div class="count"><b id="cAll">0</b><span data-i18n="全部">全部</span></div><div class="count"><b id="cKeep">0</b><span data-i18n="保留">保留</span></div><div class="count"><b id="cReview">0</b><span data-i18n="复查">复查</span></div><div class="count"><b id="cReject">0</b><span data-i18n="剔除">剔除</span></div></div>
+    <div class="brand"><h1 data-i18n="Dataset Browser">数据集审核</h1><div id="dataset" class="muted"><span data-i18n="加载中…">加载中…</span></div><div id="sourceMode" class="muted"></div></div>
+    <div class="counts"><div class="count"><b id="cAll">0</b><span data-i18n="全部">全部</span></div><div class="count"><b id="cDefault">0</b><span data-i18n="默认">默认</span></div><div class="count"><b id="cKeep">0</b><span data-i18n="保留">保留</span></div><div class="count"><b id="cReview">0</b><span data-i18n="复查">复查</span></div><div class="count"><b id="cReject">0</b><span data-i18n="剔除">剔除</span></div></div>
     <div class="filters"><select id="statusFilter"><option value="" data-i18n="全部状态">全部状态</option><option value="unreviewed" data-i18n="未审查">未审查</option><option value="keep" data-i18n="保留">保留</option><option value="review" data-i18n="待复查">待复查</option><option value="reject" data-i18n="剔除">剔除</option></select><select id="labelFilter" title="标签筛选" data-i18n-title="标签筛选"><option value="" data-i18n="全部标签">全部标签</option></select></div>
     <div id="episodes"></div>
   </aside>
@@ -226,7 +226,7 @@
       <div id="trimSummary" class="muted"></div>
       <div class="export-row">
         <div class="export-copy"><h3 data-i18n="导出新数据集">导出新数据集</h3><p class="muted" data-i18n="保留/未审查参与导出；复查/剔除不导出。未裁剪的条目保留整条。">保留/未审查参与导出；复查/剔除不导出。未裁剪的条目保留整条。</p></div>
-        <div class="export-actions"><label><span data-i18n="按标签导出">按标签导出</span><select id="exportLabelFilter"><option value="" data-i18n="全部可导出条目">全部可导出条目</option></select></label><label><span data-i18n="新数据集名称">新数据集名称 </span><input id="exportName" size="42" placeholder="dataset_trimmed_v1"></label><button id="export" class="control save"><span data-i18n="导出已保存的裁剪数据集">导出已保存的裁剪数据集</span></button></div>
+        <div class="export-actions"><label><span data-i18n="按标签导出">按标签导出</span><select id="exportLabelFilter"><option value="" data-i18n="全部可导出条目">全部可导出条目</option></select></label><label><span data-i18n="新数据集名称">新数据集名称 </span><input id="exportName" size="42" placeholder="dataset_trimmed_v1"></label><button id="export" class="control save"><span id="exportButtonText" data-i18n="导出已保存的裁剪数据集">导出已保存的裁剪数据集</span></button></div>
       </div>
       <div id="exportProgress" hidden>
         <label id="exportEpisodeCount" for="exportProgressBar"></label>
@@ -235,7 +235,7 @@
       </div>
       <div id="exportStatus" class="muted" role="status"></div>
     </section>
-    <section class="card charts-card"><div class="chart-head"><h2><span data-i18n="全部关节与夹爪：状态 / 动作">全部关节与夹爪：状态 / 动作</span></h2><div class="legend"><i class="dot" style="background:var(--blue)"></i>state <i class="dot" style="background:var(--amber)"></i>action <i class="dot" style="background:var(--red)"></i><span data-i18n="当前帧">当前帧</span></div></div><div id="charts" class="chart-grid"></div></section>
+    <section class="card charts-card"><div class="chart-head"><h2><span data-i18n="全部关节与夹爪：状态 / 动作">全部关节与夹爪：状态 / 动作</span></h2><div class="legend"><i class="dot" style="background:var(--blue)"></i>state <i class="dot" style="background:var(--amber)"></i>action <i class="dot" style="background:rgba(181,126,255,.55)"></i>expert <i class="dot" style="background:var(--red)"></i><span data-i18n="当前帧">当前帧</span></div></div><div id="charts" class="chart-grid"></div></section>
   </main>
 
   <script>
@@ -273,6 +273,18 @@
   "未审查": [
     "未审查",
     "Unreviewed"
+  ],
+  "默认": [
+    "默认",
+    "Default"
+  ],
+  "默认（未人工复核）": [
+    "默认（未人工复核）",
+    "Default (not manually reviewed)"
+  ],
+  "已人工复核": [
+    "已人工复核",
+    "Manually reviewed"
   ],
   "待复查": [
     "待复查",
@@ -695,15 +707,28 @@
       const text=typeof entry.text==='function'?entry.text():errorText(entry.text);
       $(id).textContent=text;$(id).classList.toggle('error',entry.error);
     }
+    function detailsText(){
+      let text=t('details',{count:current.length,duration:current.duration.toFixed(2),fps:meta.fps});
+      text+=' · '+t(reviewOrigin(current.index)==='default'?'默认（未人工复核）':'已人工复核');
+      if(current.expert_frames){
+        const seconds=(current.expert_frames/meta.fps).toFixed(2);
+        text+=language==='en'?` · expert ${seconds}s / ${current.interventions} intervention(s)`:` · 专家 ${seconds}s / ${current.interventions} 次接管`;
+      }
+      return text;
+    }
     function renderLocalizedState(){
       $('#play').textContent=t(playing?'❚❚ 暂停':'▶ 播放');
       if(meta){
         $('#dataset').textContent=t('datasetSummary',{name:meta.name,count:meta.total_episodes,fps:meta.fps});
+        $('#sourceMode').textContent=meta.raw_reviews
+          ?(language==='en'?'Raw review · original MP4/NPZ · convert to LeRobot once':'Raw 审核 · 直接读取 MP4/NPZ · 清洗后一次转 LeRobot'):'';
+        $('#exportButtonText').textContent=meta.raw_reviews
+          ?(language==='en'?'Convert selection to LeRobot':'将清洗结果转换为 LeRobot'):t('导出已保存的裁剪数据集');
         renderLabelControls();
         renderList();
       }
       if(current){
-        $('#details').textContent=t('details',{count:current.length,duration:current.duration.toFixed(2),fps:meta.fps});
+        $('#details').textContent=detailsText();
         renderMetrics();trimSummary();
       }
       messages.forEach((entry,id)=>renderMessage(id,entry));
@@ -739,7 +764,8 @@
     }
     function message(id,text,error=false){const entry={text,error};messages.set(id,entry);renderMessage(id,entry)}
     function changed(){dirty=true;message('#saved','未保存')}
-    function statusOf(i){return meta.reviews[String(i)]?.status||'unreviewed'}
+    function statusOf(i){return meta.reviews[String(i)]?.status||'keep'}
+    function reviewOrigin(i){return meta.reviews[String(i)]?.review_origin||'manual'}
     function schemaText(item){return item.labels?.[language]??item.labels?.['zh-CN']??item.id??item.value}
     function parseLabelFilter(encoded){
       if(!encoded)return null;
@@ -774,7 +800,8 @@
     }
     function episodeLabelSummary(index){
       const values=meta.reviews[String(index)]?.labels||{};
-      return Object.entries(values).map(([field,value])=>labelText(field,value)).join(' · ');
+      const visibleFields=new Set((meta.label_schema||[]).map(field=>field.id));
+      return Object.entries(values).filter(([field])=>visibleFields.has(field)).map(([field,value])=>labelText(field,value)).join(' · ');
     }
     function renderLabelEditor(){
       const editor=$('#labelEditor');editor.replaceChildren();
@@ -795,12 +822,13 @@
     function updateCounts(){
       const values=Object.values(meta.reviews);
       $('#cAll').textContent=meta.total_episodes;
+      $('#cDefault').textContent=values.filter(x=>x.review_origin==='default').length;
       ['Keep','Review','Reject'].forEach(key=>$('#c'+key).textContent=values.filter(x=>x.status===key.toLowerCase()).length);
     }
     function renderList(){
       const filter=$('#statusFilter').value,labelFilter=$('#labelFilter').value,list=$('#episodes');
       list.replaceChildren();
-      meta.episodes.filter(x=>(!filter||statusOf(x.index)===filter)&&matchesLabelFilter(x.index,labelFilter)).forEach(x=>{
+      meta.episodes.filter(x=>(!filter||(filter==='unreviewed'?reviewOrigin(x.index)==='default':statusOf(x.index)===filter))&&matchesLabelFilter(x.index,labelFilter)).forEach(x=>{
         const button=document.createElement('button'),status=statusOf(x.index);
         button.className='ep '+(current?.index===x.index?'active':'');
         const left=document.createElement('span'),badge=document.createElement('span'),trim=meta.reviews[String(x.index)]?.trim;
@@ -810,7 +838,9 @@
         left.innerHTML=language==='en'
           ? t('episode')+' '+x.index+'<span class="ep-duration"> · '+duration+'</span><br><small>'+x.length+'f'+(trim?' · trim '+range:'')+labelSuffix+'</small>'
           : t('episode')+' '+x.index+'<br><small>'+x.length+' '+t('frames')+' · '+duration+(trim?' · '+t('trimmed')+' '+range:'')+labelSuffix+'</small>';
-        badge.className='badge '+status;badge.textContent=t(labels[status]);
+        if(x.source_session){const source=document.createElement('small');source.textContent=' · '+x.source_session;left.append(source)}
+        const isDefault=reviewOrigin(x.index)==='default';
+        badge.className='badge '+(isDefault?'default-review':status);badge.textContent=isDefault?t('默认'):t(labels[status]);
         button.append(left,badge);button.onclick=()=>loadEpisode(x.index);list.appendChild(button);
       });
       requestAnimationFrame(()=>list.querySelector('.active')?.scrollIntoView({block:'nearest'}));updateCounts();
@@ -878,7 +908,7 @@
         $('#trimStart').max=current.duration;$('#trimEnd').max=current.duration;
         if($('#previewTrim').checked)time=bounds().start;
         message('#saved','');markButtons();renderMetrics();trimSummary();renderList();sync(true);
-        $('#details').textContent=t('details',{count:current.length,duration:current.duration.toFixed(2),fps:meta.fps});
+        $('#details').textContent=detailsText();
       }catch(e){message('#saved',e,true)}
     }
     function renderMetrics(){
@@ -908,7 +938,7 @@
         meta.reviews=await api('/api/review',{method:'POST',headers:{'Content-Type':'application/json'},
           body:JSON.stringify({episode:index,status:selectedStatus,labels:selectedLabels,note:$('#note').value,trim:{start_s:r.start,end_s:r.end}})});
         dirty=false;$('#trimStart').value=r.start;$('#trimEnd').value=r.end;
-        message('#saved','已保存标记与裁剪');trimSummary();renderLabelControls();renderList();
+        message('#saved','已保存标记与裁剪');$('#details').textContent=detailsText();trimSummary();renderLabelControls();renderList();
       }catch(e){message('#saved',e,true)}
       finally{saving=false;$('#save').disabled=false;$$('#note,#trimStart,#trimEnd,#markStart,#markEnd,#trimReset,#labelEditor select').forEach(el=>el.disabled=false)}
     };
@@ -1003,11 +1033,13 @@
       }catch(e){exporting=false;$('#export').disabled=false;message('#exportStatus',e,true)}
     };
     function niceStep(value){let power=Math.pow(10,Math.floor(Math.log10(Math.max(value,1e-9)))),fraction=value/power,nice=fraction<=1?1:fraction<=2?2:fraction<=2.5?2.5:fraction<=5?5:10;return nice*power}
-    function draw(canvas,j){let dpr=devicePixelRatio||1,w=canvas.clientWidth,h=canvas.clientHeight;if(!w||!h)return;canvas.width=w*dpr;canvas.height=h*dpr;let x=canvas.getContext('2d');x.scale(dpr,dpr);let a=current.state.map(v=>v[j]),b=current.action.map(v=>v[j]),all=a.concat(b),dataLo=Math.min(...all),dataHi=Math.max(...all),span=Math.max(dataHi-dataLo,1e-6),step=niceStep(span*1.12/4),lo=Math.floor((dataLo-span*.06)/step)*step,hi=lo+4*step;if(hi<dataHi+span*.06){hi=Math.ceil((dataHi+span*.06)/step)*step;lo=hi-4*step}let left=39,right=4,top=3,bottom=3,plotW=Math.max(1,w-left-right),plotH=Math.max(1,h-top-bottom),decimals=step>=.1?2:step>=.01?3:4;x.font='9px system-ui';x.textAlign='right';x.textBaseline='middle';for(let k=0;k<5;k++){let y=top+plotH*k/4,value=hi-k*step;x.strokeStyle='#24364b';x.lineWidth=1;x.beginPath();x.moveTo(left,y);x.lineTo(w-right,y);x.stroke();x.fillStyle='#899bb0';x.fillText(value.toFixed(decimals),left-4,y)}function line(v,c){x.strokeStyle=c;x.lineWidth=1.35;x.beginPath();v.forEach((n,k)=>{let px=left+k*plotW/Math.max(1,v.length-1),py=top+(hi-n)*plotH/(hi-lo);k?x.lineTo(px,py):x.moveTo(px,py)});x.stroke()}try{const r=bounds();x.fillStyle='rgba(85,214,157,.12)';x.fillRect(left+r.start/current.duration*plotW,top,(r.end-r.start)/current.duration*plotW,plotH)}catch(e){}line(a,'#55b8ff');line(b,'#ffc65c');let px=left+time/current.duration*plotW;x.strokeStyle='#ff7180';x.beginPath();x.moveTo(px,top);x.lineTo(px,h-bottom);x.stroke()}function drawAll(){if(!current)return;$$('canvas[data-dimension]').forEach(c=>draw(c,+c.dataset.dimension))}window.onresize=drawAll;
+    function expertBands(x,left,top,plotW,plotH){const mask=current.expert_mask||[];if(!mask.length)return;x.fillStyle='rgba(181,126,255,.13)';let start=null;for(let i=0;i<=mask.length;i++){if(i<mask.length&&mask[i]&&!Number.isInteger(start))start=i;if((i===mask.length||!mask[i])&&Number.isInteger(start)){x.fillRect(left+start*plotW/Math.max(1,mask.length-1),top,Math.max(1,(i-start)*plotW/Math.max(1,mask.length-1)),plotH);start=null}}}
+    function draw(canvas,j){let dpr=devicePixelRatio||1,w=canvas.clientWidth,h=canvas.clientHeight;if(!w||!h)return;canvas.width=w*dpr;canvas.height=h*dpr;let x=canvas.getContext('2d');x.scale(dpr,dpr);let a=current.state.map(v=>v[j]),b=current.action.map(v=>v[j]),all=a.concat(b),dataLo=Math.min(...all),dataHi=Math.max(...all),span=Math.max(dataHi-dataLo,1e-6),step=niceStep(span*1.12/4),lo=Math.floor((dataLo-span*.06)/step)*step,hi=lo+4*step;if(hi<dataHi+span*.06){hi=Math.ceil((dataHi+span*.06)/step)*step;lo=hi-4*step}let left=39,right=4,top=3,bottom=3,plotW=Math.max(1,w-left-right),plotH=Math.max(1,h-top-bottom),decimals=step>=.1?2:step>=.01?3:4;x.font='9px system-ui';x.textAlign='right';x.textBaseline='middle';expertBands(x,left,top,plotW,plotH);for(let k=0;k<5;k++){let y=top+plotH*k/4,value=hi-k*step;x.strokeStyle='#24364b';x.lineWidth=1;x.beginPath();x.moveTo(left,y);x.lineTo(w-right,y);x.stroke();x.fillStyle='#899bb0';x.fillText(value.toFixed(decimals),left-4,y)}function line(v,c){x.strokeStyle=c;x.lineWidth=1.35;x.beginPath();v.forEach((n,k)=>{let px=left+k*plotW/Math.max(1,v.length-1),py=top+(hi-n)*plotH/(hi-lo);k?x.lineTo(px,py):x.moveTo(px,py)});x.stroke()}try{const r=bounds();x.fillStyle='rgba(85,214,157,.12)';x.fillRect(left+r.start/current.duration*plotW,top,(r.end-r.start)/current.duration*plotW,plotH)}catch(e){}line(a,'#55b8ff');line(b,'#ffc65c');let px=left+time/current.duration*plotW;x.strokeStyle='#ff7180';x.beginPath();x.moveTo(px,top);x.lineTo(px,h-bottom);x.stroke()}function drawAll(){if(!current)return;$$('canvas[data-dimension]').forEach(c=>draw(c,+c.dataset.dimension))}window.onresize=drawAll;
 
     setLanguage(language,false);
     api('/api/meta').then(m=>{
       meta=m;$('#dataset').textContent=t('datasetSummary',{name:m.name,count:m.total_episodes,fps:m.fps});
+      renderLocalizedState();
       $('#exportName').value=m.suggested_export_name;
       renderLabelControls();renderList();if(m.total_episodes)loadEpisode(0);pollExport();
     }).catch(e=>message('#dataset',e,true));

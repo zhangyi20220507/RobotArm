@@ -23,6 +23,7 @@ import threading
 import time
 import traceback
 import tty
+from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -42,20 +43,135 @@ from ...record.schema import LEADER_FOLLOWER_SAMPLE_FIELDS
 
 # Encoder tolerance affects measured feedback only, never command limits.
 FEEDBACK_LIMIT_TOLERANCE_DEG = 5.0
+PREVIEW_RATE_HZ = 10.0
 
 
-def validate_joint_feedback(joints: list[float], config: dict[str, Any]) -> None:
-    if len(joints) != 6 or not all(math.isfinite(value) for value in joints):
-        raise RuntimeError("关节反馈格式异常，拒绝控制。")
+class PreviewCadence:
+    """Keep GUI refreshes independent of control and recording rates."""
+
+    def __init__(self, rate_hz: float = PREVIEW_RATE_HZ) -> None:
+        self.interval = 1.0 / rate_hz
+        self.next_due = 0.0
+
+    def due(self, now: float) -> bool:
+        if now + 1e-9 < self.next_due:
+            return False
+        self.next_due = now + self.interval
+        return True
+
+
+class ControlLoopTiming:
+    """Rolling control-loop timing statistics for diagnosing visible stutter."""
+
+    def __init__(self, period: float, window: int = 500) -> None:
+        self.period = period
+        self.previous_tick: float | None = None
+        self.intervals: deque[float] = deque(maxlen=window)
+        self.work_times: deque[float] = deque(maxlen=window)
+        self.stages: dict[str, deque[float]] = {
+            "move_js": deque(maxlen=window),
+            "record": deque(maxlen=window),
+        }
+
+    def begin(self, now: float) -> None:
+        if self.previous_tick is not None:
+            self.intervals.append(max(0.0, now - self.previous_tick))
+        self.previous_tick = now
+
+    def finish(self, work_time: float) -> None:
+        self.work_times.append(max(0.0, work_time))
+
+    def observe(self, stage: str, elapsed: float) -> None:
+        self.stages[stage].append(max(0.0, elapsed))
+
+    def summary(self) -> str:
+        if not self.intervals:
+            return "control timing unavailable"
+        mean_interval = sum(self.intervals) / len(self.intervals)
+        actual_hz = math.inf if mean_interval <= 0 else 1.0 / mean_interval
+        sorted_intervals = sorted(self.intervals)
+        p95_index = min(
+            len(sorted_intervals) - 1,
+            math.ceil(0.95 * len(sorted_intervals)) - 1,
+        )
+        overruns = sum(value > self.period * 1.5 for value in self.intervals)
+        max_work = max(self.work_times, default=0.0)
+        result = (
+            f"control target={1.0 / self.period:.1f}Hz, actual={actual_hz:.1f}Hz, "
+            f"interval p95/max={sorted_intervals[p95_index] * 1000.0:.1f}/"
+            f"{max(sorted_intervals) * 1000.0:.1f}ms, "
+            f"work max={max_work * 1000.0:.1f}ms, "
+            f"overruns(>1.5x)={overruns}/{len(self.intervals)}"
+        )
+        for name, samples in self.stages.items():
+            if samples:
+                ordered = sorted(samples)
+                p95 = ordered[math.ceil(0.95 * len(ordered)) - 1]
+                result += f", {name} p95/max={p95 * 1000:.1f}/{ordered[-1] * 1000:.1f}ms"
+        return result
+
+
+def joint_feedback_limit_violations(
+    joints: list[float], config: dict[str, Any],
+) -> list[tuple[int, float, float, float]]:
+    """Return finite feedback excursions beyond nominal limits plus tolerance."""
+    limits = config.get("joint_limits")
+    if limits is None:
+        # Some offline mocks provide command bounds directly.
+        return []
     tolerance = math.radians(FEEDBACK_LIMIT_TOLERANCE_DEG)
+    violations = []
     for index, value in enumerate(joints, 1):
-        low, high = config["joint_limits"][f"joint{index}"]
+        low, high = limits[f"joint{index}"]
         if not low - tolerance <= value <= high + tolerance:
-            raise RuntimeError(
-                f"J{index}反馈 {math.degrees(value):.2f}° 超出标称范围 "
-                f"[{math.degrees(low):.2f}, {math.degrees(high):.2f}]° "
-                f"及 {FEEDBACK_LIMIT_TOLERANCE_DEG:g}° 反馈容差；停止控制。"
-            )
+            violations.append((index, value, low, high))
+    return violations
+
+
+def validate_joint_feedback(
+    joints: list[float],
+    config: dict[str, Any],
+    *,
+    role: str = "",
+    enforce_limits: bool = True,
+) -> list[tuple[int, float, float, float]]:
+    role_prefix = f"{role} " if role else ""
+    if len(joints) != 6 or not all(math.isfinite(value) for value in joints):
+        raise RuntimeError(f"{role_prefix}关节反馈格式异常，拒绝控制。")
+    violations = joint_feedback_limit_violations(joints, config)
+    if violations and enforce_limits:
+        index, value, low, high = violations[0]
+        raise RuntimeError(
+            f"{role_prefix}J{index}反馈 {math.degrees(value):.2f}° 超出标称范围 "
+            f"[{math.degrees(low):.2f}, {math.degrees(high):.2f}]° "
+            f"及 {FEEDBACK_LIMIT_TOLERANCE_DEG:g}° 反馈容差；停止控制。"
+        )
+    return violations
+
+
+def leader_feedback_limit_state(
+    violations: list[tuple[int, float, float, float]],
+) -> tuple[tuple[int, str], ...]:
+    """Stable keys let the runtime announce an excursion without log spam."""
+    return tuple(
+        (index, "low" if value < low else "high")
+        for index, value, low, high in violations
+    )
+
+
+def print_leader_feedback_limit_warning(
+    violations: list[tuple[int, float, float, float]],
+) -> None:
+    details = "; ".join(
+        f"J{index}={math.degrees(value):.2f}° "
+        f"(标称 [{math.degrees(low):.2f}, {math.degrees(high):.2f}]°)"
+        for index, value, low, high in violations
+    )
+    print(
+        "\n[leader-follower] WARNING: leader 反馈超出标称范围及 "
+        f"{FEEDBACK_LIMIT_TOLERANCE_DEG:g}° 容差：{details}。"
+        "继续跟随，follower 目标仍会自动限幅；请将 leader 拖回标称范围。"
+    )
 
 
 def make_parser() -> argparse.ArgumentParser:
@@ -95,6 +211,10 @@ def make_parser() -> argparse.ArgumentParser:
         help="maximum native leader / MOVE_J follower / gripper homing time in seconds",
     )
     parser.add_argument(
+        "--home-speed", type=base.percentage, default=cfg["home-speed"],
+        help="MOVE_J speed percentage for h homing (1-30; native leader home is firmware-defined)",
+    )
+    parser.add_argument(
         "--home-gripper-speed-mm-s", type=base.positive_float,
         default=cfg["home-gripper-speed-mm-s"],
         help="maximum gripper closing speed during h in mm/s",
@@ -112,6 +232,16 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--speed", type=base.percentage, default=cfg["speed"],
         help="follower controller speed percentage",
+    )
+    parser.add_argument(
+        "--alignment-speed", type=base.percentage,
+        default=cfg["alignment-speed"],
+        help="MOVE_JS speed percentage for a alignment only (1-30)",
+    )
+    parser.add_argument(
+        "--alignment-rate-deg-s", type=base.positive_float,
+        default=cfg["alignment-rate-deg-s"],
+        help="maximum joint target ramp rate for a alignment (up to 30 deg/s)",
     )
     parser.add_argument(
         "--max-step-joint-deg", type=base.positive_float,
@@ -156,6 +286,10 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-gripper-following-error-mm", type=base.positive_float,
         default=cfg["max-gripper-following-error-mm"],
+        help=(
+            "maximum opening-direction command/feedback error; the same "
+            "closing-direction gap is treated as normal object contact"
+        ),
     )
     parser.add_argument(
         "--allow-enabled-start", action="store_true",
@@ -191,7 +325,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--joint-signs values must each be -1 or 1")
     numeric = [
         args.control_rate, args.stale_timeout, args.leader_init_timeout,
-        args.home_timeout, args.home_gripper_speed_mm_s,
+        args.home_timeout, args.home_speed, args.home_gripper_speed_mm_s,
+        args.alignment_speed, args.alignment_rate_deg_s,
         args.max_step_joint_deg,
         args.max_following_error_deg, args.startup_alignment_deg,
         args.joint_limit_margin_deg,
@@ -209,10 +344,16 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--leader-init-timeout must be between 3 and 120 seconds")
     if not 5.0 <= args.home_timeout <= 180.0:
         raise ValueError("--home-timeout must be between 5 and 180 seconds")
+    if not 1 <= args.home_speed <= 30:
+        raise ValueError("--home-speed must be between 1 and 30 percent")
     if args.home_gripper_speed_mm_s > 50:
         raise ValueError("--home-gripper-speed-mm-s must not exceed 50")
-    if args.max_step_joint_deg > 3.0:
-        raise ValueError("--max-step-joint-deg must not exceed 3 degrees")
+    if not 1 <= args.alignment_speed <= 30:
+        raise ValueError("--alignment-speed must be between 1 and 30 percent")
+    if not 0 < args.alignment_rate_deg_s <= 30:
+        raise ValueError("--alignment-rate-deg-s must be positive and not exceed 30")
+    if args.max_step_joint_deg > 5.0:
+        raise ValueError("--max-step-joint-deg must not exceed 5 degrees")
     if args.max_following_error_deg > 20.0:
         raise ValueError("--max-following-error-deg must not exceed 20 degrees")
     if args.startup_alignment_deg > 30.0:
@@ -377,6 +518,31 @@ def limit_joint_target(
     return candidate
 
 
+def classify_gripper_following_gap(
+    command_width: float,
+    feedback_width: float,
+    maximum_error: float,
+) -> str:
+    """Classify a width-command gap without mistaking grasp contact for failure.
+
+    Width increases when opening.  During a real grasp the closing command is
+    smaller than feedback because the object prevents further travel; that is
+    expected contact.  A command substantially wider than feedback means an
+    opening motion is not following and remains a control fault.
+    """
+    if not all(
+        math.isfinite(value)
+        for value in (command_width, feedback_width, maximum_error)
+    ) or maximum_error <= 0:
+        raise ValueError("gripper widths and maximum error must be finite")
+    signed_error = command_width - feedback_width
+    if signed_error > maximum_error:
+        return "opening_error"
+    if signed_error < -maximum_error:
+        return "closing_contact"
+    return "tracking"
+
+
 def feedback_age(message: Any, now_wall: float | None = None) -> float:
     timestamp = float(getattr(message, "timestamp", 0.0))
     now_wall = time.time() if now_wall is None else now_wall
@@ -408,7 +574,9 @@ def read_joint_message(
     if message is None:
         raise RuntimeError(f"{role} joint feedback is unavailable")
     joints = list(message.msg)
-    validate_joint_feedback(joints, config)
+    validate_joint_feedback(
+        joints, config, role=role, enforce_limits=role != "leader"
+    )
     return joints, joint_feedback_age(robot, message)
 
 
@@ -474,7 +642,9 @@ def update_leader_joint_message(
         result[offset] = float(getattr(message.msg, first))
         result[offset + 1] = float(getattr(message.msg, second))
         ages.append(age)
-    validate_joint_feedback(result, config)
+    validate_joint_feedback(
+        result, config, role="leader", enforce_limits=False
+    )
     return result, min(ages) if ages else math.inf
 
 
@@ -492,7 +662,9 @@ def read_complete_leader_joint_message(
     if message is None:
         raise RuntimeError("leader joint input is unavailable")
     joints = list(message.msg)
-    validate_joint_feedback(joints, config)
+    validate_joint_feedback(
+        joints, config, role="leader", enforce_limits=False
+    )
     ages = [
         feedback_age(getattr(parser, name))
         for name in ("leader_joint_12", "leader_joint_34", "leader_joint_56")
@@ -507,6 +679,7 @@ def wait_initial_leader_joints(
 ) -> tuple[list[float], str]:
     """Accept either normal 2A feedback or an already-active drag input stream."""
     deadline = time.monotonic() + timeout
+    announce_at = time.monotonic() + 1.0
     announced = False
     while time.monotonic() < deadline:
         try:
@@ -522,7 +695,7 @@ def wait_initial_leader_joints(
             pass
         else:
             return joints, "drag_input"
-        if not announced and time.monotonic() + 1.0 < deadline:
+        if not announced and time.monotonic() >= announce_at:
             print(
                 "[leader-follower] waiting for leader input; if it is already in "
                 "zero-gravity mode, gently move all joint pairs once."
@@ -566,11 +739,13 @@ def read_leader_gripper_command(
 
 
 def wait_leader_gripper_command(
-    gripper: Any, timeout: float
+    gripper: Any, timeout: float, *, not_before: float = 0.0,
 ) -> tuple[float, float]:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        value, age = read_leader_gripper_command(gripper, 0.0)
+        value, age = read_leader_gripper_command(
+            gripper, 0.0, not_before=not_before
+        )
         if math.isfinite(age):
             return value, age
         time.sleep(0.01)
@@ -687,6 +862,22 @@ def exit_leader_drag_mode(
     robot.set_motion_mode(robot.OPTIONS.MOTION_MODE.J)
     robot.move_j(hold)
     base.retry_boolean(robot.enable, timeout, "Enable leader after drag mode")
+    # Do not wait for gripper feedback yet: if the first role command was
+    # ignored while joints were disabled, the controller is still a Leader
+    # and may not publish ordinary gripper feedback. Finish the accepted role
+    # switch below before enabling/waiting for the gripper.
+    # Leader mode may disable the joints, and Piper ignores role changes while
+    # disabled.  Re-assert follower mode after enable so normal 2A feedback
+    # resumes before callers wait for a controlled-state sample.
+    robot.set_follower_mode()
+    time.sleep(0.1)
+    # Switching from Leader to Follower can itself clear motor enable on Piper.
+    # Send enable again *after* the accepted role command; the first enable is
+    # only there to make the role command effective on firmware that ignores
+    # configuration while disabled.
+    base.retry_boolean(
+        robot.enable, timeout, "Re-enable leader after follower-role switch"
+    )
     if gripper is not None:
         base.set_gripper_enabled(gripper, True, gripper_width, force, timeout)
     time.sleep(0.1)
@@ -700,8 +891,6 @@ def exit_leader_drag_mode(
         )
 
 
-ALIGNMENT_SPEED_PERCENT = 10
-ALIGNMENT_RATE_RAD_S = math.radians(5.0)
 ALIGNMENT_TOLERANCE_RAD = math.radians(2.0)
 ALIGNMENT_SETTLE_SECONDS = 0.5
 
@@ -816,7 +1005,9 @@ class MotionDiagnostics:
 
 def status_line(following: bool, aligning: bool, leader_drag: bool,
                 recording: bool, saved_episode: bool,
-                remaining_deg: float | None = None) -> str:
+                remaining_deg: float | None = None, *,
+                saved_episodes: int | None = None,
+                recorded_frames: int | None = None) -> str:
     if aligning:
         mode = "对齐中"
     elif following:
@@ -827,13 +1018,23 @@ def status_line(following: bool, aligning: bool, leader_drag: bool,
         mode = "双臂保持"
     record = "录制中" if recording else "已保存，可按 h 回零" if saved_episode else "未录制"
     progress = f" | 剩余 {remaining_deg:.2f}°" if aligning and remaining_deg is not None else ""
-    return f"[状态] {mode} | {record}{progress} | s 查看详细信息"
+    if saved_episodes is not None:
+        episode_progress = f" | 已保存 {saved_episodes} 条"
+        if recording:
+            episode_progress += f" | 正在采第 {saved_episodes + 1} 条"
+            if recorded_frames is not None:
+                episode_progress += f"（{recorded_frames} 帧）"
+        else:
+            episode_progress += f" | 下一条第 {saved_episodes + 1} 条"
+    else:
+        episode_progress = ""
+    return f"[状态] {mode} | {record}{episode_progress}{progress} | s 查看详细信息"
 
 
 def print_controls() -> None:
     print("\nLeader-follower controls:")
     print("  l: enable leader zero-force drag mode")
-    print("  a: slowly align follower to a snapshot of leader joints")
+    print("  a: smoothly align follower to a snapshot of leader joints")
     print("  f: start/pause following; cancel alignment while aligning")
     print("  s: show detailed arm modes, joints and following errors on demand")
     print("  r: start/save episode    d: discard episode")
@@ -1159,10 +1360,11 @@ def close_gripper_slowly(
 
 def home_one_arm(robot: Any, config: dict[str, Any], channel: str,
                  gripper: Any, force: float, gripper_speed_mm_s: float,
-                 timeout: float, stop_requested: Any) -> list[float]:
+                 timeout: float, stop_requested: Any, *,
+                 speed_percent: float = 20) -> list[float]:
     """MOVE_J to joint zero while rate-limiting the gripper to closed width."""
     options = SimpleNamespace(
-        channel=channel, speed_percent=10, timeout=timeout,
+        channel=channel, speed_percent=speed_percent, timeout=timeout,
         stale_timeout=0.5,
         joint_limit_tolerance_deg=arm_home.DEFAULT_JOINT_LIMIT_TOLERANCE_DEG,
         tolerance_deg=3.0,
@@ -1176,7 +1378,8 @@ def home_one_arm(robot: Any, config: dict[str, Any], channel: str,
 def home_leader_and_restore(
     leader: Any, leader_config: dict[str, Any], leader_channel: str,
     leader_initial_joints: list[float], timeout: float,
-    stop_requested: Any, on_command_start: Any = None,
+    stop_requested: Any, on_command_start: Any = None, *,
+    move_j_speed_percent: float = 20,
 ) -> list[float]:
     """Run native home, then use verified MOVE_J only if silent home was partial."""
     silent = False
@@ -1200,11 +1403,13 @@ def home_leader_and_restore(
     if error_deg > 3.0:
         print(
             f"[leader-follower] {leader_channel} native home stopped at "
-            f"{error_deg:.2f} deg; finishing with feedback-verified MOVE_J at 10%."
+            f"{error_deg:.2f} deg; finishing with feedback-verified MOVE_J "
+            f"at {move_j_speed_percent:g}%."
         )
         joints = home_one_arm(
             leader, leader_config, leader_channel, None,
             1.0, 1.0, timeout, stop_requested,
+            speed_percent=move_j_speed_percent,
         )
     return joints
 
@@ -1245,7 +1450,7 @@ def home_both_sequentially(
     force: float, gripper_speed_mm_s: float,
     timeout: float, stop_requested: Any,
     leader_initial_joints: list[float], leader_initial_gripper_width: float,
-    on_estop: Any = None,
+    on_estop: Any = None, *, home_speed_percent: float = 20,
 ) -> list[float]:
     """Home leader with firmware 0x191, hold it, then home the follower."""
     active_arm = leader
@@ -1258,6 +1463,7 @@ def home_both_sequentially(
         leader_joints = home_leader_and_restore(
             leader, leader_config, leader_channel, leader_initial_joints,
             timeout, stop_requested, on_command_start=mark_motion_started,
+            move_j_speed_percent=home_speed_percent,
         )
         # Leave zero-force mode immediately and hold the measured zero pose
         # before the follower starts moving.
@@ -1278,6 +1484,7 @@ def home_both_sequentially(
         home_one_arm(
             follower, follower_config, follower_channel,
             follower_gripper, force, gripper_speed_mm_s, timeout, stop_requested,
+            speed_percent=home_speed_percent,
         )
         return leader_joints
     except BaseException as error:
@@ -1323,7 +1530,7 @@ def home_both_in_parallel(
     force: float, gripper_speed_mm_s: float,
     timeout: float, stop_requested: Any,
     leader_initial_joints: list[float], leader_initial_gripper_width: float,
-    on_estop: Any = None,
+    on_estop: Any = None, *, home_speed_percent: float = 20,
 ) -> list[float]:
     """Home both CAN endpoints concurrently and fail-stop both as one operation."""
     if stop_requested():
@@ -1342,6 +1549,7 @@ def home_both_in_parallel(
         joints = home_leader_and_restore(
             leader, leader_config, leader_channel, leader_initial_joints,
             timeout, worker_stop_requested,
+            move_j_speed_percent=home_speed_percent,
         )
         exit_leader_drag_mode(
             leader, joints, leader_gripper,
@@ -1361,6 +1569,7 @@ def home_both_in_parallel(
             follower, follower_config, follower_channel,
             follower_gripper, force, gripper_speed_mm_s, timeout,
             worker_stop_requested,
+            speed_percent=home_speed_percent,
         )
 
     executor = concurrent.futures.ThreadPoolExecutor(
@@ -1500,7 +1709,10 @@ def main(argv: list[str] | None = None) -> int:
         print("Add --execute to connect hardware." if args.control_only else
               "Add --execute, --setup-id and --task to connect hardware.")
         print_controls()
-        print("h leader home uses firmware 0x191 at controller-defined speed; follower MOVE_J uses 10%.")
+        print(
+            "h leader home uses firmware 0x191 at controller-defined speed; "
+            f"follower MOVE_J uses {args.home_speed:g}%."
+        )
         return 0
     if not sys.stdin.isatty():
         raise RuntimeError("live leader-follower control requires an interactive terminal")
@@ -1524,6 +1736,8 @@ def main(argv: list[str] | None = None) -> int:
     leader_joints: list[float] | None = None
     leader_gripper_width = 0.0
     leader_gripper_input_not_before = 0.0
+    leader_limit_state: tuple[tuple[int, str], ...] = ()
+    gripper_contact_active = False
     motion_diagnostics = MotionDiagnostics()
     last_status_print = -math.inf
     last_sent_joints: list[float] | None = None
@@ -1544,8 +1758,23 @@ def main(argv: list[str] | None = None) -> int:
         follower_joints, _ = wait_joint_message(
             follower, follower_config, "follower", args.feedback_timeout
         )
-        validate_joint_feedback(leader_joints, leader_config)
-        validate_joint_feedback(follower_joints, follower_config)
+        validate_joint_feedback(
+            leader_joints,
+            leader_config,
+            role="leader",
+            enforce_limits=False,
+        )
+        leader_limit_violations = joint_feedback_limit_violations(
+            leader_joints, leader_config
+        )
+        leader_limit_state = leader_feedback_limit_state(
+            leader_limit_violations
+        )
+        if leader_limit_violations:
+            print_leader_feedback_limit_warning(leader_limit_violations)
+        validate_joint_feedback(
+            follower_joints, follower_config, role="follower"
+        )
         if leader_source == "feedback":
             ensure_startup_status(leader, args.feedback_timeout)
         ensure_startup_status(follower, args.feedback_timeout)
@@ -1579,7 +1808,7 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError(
                 "follower is already enabled; confirm and add --allow-enabled-start"
             )
-        follower.set_speed_percent(ALIGNMENT_SPEED_PERCENT)
+        follower.set_speed_percent(args.alignment_speed)
 
         if not args.control_only:
             recorder = RawEpisodeRecorder(
@@ -1615,6 +1844,9 @@ def main(argv: list[str] | None = None) -> int:
                 encoder_queue_size=args.encoder_queue_size,
                 extra_sample_fields=LEADER_FOLLOWER_SAMPLE_FIELDS,
             )
+            # Start ffmpeg while the follower is still holding.  Pressing r
+            # then only starts the episode clock and cannot stall MOVE_JS.
+            recorder.prepare_episode()
         bounds = command_joint_bounds(
             follower_config, margin_degrees=args.joint_limit_margin_deg
         )
@@ -1625,6 +1857,10 @@ def main(argv: list[str] | None = None) -> int:
             f"(margin {args.joint_limit_margin_deg:.2f} deg)"
         )
         max_step = math.radians(args.max_step_joint_deg)
+        alignment_rate = min(
+            math.radians(args.alignment_rate_deg_s),
+            max_step * args.control_rate,
+        )
         max_error = math.radians(args.max_following_error_deg)
         alignment_limit = min(
             math.radians(args.startup_alignment_deg),
@@ -1634,6 +1870,8 @@ def main(argv: list[str] | None = None) -> int:
         gripper_step = args.max_gripper_step_mm / 1000.0
         max_gripper_error = args.max_gripper_following_error_mm / 1000.0
         period = 1.0 / args.control_rate
+        loop_timing = ControlLoopTiming(period)
+        preview_cadence = PreviewCadence()
         next_gripper_command = 0.0
         if leader_drag:
             print(
@@ -1650,6 +1888,7 @@ def main(argv: list[str] | None = None) -> int:
         with KeyReader() as keys:
             while True:
                 tick = time.monotonic()
+                loop_timing.begin(tick)
                 ensure_receive_running(leader, "leader")
                 ensure_receive_running(follower, "follower")
                 key = keys.poll()
@@ -1692,13 +1931,13 @@ def main(argv: list[str] | None = None) -> int:
                             raise RuntimeError("cannot align with stale follower feedback")
                         command = clip_command_to_bounds(follower_joints, bounds)
                         command_gripper = follower_width
-                        follower.set_speed_percent(ALIGNMENT_SPEED_PERCENT)
-                        enter_follower_j(
+                        follower.set_speed_percent(args.alignment_speed)
+                        enter_follower_js(
                             follower, follower_gripper, command,
                             follower_width, args.gripper_force, follower_enabled,
                         )
                         follower_enabled = True
-                        follower_js_mode = False
+                        follower_js_mode = True
                         alignment_settled_since = None
                         alignment_target = target[:]
                         duration = max(abs(t - c) for t, c in zip(target, command))
@@ -1707,13 +1946,14 @@ def main(argv: list[str] | None = None) -> int:
                             abs(t - a) for t, a in zip(target, follower_joints)
                         )
                         alignment_deadline = (
-                            alignment_last_progress_at + duration / ALIGNMENT_RATE_RAD_S + 30.0
+                            alignment_last_progress_at + duration / alignment_rate + 30.0
                         )
                         print(
                             "\n[leader-follower] aligning to leader snapshot "
-                            "in MOVE_J at 10% speed, joint target rate <= 5 deg/s; "
+                            f"in streaming MOVE_JS at {args.alignment_speed}% speed, "
+                            f"joint target rate <= {math.degrees(alignment_rate):g} deg/s; "
                             f"initial gap={math.degrees(duration):.2f} deg, "
-                            f"target ramp >= {duration / ALIGNMENT_RATE_RAD_S:.1f} s; "
+                            f"target ramp >= {duration / alignment_rate:.1f} s; "
                             "f cancels. Wait for completion before following."
                         )
                 elif key == "f":
@@ -1727,13 +1967,14 @@ def main(argv: list[str] | None = None) -> int:
                         if age > args.stale_timeout:
                             raise RuntimeError("cannot hold with stale follower feedback")
                         command = clip_command_to_bounds(follower_joints, bounds)
-                        move_follower_j(follower, command)
+                        follower.move_js(command)
                         last_sent_joints = list(command)
                         print("\n[leader-follower] alignment cancelled; follower holds position.")
                     elif following:
                         following = False
                         if recorder is not None and recorder.active:
                             recorder.mark_incomplete()
+                            recorder.prepare_episode()
                         print("\n[leader-follower] following paused; follower holds position.")
                     else:
                         leader_joints, _ = update_leader_joint_message(
@@ -1872,14 +2113,14 @@ def main(argv: list[str] | None = None) -> int:
                             print(
                                 "\n[leader-follower] following paused; PARALLEL HOME: "
                                 "leader uses firmware 0x191 and follower uses MOVE_J "
-                                "at 10%; both grippers close slowly. Keep both return "
+                                f"at {args.home_speed:g}%; both grippers close slowly. Keep both return "
                                 "paths clear. Any failure E-stops both arms."
                             )
                         else:
                             print(
                                 "\n[leader-follower] following paused; homing leader "
                                 "with firmware 0x191 at controller-defined speed, "
-                                "then follower with MOVE_J at 10%; both grippers close slowly."
+                                f"then follower with MOVE_J at {args.home_speed:g}%; both grippers close slowly."
                             )
                         def home_stop_requested() -> bool:
                             return keys.poll() in ("x", "q")
@@ -1899,6 +2140,7 @@ def main(argv: list[str] | None = None) -> int:
                                 args.home_timeout, home_stop_requested,
                                 leader_joints, leader_gripper_width,
                                 on_estop=mark_homing_estop,
+                                home_speed_percent=args.home_speed,
                             )
                         except BaseException:
                             if emergency_stop:
@@ -1925,6 +2167,10 @@ def main(argv: list[str] | None = None) -> int:
                         command_gripper = follower_gripper_width
                         last_sent_joints = list(command)
                         episode_ready_for_home = False
+                        if recorder is not None:
+                            # Home has finished and the follower is holding, so
+                            # process startup cannot interrupt MOVE_JS streaming.
+                            recorder.prepare_episode()
                         if resume_following_after_home:
                             leader.set_leader_mode()
                             leader_drag = True
@@ -2003,6 +2249,23 @@ def main(argv: list[str] | None = None) -> int:
                     leader_width, leader_gripper_age = read_gripper_message(
                         leader_gripper, "leader"
                     )
+                leader_limit_violations = joint_feedback_limit_violations(
+                    leader_joints, leader_config
+                )
+                current_leader_limit_state = leader_feedback_limit_state(
+                    leader_limit_violations
+                )
+                if current_leader_limit_state != leader_limit_state:
+                    if leader_limit_violations:
+                        print_leader_feedback_limit_warning(
+                            leader_limit_violations
+                        )
+                    else:
+                        print(
+                            "\n[leader-follower] leader 反馈已回到标称范围及"
+                            "容差内。"
+                        )
+                    leader_limit_state = current_leader_limit_state
                 follower_joints, follower_joint_age = read_joint_message(
                     follower, follower_config, "follower"
                 )
@@ -2055,7 +2318,7 @@ def main(argv: list[str] | None = None) -> int:
                     assert command is not None
                     motion_target = bounded_requested if alignment_target is None else alignment_target
                     motion_step = max_step if alignment_target is None else min(
-                        max_step, ALIGNMENT_RATE_RAD_S * period
+                        max_step, alignment_rate * period
                     )
                     if alignment_target is not None and tick > alignment_deadline:
                         raise RuntimeError("slow alignment timed out; follower will hold")
@@ -2063,15 +2326,31 @@ def main(argv: list[str] | None = None) -> int:
                         motion_target, command, follower_joints, motion_step, max_error
                     )
                     validate_target_bounds(command, bounds)
-                    if alignment_target is not None:
-                        move_follower_j(follower, command)
-                    else:
-                        follower.move_js(command)
+                    send_started = time.monotonic()
+                    follower.move_js(command)
+                    loop_timing.observe("move_js", time.monotonic() - send_started)
                     last_sent_joints = list(command)
-                    if abs(command_gripper - follower_width) > max_gripper_error:
+                    gripper_gap_state = classify_gripper_following_gap(
+                        command_gripper, follower_width, max_gripper_error
+                    )
+                    if gripper_gap_state == "opening_error":
                         raise RuntimeError(
-                            "follower gripper exceeded the maximum following error"
+                            "follower gripper did not follow an opening command: "
+                            f"command={command_gripper * 1000.0:.1f}mm, "
+                            f"feedback={follower_width * 1000.0:.1f}mm, "
+                            f"gap={(command_gripper - follower_width) * 1000.0:.1f}mm "
+                            f"> {args.max_gripper_following_error_mm:.1f}mm"
                         )
+                    contact_now = gripper_gap_state == "closing_contact"
+                    if contact_now != gripper_contact_active:
+                        gripper_contact_active = contact_now
+                        if contact_now:
+                            print(
+                                "\n[夹爪] 检测到闭合受阻，按抓到物体处理并继续跟随/录制；"
+                                "action仍保留主臂闭合目标。"
+                            )
+                        else:
+                            print("\n[夹爪] 闭合接触差已解除，恢复普通宽度跟随。")
                     if following and tick >= next_gripper_command:
                         desired_gripper = min(max(leader_width, 0.0), gripper_max)
                         gripper_delta = max(
@@ -2128,34 +2407,49 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     command = clip_command_to_bounds(follower_joints, bounds)
                     command_gripper = follower_width
+                    gripper_contact_active = False
 
                 following_error = [
                     target - actual for target, actual in zip(command, follower_joints)
                 ] + [command_gripper - follower_width]
                 if recorder is not None:
-                    recorder.capture(
-                        time.monotonic(),
-                        [*follower_joints, follower_width],
-                        [*command, command_gripper],
-                        list(follower.fk(follower_joints)),
-                        [
-                            *(
-                                target - actual
-                                for target, actual in zip(requested, follower_joints)
-                            )
-                        ],
-                        {
-                            "leader_state": [*leader_joints, leader_width],
-                            "follower_state": [*follower_joints, follower_width],
-                            "following_error": following_error,
-                            "leader_feedback_age": finite_combined_age(
-                                leader_joint_age, leader_gripper_age
-                            ),
-                            "follower_feedback_age": finite_combined_age(
-                                follower_joint_age, follower_gripper_age
-                            ),
-                        },
+                    record_started = time.monotonic()
+                    capture_now = time.monotonic()
+                    capture_due = recorder.sample_due(capture_now)
+                    preview_due = (
+                        not args.no_preview and preview_cadence.due(capture_now)
                     )
+                    if capture_due or preview_due:
+                        tcp_pose = (
+                            list(follower.fk(follower_joints))
+                            if capture_due
+                            else []
+                        )
+                        recorder.capture(
+                            capture_now,
+                            [*follower_joints, follower_width],
+                            [*command, command_gripper],
+                            tcp_pose,
+                            [
+                                *(
+                                    target - actual
+                                    for target, actual in zip(requested, follower_joints)
+                                )
+                            ],
+                            {
+                                "leader_state": [*leader_joints, leader_width],
+                                "follower_state": [*follower_joints, follower_width],
+                                "following_error": following_error,
+                                "leader_feedback_age": finite_combined_age(
+                                    leader_joint_age, leader_gripper_age
+                                ),
+                                "follower_feedback_age": finite_combined_age(
+                                    follower_joint_age, follower_gripper_age
+                                ),
+                            },
+                            show_preview=preview_due,
+                        )
+                    loop_timing.observe("record", time.monotonic() - record_started)
                 if key == "s":
                     motion_diagnostics.emit(
                         tick, args, leader, follower, leader_joints, requested,
@@ -2164,15 +2458,29 @@ def main(argv: list[str] | None = None) -> int:
                         following, alignment_target is not None, force=True,
                         bounded_target=bounded_requested,
                     )
-                if status_dirty or key in ("l", "a", "f", "r", "d", "h", "s") or tick - last_status_print >= 1.0:
+                    print(f"[timing] {loop_timing.summary()}")
+                if status_dirty or key in ("l", "a", "f", "r", "d", "h", "s") or tick - last_status_print >= 0.5:
+                    saved_episodes = None
+                    recorded_frames = None
+                    if recorder is not None:
+                        value = getattr(recorder, "saved_episodes", None)
+                        if isinstance(value, int):
+                            saved_episodes = value
+                        value = getattr(recorder, "frames", None)
+                        if isinstance(value, int):
+                            recorded_frames = value
                     text = status_line(
                         following, alignment_target is not None, leader_drag,
                         recorder is not None and recorder.active,
                         episode_ready_for_home, alignment_remaining_deg,
+                        saved_episodes=saved_episodes,
+                        recorded_frames=recorded_frames,
                     )
-                    print(f"\r{text:<90}", end="", flush=True)
+                    print(f"\r{text:<150}", end="", flush=True)
                     last_status_print = tick
-                remaining = period - (time.monotonic() - tick)
+                work_elapsed = time.monotonic() - tick
+                loop_timing.finish(work_elapsed)
+                remaining = period - work_elapsed
                 if remaining > 0:
                     time.sleep(remaining)
         return 0

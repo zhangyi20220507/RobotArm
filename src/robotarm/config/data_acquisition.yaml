@@ -67,11 +67,14 @@ collect-leader-follower:
   leader-init-timeout: 30.0 # 已处于零重力模式时，等待 155/156/157 的时间
   stale-timeout: 0.2       # 从臂反馈超时立即停止；零重力主臂无新事件时保持目标
   home-timeout: 60.0      # h 回零时每台机械臂和夹爪各自的超时（秒）
+  home-speed: 20           # h 回零的 MOVE_J 速度百分比（主臂原生 0x191 速度由固件决定）
   home-gripper-speed-mm-s: 10.0 # h 回零夹爪最大闭合速度
   # 软件跟随安全限制
-  control-rate: 50.0
+  control-rate: 50.0        # Piper + SocketCAN 稳定流式控制频率
   speed: 100                # 从臂控制器速度百分比
-  max-step-joint-deg: 3 # 单周期单关节最大命令变化
+  alignment-speed: 30        # a 对齐的 MOVE_JS 速度百分比，上限 30
+  alignment-rate-deg-s: 30.0 # a 对齐的关节目标推进上限（°/s），上限 30
+  max-step-joint-deg: 4.0    # f 单周期最大命令变化；50 Hz 时上限约 200°/s
   max-following-error-deg: 10.0
   startup-alignment-deg: 15.0
   joint-limit-margin-deg: 0.5 # J5 标称 ±70°，保留 0.5° 后可用 ±69.5°
@@ -79,8 +82,9 @@ collect-leader-follower:
   joint-offsets-deg: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
   # 夹爪
   gripper-max-mm: 100.0
-  gripper-force: 1.0
+  gripper-force: 2.0             # 主从抓取默认力；易变形物体可用CLI降回1.0 N
   max-gripper-step-mm: 10.0      # 每个 20 Hz 夹爪命令的最大变化
+  # 张开方向超过此误差才停机；闭合方向同等误差视为物体阻挡/正常抓持接触
   max-gripper-following-error-mm: 20.0
   # 录制
   global-camera-serial: "347522071736"

@@ -14,7 +14,7 @@ class CameraPreviewTests(unittest.TestCase):
         cameras.viewer_ok = True
         cameras.cv2 = Mock(FONT_HERSHEY_SIMPLEX=0, WND_PROP_FULLSCREEN=0,
                            WINDOW_FULLSCREEN=1, WINDOW_NORMAL=0)
-        cameras.cv2.waitKeyEx.side_effect = [ord('f'), 27, ord('x')]
+        cameras.cv2.pollKey.side_effect = [ord('f'), 27, ord('x')]
         cameras.np, cameras.window = np, 'preview'
         cameras.always_on_top = False
         cameras._fullscreen, cameras._preview_keys = False, []

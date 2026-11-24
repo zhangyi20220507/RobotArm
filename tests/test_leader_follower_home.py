@@ -590,6 +590,10 @@ class LeaderFollowerHomeTests(unittest.TestCase):
         recorder.save_episode.assert_called_once()
         replacements['home_both_sequentially'].assert_called_once()
         self.assertEqual(
+            replacements['home_both_sequentially'].call_args.kwargs['home_speed_percent'],
+            20,
+        )
+        self.assertEqual(
             replacements['home_both_sequentially'].call_args.args[2], 'can_follower1'
         )
         self.assertEqual(
@@ -671,7 +675,7 @@ class LeaderFollowerHomeTests(unittest.TestCase):
         with patch.object(lf.arm_home,'run_home') as run:
             lf.home_one_arm(robot,config,'can0',gripper,1.0,12.0,75,lambda:False)
         self.assertIs(run.call_args.args[0],robot)
-        self.assertEqual(run.call_args.args[2].speed_percent,10)
+        self.assertEqual(run.call_args.args[2].speed_percent,20)
         self.assertEqual(run.call_args.args[2].timeout,75)
         self.assertEqual(run.call_args.args[2].tolerance_deg,3)
         self.assertEqual(run.call_args.args[2].joint_limit_tolerance_deg,5)
@@ -710,6 +714,7 @@ class LeaderFollowerHomeTests(unittest.TestCase):
     def test_options_are_bounded(self):
         args=lf.make_parser().parse_args([])
         self.assertEqual(args.home_timeout,60)
+        self.assertEqual(args.home_speed,20)
         self.assertEqual(args.home_gripper_speed_mm_s,10)
         self.assertFalse(args.parallel_home)
         self.assertTrue(lf.make_parser().parse_args(['--parallel-home']).parallel_home)
@@ -718,4 +723,7 @@ class LeaderFollowerHomeTests(unittest.TestCase):
             lf.validate_args(args)
         args.home_timeout=181
         with self.assertRaisesRegex(ValueError,'home-timeout'):
+            lf.validate_args(args)
+        args=lf.make_parser().parse_args(['--home-speed','31'])
+        with self.assertRaisesRegex(ValueError,'home-speed'):
             lf.validate_args(args)

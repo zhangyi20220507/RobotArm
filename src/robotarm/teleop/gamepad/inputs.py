@@ -28,6 +28,28 @@ def joint_inputs(pad: Any, deadzone: float) -> list[float]:
     ]
 
 
+def dominant_joint_input(inputs: list[float]) -> tuple[list[float], int | None]:
+    """Keep only the strongest joint-jog input.
+
+    Joint jog is intentionally single-axis.  Real gamepads commonly report a
+    small orthogonal component when a stick is pushed along one axis, and an
+    ageing second stick may drift just beyond the deadzone.  Passing all six
+    values through made those components move unselected joints.
+
+    Returning the selected index also lets the runtime re-anchor every joint
+    when the operator changes which joint is being controlled.
+    """
+    if len(inputs) != 6:
+        raise ValueError("joint inputs must contain J1..J6")
+    active = [(index, value) for index, value in enumerate(inputs) if value]
+    if not active:
+        return [0.0] * 6, None
+    selected, value = max(active, key=lambda item: abs(item[1]))
+    result = [0.0] * 6
+    result[selected] = value
+    return result, selected
+
+
 def cartesian_inputs(pad: Any, deadzone: float) -> list[float]:
     """Return XYZ/RPY jog input for end-effector (DLS) mode.
 

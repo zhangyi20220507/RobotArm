@@ -6,10 +6,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 from robotarm.modeling.dataset_extend import (
     _base_session,
     _extended_reviews,
     _source_sessions,
+    _validate_compatibility,
 )
 from robotarm.record.convert import write_json
 
@@ -59,6 +62,47 @@ class DatasetExtendTests(unittest.TestCase):
             result["episodes"]["3"]["labels"], {"cup_orientation": "sideways"}
         )
         self.assertEqual(result["derived_from"]["new_episode_range"], [2, 4])
+
+    def test_extension_counts_expert_segments_not_full_hg_trials(self):
+        raw = self.root / "hg_raw"
+        session = {
+            "format_version": "piper_raw_v1",
+            "record_fps": 20,
+            "state_names": [f"joint_{index}" for index in range(6)] + ["gripper"],
+            "state_units": ["rad"] * 6 + ["m"],
+            "action_semantics": "commanded MOVE_JS joint targets and gripper target",
+            "robot": {"training_export": "expert_mask_only"},
+            "cameras": {
+                "global": {
+                    "serial": "camera",
+                    "stream": {"width": 32, "height": 24},
+                }
+            },
+        }
+        write_json(raw / "session.json", session)
+        episode = raw / "episodes" / "episode_000000"
+        write_json(
+            episode / "episode.json",
+            {
+                "episode_index": 0,
+                "frames": 6,
+                "status": "complete",
+                "task": "task",
+                "camera_roles": ["global"],
+            },
+        )
+        np.savez_compressed(
+            episode / "frames.npz",
+            expert_mask=np.asarray([0, 1, 1, 0, 1, 1], dtype=np.int8),
+        )
+        conversion = {"camera_roles": ["global"], "source_sessions": []}
+
+        episodes, frames, details = _validate_compatibility(
+            session, conversion, [raw]
+        )
+
+        self.assertEqual((episodes, frames), (2, 4))
+        self.assertEqual(details[0][2], 2)
 
 
 if __name__ == "__main__":

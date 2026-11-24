@@ -56,8 +56,8 @@ piper-xr:
 # expressed in each arm's own base frame and must be tightened for the actual
 # physical installation before live operation.
 piper-bimanual-xr:
-  left-channel: can_leader1
-  right-channel: can_follower1
+  left-channel: can_follower1 # Physical left arm in the current PICO installation.
+  right-channel: can_leader1 # CAN role names do not identify physical left/right.
   firmware: auto
   model: piper
   rate: 50.0
@@ -72,7 +72,7 @@ piper-bimanual-xr:
   engage-settle-seconds: 0.25 # Ignore controller motion caused by squeezing Grip.
   engage-deadband-m: 0.002 # Require deliberate hand motion before the first robot command.
   command-modifier-threshold: 0.8
-  gripper-max-mm: 70.0
+  gripper-max-mm: 100.0
   gripper-speed-mm-s: 20.0
   gripper-force: 1.0
   gripper-force-hold-threshold: 0.8

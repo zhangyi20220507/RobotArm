@@ -24,8 +24,26 @@ def exported_reviews(dataset_root: Path) -> dict | None:
     root = dataset_root.expanduser().resolve()
     if (root / "TRIM_INCOMPLETE.txt").exists():
         raise ValueError("裁剪导出尚未完成或已失败，不能使用此数据集训练")
+    if (root / "CONVERSION_INCOMPLETE.txt").exists():
+        raise ValueError("原始数据转换尚未完成或已失败，不能使用此数据集训练")
     path = root / "meta/trim_provenance.json"
     if not path.is_file():
+        conversion = root / "meta/piper_conversion.json"
+        if conversion.is_file():
+            manifest = json.loads(conversion.read_text(encoding="utf-8"))
+            if any(manifest.get("raw_reviews_snapshot", {}).values()):
+                info = json.loads((root / "meta/info.json").read_text())
+                items = manifest.get("episodes", [])
+                if ([item.get("lerobot_episode_index") for item in items]
+                        != list(range(info["total_episodes"]))
+                        or sum(item["frames"] for item in items) != info["total_frames"]):
+                    raise ValueError("invalid raw conversion review mapping")
+                return {"dataset_root": str(root), "episodes": {
+                    str(item["lerobot_episode_index"]): {
+                        key: copy.deepcopy(value)
+                        for key, value in item.get("review", {}).items() if key != "trim"
+                    } for item in items if item.get("review")
+                }, "derived_from": {"path": str(conversion), "trim_already_applied": True}}
         return None
     manifest = json.loads(path.read_text(encoding="utf-8"))
     info = json.loads((root / "meta/info.json").read_text(encoding="utf-8"))

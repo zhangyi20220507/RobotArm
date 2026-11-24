@@ -36,6 +36,11 @@ python_bin="${env_prefix}/bin/python"
 "${python_bin}" -m pip install --no-deps numpy==2.2.6
 "${python_bin}" -m pip install --no-build-isolation "${repo_root}/vendor/xrobotoolkit_sdk"
 
+# LeRobot 0.6.1 hard-codes ACT's ResNet layer4 output. Apply the repository-managed,
+# version-checked extension so local and cloud environments can also train with layer3.
+"${repo_root}/scripts/apply_lerobot_act_feature_layer_patch.sh" \
+  --python "${python_bin}" --apply
+
 mkdir -p "${env_prefix}/etc/conda/activate.d" "${env_prefix}/etc/conda/deactivate.d"
 install -m 0644 "${repo_root}/config/conda/activate.d/robotarm.sh" \
   "${env_prefix}/etc/conda/activate.d/robotarm.sh"

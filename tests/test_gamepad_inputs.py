@@ -8,7 +8,11 @@ import unittest
 from types import SimpleNamespace
 
 from robotarm.teleop.gamepad.device import DPAD_LEFT, DPAD_RIGHT, DPAD_UP, DPAD_DOWN
-from robotarm.teleop.gamepad.inputs import cartesian_inputs, joint_inputs
+from robotarm.teleop.gamepad.inputs import (
+    cartesian_inputs,
+    dominant_joint_input,
+    joint_inputs,
+)
 
 FULL = 32767
 DEADZONE = 0.18
@@ -86,6 +90,24 @@ class JointMappingTests(unittest.TestCase):
         result = joint_inputs(pad(left_x=FULL, left_y=FULL, right_x=FULL,
                                   right_y=FULL, buttons=DPAD_RIGHT | DPAD_UP), DEADZONE)
         self.assertEqual([round(v, 3) for v in result], [-1.0, -1.0, -1.0, 1.0, 1.0, 1.0])
+
+    def test_dominant_joint_filters_cross_axis_and_other_stick_drift(self):
+        raw = joint_inputs(
+            pad(left_x=FULL, left_y=FULL // 2, right_x=FULL // 3), DEADZONE
+        )
+        result, selected = dominant_joint_input(raw)
+        self.assertEqual(selected, 0)
+        self.assertEqual(result[0], -1.0)
+        self.assertEqual(result[1:], [0.0] * 5)
+
+    def test_dominant_joint_returns_neutral_selection(self):
+        result, selected = dominant_joint_input([0.0] * 6)
+        self.assertEqual(result, [0.0] * 6)
+        self.assertIsNone(selected)
+
+    def test_dominant_joint_rejects_wrong_shape(self):
+        with self.assertRaisesRegex(ValueError, "J1..J6"):
+            dominant_joint_input([0.0] * 5)
 
 
 if __name__ == "__main__":

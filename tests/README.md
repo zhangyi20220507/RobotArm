@@ -18,12 +18,16 @@ python -m unittest discover -s tests -p 'test_training_report.py' -v
 
 | 组 | 主要覆盖 |
 |---|---|
-| `test_leader_follower*`、`test_home*`、`test_piper_home`、`test_restore_piper_role` | 主从启动、对齐、回零、角色、异常清理 |
+| `test_leader_follower*`、`test_home*`、`test_piper_home`、`test_restore_piper_role`、`test_reset_both_arms` | 主从启动、对齐、回零、角色、双臂软件复位、异常清理 |
 | `test_gamepad*` | DLS/Placo接口、输入、目标、步长与拒绝行为 |
 | `test_pico*` | XR坐标、单/双臂、安全恢复及控制模式 |
 | `test_camera_preview`、`test_recorder*`、`test_convert*` | 相机窗口、预览节流、录制与转换 |
-| `test_merge_raw` | 原始session复制、连续编号、来源追踪、兼容检查、重复/覆盖保护；使用微型NPZ/视频夹具 |
+| `test_merge_raw` | 原始session复制、连续编号、来源追踪、兼容检查、重复/覆盖保护，以及滚动MASTER事务追加与失败回滚；使用微型NPZ/视频夹具 |
+| `test_raw_dataset_browser` | raw 直接预览与非破坏性标注、内容身份绑定、再次合并标注迁移、帧/视频同步裁剪、一次真实 LeRobot 导出和审核继承 |
 | `test_online_policy*`、`test_pi0_async`、`test_approve*`、`test_validate_runtime` | 预测边界、端点修正、异步过期/断供、审批 |
+| `test_keyboard_events`、`test_process_terminal` | 按键解码、伪终端回显恢复、Ctrl+C后外层等待子进程清理、子进程退出时再次修改TTY及已损坏终端的恢复；不连接机械臂 |
+| `test_hil_act_baseline` | 原ACT时间集成与HIL参考输出一致性、限幅等待与慢帧撤销、默认基线／显式探索、v1/v2缓存隔离和逐episode重置 |
+| `test_hil_merged_recovery` | RAW合并后沿用原trial身份，已提交试次不重复入replay；冲突结果仍拒绝 |
 | `test_act_latent_report`、`test_pi0_*report`、`test_training_report`、`test_report_entrypoints` | padding、单位、配对、续训合并、报告兼容入口 |
 | `test_pi0_lora`、`test_pi0_cloud_bundle`、`test_pi05*` | LoRA计划/重载约束、无凭据打包、基础模型适配 |
 | `test_quality_filter`、`test_train_monitor`、`test_trajectory_studio` | 划分与审查、裁剪导出审核继承/新编号映射/未完成导出拒绝、新审核优先；监控不修改run、Open-loop适配 |

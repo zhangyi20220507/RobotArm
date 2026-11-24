@@ -13,6 +13,7 @@ USB 2.x 口上彩色+深度双流带宽不足（帧无法到达），此时自�
 from __future__ import annotations
 
 import argparse
+import re
 
 
 def parse_args() -> argparse.Namespace:
@@ -77,8 +78,7 @@ def main() -> int:
             )
             if not with_depth:
                 print(
-                    f"{serial}: {name} (USB {usb}) — color only; "
-                    "color+depth needs USB 3.0 (override with --depth)"
+                    f"{serial}: {name} (USB {usb}) — color only"
                 )
             else:
                 print(f"{serial}: {name} (USB {usb}) — color+depth")
@@ -99,14 +99,26 @@ def main() -> int:
             for serial, pipeline in pipelines.items():
                 try:
                     frameset = pipeline.wait_for_frames(timeout_ms=timeout_ms)
-                except RuntimeError:
+                except RuntimeError as exc:
+                    # A disconnected/stopped pipeline can fail immediately.
+                    # Retrying that as a timeout creates an unbounded busy loop
+                    # and hides the original device error.
+                    if not re.fullmatch(r"Frame didn't arrive within \d+\.?", str(exc)):
+                        raise RuntimeError(
+                            f"Camera {serial} stream failed: {exc}"
+                        ) from exc
                     failures[serial] += 1
-                    if failures[serial] > 5:
-                        print(
-                            f"{serial}: no frames after {failures[serial]} "
-                            "timeouts — check USB bandwidth/port"
-                        )
+                    if failures[serial] >= 5:
+                        raise RuntimeError(
+                            f"Camera {serial}: no frames after 5 consecutive "
+                            f"{timeout_ms} ms waits: {exc}"
+                        ) from exc
+                    print(
+                        f"{serial}: frame wait timed out "
+                        f"({failures[serial]}/5): {exc}"
+                    )
                     continue
+                failures[serial] = 0
                 color = frameset.get_color_frame()
                 if not color:
                     continue
@@ -136,6 +148,8 @@ def main() -> int:
                 cv2.imshow(window, images)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
+    except KeyboardInterrupt:
+        return 130
     finally:
         for pipeline in pipelines.values():
             try:

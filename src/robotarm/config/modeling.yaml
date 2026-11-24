@@ -53,7 +53,7 @@ online-policy:
   gripper-force: 1.5
   # 键盘
   keyboard-hold-seconds: 0.3
-  home-speed-percent: 5
+  home-speed-percent: 20  # MOVE_J 回零速度，与主从臂数采默认值一致
   home-timeout: 60.0
   # 按策略类型覆盖（checkpoint 加载后按 policy_type 叠加；键名与 CLI flag
   # 一致、下划线形式；显式 CLI 参数优先级最高）。chunk_size 等模型结构参数

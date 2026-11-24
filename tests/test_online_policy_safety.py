@@ -10,20 +10,24 @@ from itertools import count
 from argparse import Namespace
 from collections import deque
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import ANY, Mock, patch
 
 from robotarm.modeling.online_policy import (
     act_action_envelope_failures,
     act_action_within_envelope,
+    act_backpressure_required,
     act_joint_gap_failure,
     act_subgoal_errors,
     act_tracking_action,
     bounded_act_subgoal,
     clamp_step,
+    engage_expert_with_follower_hold,
     action_queue_depth,
     action_was_clamped,
     approval_required,
+    isolate_leader_home_failure,
     home_arm_to_zero,
     inference_timing_messages,
     KeyboardIntentTracker,
@@ -50,6 +54,27 @@ class OnlinePolicySafetyTests(unittest.TestCase):
     def setUp(self):
         self.bounds = [(-math.pi, math.pi)] * 6
         self.state = [0.0] * 7
+
+    def test_takeover_holds_follower_before_blocking_leader_switch(self):
+        events = []
+        robot = Mock()
+        gripper = Mock()
+        expert = Mock()
+        state = [0.1] * 6 + [0.04]
+        robot.move_js.side_effect = lambda q: events.append(("hold_joints", q))
+        gripper.move_gripper_m.side_effect = lambda width, force: events.append(("hold_gripper", width))
+        expert.engage.side_effect = lambda q, bounds: events.append(("leader_role_switch", q)) or "sample"
+        result = engage_expert_with_follower_hold(robot, gripper, expert, state, self.bounds, 1.0, 0.1)
+        self.assertEqual(result, "sample")
+        self.assertEqual(events, [("hold_joints", state[:6]), ("hold_gripper", 0.04),
+                                  ("leader_role_switch", state)])
+
+    def test_takeover_rejects_invalid_state_before_any_motion_command(self):
+        robot, gripper, expert = Mock(), Mock(), Mock()
+        with self.assertRaisesRegex(ValueError, "finite 7D"):
+            engage_expert_with_follower_hold(robot, gripper, expert, [math.nan] * 7, self.bounds, 1, 0.1)
+        robot.move_js.assert_not_called()
+        expert.engage.assert_not_called()
 
     def test_inference_timing_uses_soft_warning_before_hard_stop(self):
         warnings, failures = inference_timing_messages(229.3, 60.0, 500.0)
@@ -117,6 +142,18 @@ class OnlinePolicySafetyTests(unittest.TestCase):
         self.assertTrue(keys.intervention_toggle([("i", 1.0)]))
         self.assertFalse(keys.intervention_toggle([("i", 1.1)]))
         self.assertTrue(keys.intervention_toggle([("i", 2.0)]))
+
+    def test_i_allows_quick_return_without_waiting_for_x_debounce(self):
+        keys = KeyboardIntentTracker(0.3)
+        self.assertTrue(keys.intervention_toggle([("i", 1.0)]))
+        self.assertFalse(keys.intervention_toggle([("i", 1.1)]))
+        self.assertTrue(keys.intervention_toggle([("i", 1.5)]))
+
+    def test_d_discards_hg_trial_with_key_repeat_debounce(self):
+        keys = KeyboardIntentTracker(0.3)
+        self.assertTrue(keys.trial_discard([("d", 1.0)]))
+        self.assertFalse(keys.trial_discard([("d", 1.1)]))
+        self.assertTrue(keys.trial_discard([("d", 2.0)]))
 
     def test_r_reset_releases_before_home_and_closes_before_rearming(self):
         events = []
@@ -219,9 +256,147 @@ class OnlinePolicySafetyTests(unittest.TestCase):
                 Robot(), config, Gripper(), 0.02, 1.0, 1.0, 5, 5.0,
             )
         self.assertEqual(result, [0.0] * 6)
-        self.assertLess(events.index(("enable",)), events.index(("move_j", (0.0,) * 6)))
+        zero_target_index = events.index(("move_j", (0.0,) * 6))
+        self.assertLess(events.index(("enable",)), zero_target_index)
+        self.assertEqual(events[zero_target_index - 1], ("mode", 1))
         self.assertIn(("gripper", 0.02), events)
-        self.assertLess(events.index(("move_j", (0.0,) * 6)), events.index(("gripper", 0.0)))
+        self.assertLess(zero_target_index, events.index(("gripper", 0.0)))
+
+    def test_home_starts_and_finishes_companion_arm_in_same_cycle(self):
+        class Robot:
+            OPTIONS = SimpleNamespace(MOTION_MODE=SimpleNamespace(J=1))
+
+            def move_j(self, joints):
+                pass
+
+            def set_motion_mode(self, mode):
+                pass
+
+            def set_speed_percent(self, speed):
+                pass
+
+            def get_arm_status(self):
+                return SimpleNamespace(msg=SimpleNamespace(
+                    arm_status=0, motion_status=0,
+                    err_status=SimpleNamespace(),
+                ))
+
+        gripper = Mock()
+        companion = Mock()
+        companion.homing_active = False
+        companion.homing_ready.return_value = True
+        def progress(*args):
+            self.assertTrue(companion.homing_active)
+        config = {"joint_limits": {
+            f"joint{index}": (-math.pi, math.pi)
+            for index in range(1, 7)
+        }}
+        clock = count(step=0.2)
+        with patch(
+            "robotarm.modeling.online_policy.read_valid_joints",
+            return_value=[0.0] * 6,
+        ), patch(
+            "robotarm.modeling.online_policy.base.enable_arm_and_gripper",
+        ), patch(
+            "robotarm.modeling.online_policy.base.wait_gripper_width",
+            return_value=0.001,
+        ), patch("robotarm.modeling.online_policy.time.sleep"), patch(
+            "robotarm.modeling.online_policy.time.monotonic",
+            side_effect=lambda: next(clock),
+        ):
+            home_arm_to_zero(
+                Robot(), config, gripper, 0.02, 1.0, 1.0, 5, 5.0,
+                companion=companion,
+                progress_callback=progress,
+            )
+
+        companion.start_homing.assert_called_once_with(
+            [0.0] * 6 + [0.02],
+            5,
+            timeout=5.0,
+            stop_requested=ANY,
+        )
+        self.assertTrue(callable(companion.start_homing.call_args.kwargs["stop_requested"]))
+        companion.homing_ready.assert_called()
+        companion.finish_homing.assert_called_once_with(
+            [0.0] * 6 + [0.001]
+        )
+
+    def test_paired_home_sends_follower_target_while_leader_home_runs(self):
+        leader_started = Event()
+        follower_target_sent = Event()
+        follower_gripper_closed = Event()
+
+        class Robot:
+            OPTIONS = SimpleNamespace(MOTION_MODE=SimpleNamespace(J=1))
+
+            def move_j(self, joints):
+                if list(joints) == [0.0] * 6:
+                    self_test.assertTrue(leader_started.wait(1.0))
+                    follower_target_sent.set()
+
+            def set_motion_mode(self, mode):
+                pass
+
+            def set_speed_percent(self, speed):
+                pass
+
+            def get_arm_status(self):
+                return SimpleNamespace(msg=SimpleNamespace(
+                    arm_status=0, motion_status=0, err_status=SimpleNamespace(),
+                ))
+
+        def leader_home(*args, **kwargs):
+            leader_started.set()
+            self.assertTrue(follower_target_sent.wait(1.0))
+            self.assertTrue(follower_gripper_closed.wait(1.5))
+
+        def close_gripper(*args, **kwargs):
+            follower_gripper_closed.set()
+            return 0.001
+
+        self_test = self
+        companion = Mock()
+        companion.start_homing.side_effect = leader_home
+        companion.homing_ready.return_value = True
+        config = {"joint_limits": {
+            f"joint{index}": (-math.pi, math.pi) for index in range(1, 7)
+        }}
+        with patch(
+            "robotarm.modeling.online_policy.read_valid_joints",
+            side_effect=lambda *args: [0.0] * 6 if follower_target_sent.is_set() else [0.1] * 6,
+        ), patch(
+            "robotarm.modeling.online_policy.base.enable_arm_and_gripper",
+        ), patch(
+            "robotarm.modeling.online_policy.move_gripper_and_wait",
+            side_effect=close_gripper,
+        ), patch("robotarm.modeling.online_policy.time.sleep"):
+            home_arm_to_zero(
+                Robot(), config, Mock(), 0.02, 1.0, 1.0, 5, 5.0,
+                companion=companion,
+            )
+        self.assertTrue(follower_target_sent.is_set())
+        self.assertTrue(follower_gripper_closed.is_set())
+        companion.finish_homing.assert_called_once()
+
+    def test_leader_home_failure_stops_only_leader_when_follower_can_hold(self):
+        robot = Mock()
+        robot.OPTIONS.MOTION_MODE.J = "j"
+        companion = Mock()
+        measured = [0.1] * 6
+        with patch(
+            "robotarm.modeling.online_policy.read_valid_joints",
+            return_value=measured,
+        ):
+            follower_error, leader_error = isolate_leader_home_failure(
+                robot, {}, 1.0, companion
+            )
+        self.assertIsNone(follower_error)
+        self.assertIsNone(leader_error)
+        robot.set_motion_mode.assert_called_once_with("j")
+        robot.move_j.assert_called_once_with(measured)
+        robot.electronic_emergency_stop.assert_not_called()
+        companion.emergency_stop.assert_called_once_with()
 
     def test_home_emergency_input_prevents_enable_and_motion(self):
         with patch("robotarm.modeling.online_policy.read_valid_joints") as read, patch(
@@ -360,6 +535,62 @@ class OnlinePolicySafetyTests(unittest.TestCase):
         )
         self.assertFalse(status["progressed"])
         self.assertEqual(status["no_progress_steps"], 3)
+
+    def test_grasped_gripper_does_not_freeze_following_act_lift(self):
+        import numpy as np
+
+        # Reported stop: measured 78.3 mm, requested 62.1 mm, safe 62.3 mm.
+        # Keep width fixed as though gripping an object while joints follow
+        # successive policy lift targets for longer than the old 10-tick trip.
+        state = np.asarray([0.0] * 6 + [0.0783])
+        previous = state.copy()
+        latched = [0.0] * 6 + [0.0621]  # Also release a pre-existing grip latch.
+        for step in range(30):
+            desired = np.asarray([0.001 * (step + 1)] + [0.0] * 5 + [0.0621])
+            safe = self.limited_target(desired, state, previous)
+            self.assertTrue(action_was_clamped(desired, safe))
+            pressure = act_backpressure_required(desired, safe, state)
+            self.assertFalse(pressure)
+            latched, created, _ = update_act_backpressure_target(
+                latched, desired, pressure, True,
+            )
+            self.assertIsNone(latched)
+            self.assertFalse(created)
+            self.assertLessEqual(abs(safe[6] - previous[6]), 0.008 + 1e-9)
+            self.assertLessEqual(abs(safe[6] - state[6]), 0.016 + 1e-9)
+            state[:6] = safe[:6]
+            previous = safe
+        self.assertAlmostEqual(state[0], 0.03)
+        self.assertAlmostEqual(state[6], 0.0783)
+
+    def test_grasp_exception_preserves_joint_and_opening_stall_protection(self):
+        import numpy as np
+
+        state = np.asarray([0.0] * 6 + [0.0783])
+        for desired in (
+            [math.radians(20)] + [0.0] * 5 + [0.0621],  # Joint blocked, closing.
+            [0.0] * 6 + [0.1],  # Gripper blocked while opening.
+        ):
+            safe = self.limited_target(desired, state, state)
+            self.assertTrue(act_backpressure_required(desired, safe, state))
+            latch, created, _ = update_act_backpressure_target(
+                None, desired, True, True,
+            )
+            self.assertTrue(created)
+            joint_error, _, grip_error = act_subgoal_errors(latch, state)
+            count = 0
+            for _ in range(10):
+                status = update_act_backpressure_progress(
+                    latch, state, joint_error, grip_error, count,
+                    math.radians(0.05), 0.0001,
+                )
+                count = status["no_progress_steps"]
+            self.assertEqual(count, 10)
+
+    def test_act_backpressure_rejects_invalid_state(self):
+        for current in ([0.0] * 6, [math.nan] * 7):
+            with self.assertRaisesRegex(RuntimeError, "invalid"):
+                act_backpressure_required([0.0] * 7, [0.0] * 7, current)
 
     def test_act_backpressure_small_changes_accumulate_against_baseline(self):
         target = [math.radians(6)] + [0.0] * 6

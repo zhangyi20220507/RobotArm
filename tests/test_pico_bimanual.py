@@ -44,8 +44,9 @@ class PicoBimanualTests(unittest.TestCase):
     def test_default_channels_are_distinct_and_dry_run(self):
         args = make_parser().parse_args([])
         validate_args(args)
-        self.assertEqual(args.left_channel, "can_leader1")
-        self.assertEqual(args.right_channel, "can_follower1")
+        self.assertEqual(args.left_channel, "can_follower1")
+        self.assertEqual(args.right_channel, "can_leader1")
+        self.assertEqual(args.gripper_max_mm, 100.0)
         self.assertFalse(args.live)
         self.assertEqual(args.stale_timeout, 0.2)
         self.assertEqual(args.homing_stale_timeout, 1.0)

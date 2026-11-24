@@ -1,0 +1,67 @@
+diff --git a/lerobot/policies/act/configuration_act.py b/lerobot/policies/act/configuration_act.py
+--- a/lerobot/policies/act/configuration_act.py
++++ b/lerobot/policies/act/configuration_act.py
+@@ -45,6 +45,9 @@ class ACTConfig(PreTrainedConfig):
+         vision_backbone: Name of the torchvision resnet backbone to use for encoding images.
+         pretrained_backbone_weights: Pretrained weights from torchvision to initialize the backbone.
+             `None` means no pretrained weights.
++        vision_feature_layer: ResNet stage used as the visual feature map. `layer4` preserves the upstream
++            ACT behavior (output stride 32); `layer3` uses a higher-resolution feature map (output stride 16)
++            at the cost of four times as many visual tokens for the same input image.
+         replace_final_stride_with_dilation: Whether to replace the ResNet's final 2x2 stride with a dilated
+             convolution.
+         pre_norm: Whether to use "pre-norm" in the transformer blocks.
+@@ -95,6 +98,7 @@ class ACTConfig(PreTrainedConfig):
+     # Vision backbone.
+     vision_backbone: str = "resnet18"
+     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
++    vision_feature_layer: str = "layer4"
+     replace_final_stride_with_dilation: int = False
+     # Transformer layers.
+     pre_norm: bool = False
+@@ -132,6 +136,11 @@ class ACTConfig(PreTrainedConfig):
+             raise ValueError(
+                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
+             )
++        if self.vision_feature_layer not in {"layer3", "layer4"}:
++            raise ValueError(
++                "`vision_feature_layer` must be either 'layer3' (output stride 16) or "
++                f"'layer4' (output stride 32). Got {self.vision_feature_layer}."
++            )
+         if self.temporal_ensemble_coeff is not None and self.n_action_steps > 1:
+             raise NotImplementedError(
+                 "`n_action_steps` must be 1 when using temporal ensembling. This is "
+diff --git a/lerobot/policies/act/modeling_act.py b/lerobot/policies/act/modeling_act.py
+--- a/lerobot/policies/act/modeling_act.py
++++ b/lerobot/policies/act/modeling_act.py
+@@ -329,10 +329,18 @@ class ACT(nn.Module):
+                 weights=config.pretrained_backbone_weights,
+                 norm_layer=FrozenBatchNorm2d,
+             )
+-            # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
+-            # feature map).
+             # Note: The forward method of this returns a dict: {"feature_map": output}.
+-            self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
++            feature_layer = config.vision_feature_layer
++            self.backbone = IntermediateLayerGetter(
++                backbone_model, return_layers={feature_layer: "feature_map"}
++            )
++            # BasicBlock (ResNet18/34) ends in conv2; Bottleneck (ResNet50+) ends in conv3.
++            # Reading the selected stage keeps the projection correct for both layer3/layer4 and all ResNets.
++            feature_block = getattr(backbone_model, feature_layer)[-1]
++            feature_output_conv = (
++                feature_block.conv3 if hasattr(feature_block, "conv3") else feature_block.conv2
++            )
++            backbone_output_channels = feature_output_conv.out_channels
+ 
+         # Transformer (acts as VAE decoder when training with the variational objective).
+         self.encoder = ACTEncoder(config)
+@@ -353,7 +361,7 @@ class ACT(nn.Module):
+         self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
+         if self.config.image_features:
+             self.encoder_img_feat_input_proj = nn.Conv2d(
+-                backbone_model.fc.in_features, config.dim_model, kernel_size=1
++                backbone_output_channels, config.dim_model, kernel_size=1
+             )
+         # Transformer encoder positional embeddings.
+         n_1d_tokens = 1  # for the latent

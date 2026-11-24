@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -126,6 +127,7 @@ class RawEpisodeRecorder:
         encoder_queue_size: int = 60,
         extra_sample_fields: tuple[str, ...] = (),
         cameras: RoleCameras | None = None,
+        session_prefix: str = "",
     ) -> None:
         if shutil.which("ffmpeg") is None:
             raise RuntimeError("ffmpeg is required; install it with: sudo apt install ffmpeg")
@@ -148,6 +150,12 @@ class RawEpisodeRecorder:
         if len(set(extra_sample_fields)) != len(extra_sample_fields):
             raise ValueError("extra sample fields must be unique")
         self.extra_sample_fields = tuple(extra_sample_fields)
+        session_prefix = session_prefix.strip().strip("_")
+        if session_prefix and re.fullmatch(r"[A-Za-z0-9._-]+", session_prefix) is None:
+            raise ValueError(
+                "session_prefix may contain only letters, digits, '.', '_', and '-'"
+            )
+        self.session_prefix = session_prefix
         self.root_base = root_base
         self.root: Path | None = None
         self.episodes_dir: Path | None = None
@@ -170,6 +178,9 @@ class RawEpisodeRecorder:
         ]
         self.active = False
         self.episode_index = 0
+        self.saved_episodes = 0
+        self.discarded_episodes = 0
+        self.incomplete_episodes = 0
         self.frames = 0
         self.next_frame_time = 0.0
         self.started_at = 0.0
@@ -184,7 +195,8 @@ class RawEpisodeRecorder:
         if self.root is not None:
             return
         stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
-        root = self.root_base / stamp
+        session_name = f"{self.session_prefix}_{stamp}" if self.session_prefix else stamp
+        root = self.root_base / session_name
         episodes_dir = root / "episodes"
         try:
             root.mkdir(parents=True, exist_ok=False)
@@ -199,10 +211,25 @@ class RawEpisodeRecorder:
 
     def preview(self) -> None:
         frames = self.cameras.latest()
+        self._show_preview(frames)
+
+    def _show_preview(
+        self, frames: dict[str, tuple[Any, float, float, int]],
+    ) -> None:
         self.cameras.show(frames, self.active)
 
-    def start_episode(self) -> None:
-        if self.active:
+    def sample_due(self, now: float) -> bool:
+        """Whether this control tick needs an on-disk sample."""
+        return self.active and now >= self.next_frame_time
+
+    @property
+    def prepared(self) -> bool:
+        """Whether video encoders are ready for an immediate episode start."""
+        return not self.active and self.working_dir is not None
+
+    def prepare_episode(self) -> None:
+        """Create the next episode and encoders without starting its timeline."""
+        if self.active or self.prepared:
             return
         usage_path = self.root_base.resolve() if self.root_base.exists() else Path.cwd()
         free = shutil.disk_usage(usage_path).free
@@ -233,12 +260,19 @@ class RawEpisodeRecorder:
                 self.root = None
                 self.episodes_dir = None
             raise
+
+    def start_episode(self, *, started_at: float | None = None) -> None:
+        if self.active:
+            return
+        self.prepare_episode()
         self.samples = {
             field: [] for field in (*SAMPLE_FIELDS, *self.extra_sample_fields)
         }
         self.frames = 0
         self.dropped_samples = 0
-        self.started_at = time.monotonic()
+        self.started_at = (
+            time.monotonic() if started_at is None else float(started_at)
+        )
         self.next_frame_time = self.started_at
         self.active = True
         print(f"\n[record] Episode {self.episode_index}; short save, long discard.")
@@ -251,12 +285,17 @@ class RawEpisodeRecorder:
         tcp_pose: list[float],
         teleop_delta: list[float],
         extra_samples: dict[str, Any] | None = None,
-        *, show_preview: bool = True,
+        *,
+        show_preview: bool = True,
+        frames: dict[str, tuple[Any, float, float, int]] | None = None,
     ) -> bool:
-        frames = self.cameras.latest()
+        capture_due = self.sample_due(now)
+        if not capture_due and not show_preview:
+            return False
+        frames = self.cameras.latest() if frames is None else frames
         if show_preview:
-            self.cameras.show(frames, self.active)
-        if not self.active or now < self.next_frame_time:
+            self._show_preview(frames)
+        if not capture_due:
             return False
         extra_samples = extra_samples or {}
         expected_extra = set(self.extra_sample_fields)
@@ -335,10 +374,31 @@ class RawEpisodeRecorder:
             "writer_errors": writer_errors,
             "finished_at": datetime.now().astimezone().isoformat(),
         }
+        if "expert_mask" in arrays and "control_source" in arrays:
+            expert_mask = arrays["expert_mask"].astype(bool)
+            intervention_ids = arrays.get(
+                "intervention_id", np.full(self.frames, -1, dtype=np.int64)
+            )
+            metadata["control_source_frames"] = {
+                "novice": int(np.count_nonzero(arrays["control_source"] == 0)),
+                "armed": int(np.count_nonzero(arrays["control_source"] == 1)),
+                "expert": int(np.count_nonzero(expert_mask)),
+            }
+            metadata["interventions"] = len(
+                {int(value) for value in intervention_ids if int(value) >= 0}
+            )
+            metadata["expert_interventions"] = len(
+                {
+                    int(value)
+                    for value, is_expert in zip(intervention_ids, expert_mask)
+                    if is_expert and int(value) >= 0
+                }
+            )
         _json_write(self.working_dir / "episode.json", metadata)
         if status == "discarded":
             shutil.rmtree(self.working_dir)
             print(f"\n[record] Episode {self.episode_index} discarded.")
+            self.discarded_episodes += 1
             result = None
         else:
             prefix = "episode" if status == "complete" and self.frames else "incomplete_episode"
@@ -348,8 +408,18 @@ class RawEpisodeRecorder:
                 f"\n[record] Episode {self.episode_index} {status}: "
                 f"{self.frames} frames -> {destination}"
             )
+            if status == "complete" and self.frames:
+                self.saved_episodes += 1
+            else:
+                self.incomplete_episodes += 1
             result = destination
         self.episode_index += 1
+        print(
+            "[record] Progress: "
+            f"saved={self.saved_episodes}, discarded={self.discarded_episodes}, "
+            f"incomplete={self.incomplete_episodes}; "
+            f"next saved episode={self.saved_episodes + 1}"
+        )
         self.working_dir = None
         self.writers = {}
         self.samples = {}
@@ -367,5 +437,24 @@ class RawEpisodeRecorder:
     def close(self) -> None:
         if self.active:
             self.mark_incomplete()
+        elif self.prepared:
+            for writer in self.writers.values():
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+            if self.working_dir is not None:
+                shutil.rmtree(self.working_dir, ignore_errors=True)
+            self.working_dir = None
+            self.writers = {}
+            if (
+                self.episode_index == 0
+                and self.root is not None
+                and self.episodes_dir is not None
+                and not any(self.episodes_dir.iterdir())
+            ):
+                shutil.rmtree(self.root, ignore_errors=True)
+                self.root = None
+                self.episodes_dir = None
         if self._owns_cameras:
             self.cameras.close()

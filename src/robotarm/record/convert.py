@@ -145,6 +145,10 @@ def discover_episodes(
     session_path: Path,
     include_incomplete: bool,
 ) -> tuple[dict[str, Any], list[EpisodeSource], list[str]]:
+    if (session_path / "MERGE_INCOMPLETE.txt").exists():
+        raise ValueError("raw merge is incomplete")
+    if (session_path / "APPEND_INCOMPLETE.json").exists():
+        raise ValueError("raw transactional append is incomplete; recover it before use")
     session = read_json(session_path / "session.json")
     if session.get("format_version") != RAW_FORMAT:
         raise RuntimeError(
@@ -171,6 +175,12 @@ def discover_episodes(
     selected: list[EpisodeSource] = []
     skipped: list[str] = []
     for path in sorted(item for item in episodes_dir.iterdir() if item.is_dir()):
+        # Recorder prewarming creates this directory before episode.json or
+        # frames.npz exist. It is never a published episode, including when
+        # callers opt into finalized incomplete_episode_* directories.
+        if path.name.startswith(".episode_") and path.name.endswith(".in_progress"):
+            skipped.append(f"{path.name}: recording/prewarming in progress")
+            continue
         metadata = read_json(path / "episode.json")
         status = metadata.get("status")
         frames = int(metadata.get("frames", 0))
@@ -278,6 +288,29 @@ def validate_episode(
             raise RuntimeError(
                 f"{episode.path.name}: timestamps are not strictly increasing"
             )
+        if uses_expert_mask(session):
+            for key in (
+                "control_source",
+                "expert_mask",
+                "intervention_id",
+                "command_sent",
+            ):
+                if key not in archive or np.asarray(archive[key]).shape != (rows,):
+                    raise RuntimeError(
+                        f"{episode.path.name}: missing or invalid full-trial field {key}"
+                    )
+            source = np.asarray(archive["control_source"])
+            expert = np.asarray(archive["expert_mask"])
+            if not np.isin(source, [0, 1, 2]).all():
+                raise RuntimeError(
+                    f"{episode.path.name}: control_source must use novice/armed/expert codes"
+                )
+            if not np.isin(expert, [0, 1]).all() or not np.array_equal(
+                expert.astype(bool), source == 2
+            ):
+                raise RuntimeError(
+                    f"{episode.path.name}: expert_mask disagrees with control_source"
+                )
 
     fps = float(session["record_fps"])
     for role in expected_roles:
@@ -307,6 +340,50 @@ def validate_episode(
                 f"{episode.path.name}:{role}.mp4 is {width}x{height}, "
                 f"expected {stream['width']}x{stream['height']}"
             )
+
+
+def uses_expert_mask(session: dict[str, Any]) -> bool:
+    return (
+        session.get("robot", {}).get("training_export")
+        == "expert_mask_only"
+    )
+
+
+def split_expert_selections(selections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Split reviewed full trials into contiguous expert-supervised ranges."""
+    import numpy as np
+
+    result: list[dict[str, Any]] = []
+    for item in selections:
+        episode = item["episode"]
+        with np.load(episode.path / "frames.npz", allow_pickle=False) as data:
+            if "expert_mask" not in data:
+                raise RuntimeError(
+                    f"{episode.path.name}: full-trial HG session has no expert_mask"
+                )
+            mask = np.asarray(data["expert_mask"]).reshape(-1)
+        rows = int(episode.metadata["frames"])
+        if mask.shape != (rows,) or not np.isin(mask, [0, 1]).all():
+            raise RuntimeError(
+                f"{episode.path.name}: expert_mask must contain {rows} boolean rows"
+            )
+        start = int(item["start_frame"])
+        stop = int(item["end_frame"])
+        segment_start: int | None = None
+        segment_index = 0
+        for index in range(start, stop + 1):
+            is_expert = index < stop and bool(mask[index])
+            if is_expert and segment_start is None:
+                segment_start = index
+            elif not is_expert and segment_start is not None:
+                segment = dict(item)
+                segment["start_frame"] = segment_start
+                segment["end_frame"] = index
+                segment["expert_segment_index"] = segment_index
+                result.append(segment)
+                segment_start = None
+                segment_index += 1
+    return result
 
 
 def vector_feature(width: int, names: list[str], dtype: str = "float32") -> dict:
@@ -433,11 +510,16 @@ def convert_episode(
     space: str = "joint",
     frame: str = "absolute",
     fk: Callable[[list[float]], list[float]] | None = None,
+    *, start_frame: int = 0, end_frame: int | None = None,
+    progress: Callable[[int], None] | None = None,
 ) -> int:
     import cv2
     import numpy as np
 
     rows = int(episode.metadata["frames"])
+    stop = rows if end_frame is None else end_frame
+    if not 0 <= start_frame < stop <= rows:
+        raise ValueError("invalid raw conversion frame range")
     captures = {
         role: cv2.VideoCapture(str(episode.path / f"{role}.mp4"))
         for role in camera_roles
@@ -446,6 +528,16 @@ def convert_episode(
         for capture in captures.values():
             capture.release()
         raise RuntimeError(f"failed to open a video in {episode.path}")
+
+    # HG-DAgger exports several short expert spans from a full trial. Seek to
+    # each span instead of decoding all earlier novice frames for every span.
+    if start_frame:
+        for role, capture in captures.items():
+            if not capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame):
+                raise RuntimeError(f"cannot seek {episode.path / (role + '.mp4')} to frame {start_frame}")
+            actual = int(round(capture.get(cv2.CAP_PROP_POS_FRAMES)))
+            if actual != start_frame:
+                raise RuntimeError(f"video seek landed at frame {actual}, expected {start_frame}")
 
     try:
         with np.load(episode.path / "frames.npz", allow_pickle=False) as data:
@@ -460,7 +552,7 @@ def convert_episode(
                     ],
                     axis=1,
                 ).astype(np.float32)
-            for index in range(rows):
+            for index in range(start_frame, stop):
                 frame_dict: dict[str, Any] = {
                     "observation.state": state_array[index],
                     "action": action_array[index],
@@ -476,7 +568,9 @@ def convert_episode(
                         cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
                     )
                 dataset.add_frame(frame_dict)
-                if (index + 1) % 100 == 0 or index + 1 == rows:
+                if progress is not None:
+                    progress(index - start_frame + 1)
+                if (index + 1) % 100 == 0 or index + 1 == stop:
                     print(
                         f"  {episode.path.name}: {index + 1}/{rows} frames",
                         flush=True,
@@ -485,10 +579,10 @@ def convert_episode(
     finally:
         for capture in captures.values():
             capture.release()
-    return rows
+    return stop - start_frame
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     from ..config import defaults
 
     cfg = defaults("data_acquisition", "convert")
@@ -497,6 +591,10 @@ def parse_args() -> argparse.Namespace:
         "sessions", type=Path, nargs="+", help="piper_raw_v1 session directories"
     )
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument(
+        "--reviews", type=Path, default=None,
+        help="raw review JSON (one session only); default: annotations/reviews.json in each session",
+    )
     parser.add_argument(
         "--repo-id",
         default=None,
@@ -563,11 +661,13 @@ def parse_args() -> argparse.Namespace:
             "[-pi, pi])"
         ),
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: list[str] | None = None, *, progress=None, review_documents=None) -> int:
+    args = parse_args() if argv is None else parse_args(argv)
+    progress = progress or (lambda _: None)
+    from .raw_reviews import episode_identity, load_raw_reviews, select_reviewed_episodes
     session_paths = [path.expanduser().resolve() for path in args.sessions]
     session_path = session_paths[0]
     suffix = representation_suffix(args.space, args.frame)
@@ -582,7 +682,27 @@ def main() -> int:
         discover_episodes(path, args.include_incomplete) for path in session_paths
     ]
     session = discovered[0][0]
+    expert_only = uses_expert_mask(session)
+    if any(uses_expert_mask(item[0]) != expert_only for item in discovered[1:]):
+        raise RuntimeError(
+            "cannot combine full-trial HG sessions with ordinary/expert-only "
+            "raw sessions in one conversion"
+        )
     episodes = [episode for _, items, _ in discovered for episode in items]
+    if getattr(args, "reviews", None) is not None and len(session_paths) != 1:
+        raise ValueError("--reviews requires exactly one raw session")
+    selections = []
+    review_snapshots = {}
+    for path, (_, items, _) in zip(session_paths, discovered):
+        reviews = load_raw_reviews(
+            path, items, getattr(args, "reviews", None),
+            (review_documents or {}).get(path),
+        )
+        review_snapshots[str(path)] = reviews
+        selections.extend(select_reviewed_episodes(items, reviews))
+    if not selections:
+        raise ValueError("没有可导出的轨迹：复查和剔除条目不参与导出")
+    episodes = [item["episode"] for item in selections]
     skipped = [
         f"{path.name}/{reason}"
         for path, (_, _, reasons) in zip(session_paths, discovered)
@@ -725,6 +845,21 @@ def main() -> int:
             )
         print(f"  OK {episode.session_path.name}/{episode.path.name}")
 
+    if expert_only:
+        selections = split_expert_selections(selections)
+        if not selections:
+            raise ValueError(
+                "完整HG轨迹中没有可导出的expert_mask区间；保留raw供HIL使用，"
+                "但不能生成HG监督数据集"
+            )
+        expert_frames = sum(
+            item["end_frame"] - item["start_frame"] for item in selections
+        )
+        print(
+            f"HG expert export: {len(selections)} intervention segments / "
+            f"{expert_frames} frames (novice/armed frames remain raw-only)"
+        )
+
     if output.exists() and not args.append:
         if not args.overwrite:
             raise RuntimeError(
@@ -787,12 +922,32 @@ def main() -> int:
         existing_frames = 0
 
     converted: list[dict[str, Any]] = []
+    (output / "CONVERSION_INCOMPLETE.txt").write_text(
+        "Conversion in progress; do not train from this directory.\n", encoding="utf-8"
+    )
+    total_frames = sum(item["end_frame"] - item["start_frame"] for item in selections)
+    done = 0
     try:
-        for output_index, episode in enumerate(episodes, start=first_output_index):
+        for position, item in enumerate(selections, start=1):
+            episode = item["episode"]
+            if episode_identity(episode) != item["episode_id"]:
+                raise ValueError(f"raw source changed before conversion: {episode.path}")
+            output_index = first_output_index + position - 1
+            progress({"total_episodes": len(selections), "total_frames": total_frames,
+                      "episodes_done": position - 1, "frames_done": done,
+                      "current_episode": item["source_index"],
+                      "episode_position": position, "phase": "复制帧"})
             print(f"Converting {episode.path.name} -> episode {output_index}...")
             rows = convert_episode(
-                dataset, episode, camera_roles, args.space, args.frame, fk
+                dataset, episode, camera_roles, args.space, args.frame, fk,
+                start_frame=item["start_frame"], end_frame=item["end_frame"],
+                progress=lambda count: progress({"frames_done": done + count}),
             )
+            if episode_identity(episode) != item["episode_id"]:
+                raise ValueError(f"raw source changed during conversion: {episode.path}")
+            done += rows
+            progress({"episodes_done": position, "frames_done": done,
+                      "current_episode": None, "episode_position": None})
             converted.append(
                 {
                     "source_episode": episode.path.name,
@@ -802,6 +957,16 @@ def main() -> int:
                     "status": episode.metadata.get("status"),
                     "frames": rows,
                     "task": episode.metadata.get("task"),
+                    "raw_episode_id": item["episode_id"],
+                    "start_frame": item["start_frame"],
+                    "end_frame": item["end_frame"],
+                    **(
+                        {"expert_segment_index": item["expert_segment_index"]}
+                        if "expert_segment_index" in item
+                        else {}
+                    ),
+                    "review": item["review"],
+                    "merge_source": episode.metadata.get("merge_source"),
                 }
             )
         dataset.finalize()
@@ -832,6 +997,16 @@ def main() -> int:
         "repo_id": repo_id,
         "include_incomplete": bool(
             existing_provenance.get("include_incomplete", False) or args.include_incomplete
+        ),
+        "expert_only": (
+            expert_only
+            if not args.append
+            else bool(existing_provenance.get("expert_only", False))
+            and expert_only
+        ),
+        "includes_expert_mask_exports": bool(
+            expert_only
+            or existing_provenance.get("includes_expert_mask_exports", False)
         ),
         "camera_roles": camera_roles,
         # Only present when --camera-role dropped a recorded camera, so the
@@ -874,6 +1049,8 @@ def main() -> int:
         ],
         "excluded_redundant_fields": ["observation.tcp_pose"],
         "episodes": [*existing_provenance.get("episodes", []), *converted],
+        "raw_reviews_snapshot": {**existing_provenance.get("raw_reviews_snapshot", {}),
+                                 **review_snapshots},
     }
     existing_session_records = []
     existing_session_metadata_path = output / "meta" / "piper_raw_session.json"
